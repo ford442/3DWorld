@@ -1,7 +1,7 @@
 TARGET=3dworld
 BUILD=obj
 VPATH=$(BUILD) src src/texture_tile_blend
-CXX=em++
+CXX=emcc
 TARGA=Targa
 GLI=dependencies/gli
 GLM=dependencies/glm
