@@ -1,4 +1,4 @@
-TARGET=3dworld
+TARGET=3dworld.html
 BUILD=obj
 VPATH=$(BUILD) src src/texture_tile_blend
 CXX=em++
