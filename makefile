@@ -5,10 +5,10 @@ CXX=emcc
 TARGA=Targa
 GLI=dependencies/gli
 GLM=dependencies/glm
-INCLUDES=-Isrc -Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM)
+INCLUDES=-Isrc -Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -I/usr/include/GL
 DEFINES=-DENABLE_JPEG -DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS
 CXXFLAGS=-g -Wall -O3 -flto=thin -sENVIRONMENT=web -sMALLOC='emmalloc' -sUSE_WEBGL2=1 -sMAX_WEBGL_VERSION=2 \
--sMIN_WEBGL_VERSION=2 -sFORCE_FILESYSTEM=1  -sFULL_ES2=1 -sFULL_ES3=1 --closure 1 -g0 -sGL_TESTING=1 \
+-sMIN_WEBGL_VERSION=2 -sFORCE_FILESYSTEM=1  -sFULL_ES2=1 -sFULL_ES3=1 --closure 0 -sGL_TESTING=1 \
 -sPRINTF_LONG_DOUBLE=1 -fopenmp $(INCLUDES) $(DEFINES) -Wextra -Wno-unused-parameter -Wno-implicit-fallthrough \
 -ffast-math -sSUPPORT_LONGJMP=0 -DNDEBUG -sALLOW_MEMORY_GROWTH=0 -sINITIAL_MEMORY=1400mb
 
