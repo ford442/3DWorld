@@ -4,11 +4,26 @@
 #include "3DWorld.h"
 #include "function_registry.h"
 #include "buildings.h"
+#include "city_model.h"
 
+float const TAPE_HEIGHT_TO_RADIUS = 0.6;
+
+extern object_model_loader_t building_obj_model_loader;
 
 float get_lamp_width_scale();
 vect_cube_t &get_temp_cubes();
 bool get_dishwasher_for_ksink(room_object_t const &c, cube_t &dishwasher);
+void set_wall_width(cube_t &wall, float pos, float half_thick, unsigned dim);
+
+void resize_model_cube_xy(cube_t &cube, float dim_pos, float not_dim_pos, unsigned id, bool dim) {
+	vector3d const sz(building_obj_model_loader.get_model_world_space_size(id)); // L, W, H
+	set_wall_width(cube, dim_pos,     0.5*cube.dz()*sz.x/sz.z,  dim); // length
+	set_wall_width(cube, not_dim_pos, 0.5*cube.dz()*sz.y/sz.z, !dim); // width
+}
+
+bool is_shirt_model     (room_object_t const &obj) {return building_obj_model_loader.model_filename_contains(obj.get_model_id(), "shirt", "Shirt");}
+bool is_pants_model     (room_object_t const &obj) {return building_obj_model_loader.model_filename_contains(obj.get_model_id(), "pants", "Pants");}
+bool is_bar_hanger_model(room_object_t const &obj) {return building_obj_model_loader.model_filename_contains(obj.get_model_id(), "bar hanger", "Bar Hanger");}
 
 bool add_if_not_intersecting(room_object_t const &obj, vector<room_object_t> &objects, vect_cube_t &cubes) {
 	if (has_bcube_int(obj, cubes)) return 0;
@@ -143,23 +158,69 @@ void building_room_geom_t::add_closet_objects(room_object_t const &c, vector<roo
 	hanger_rod.z1() = c.z1() + 0.8*window_vspacing;
 	hanger_rod.z2() = hanger_rod.z1() + 2.0*hr_radius;
 	set_wall_width(hanger_rod, (0.45*c.d[c.dim][c.dir] + 0.55*c.d[c.dim][!c.dir]), hr_radius, c.dim); // move slightly toward the back
+	unsigned const hanger_rod_ix(objects.size());
 	objects.push_back(hanger_rod);
 
-	// add hangers
-	unsigned const num_hangers(rgen.rand() % (c.is_small_closet() ? 5 : 9)); // 0-4/8
+	// add hangers and hanging clothes
+	unsigned const num_hangers(c.is_small_closet() ? ((rgen.rand()%7) + 2) : ((rgen.rand()%13) + 4)); // 2-8 / 4-16
 	float const wire_radius(0.25*hr_radius);
 
-	if (num_hangers > 0 && hanger_rod.get_sz_dim(!c.dim) > 10.0*wire_radius) {
+	if (num_hangers > 0 && hanger_rod.get_sz_dim(!c.dim) > 10.0*wire_radius && building_obj_model_loader.is_model_valid(OBJ_MODEL_HANGER)) {
 		room_object_t hanger(hanger_rod);
-		hanger.type = TYPE_HANGER;
-		set_cube_zvals(hanger, (hanger_rod.z1() - 0.09*window_vspacing), (hanger_rod.z2() + 2.0*wire_radius));
-		hanger.expand_in_dim(c.dim, 0.09*window_vspacing); // set width
+		hanger.type       = TYPE_HANGER;
+		hanger.item_flags = rgen.rand(); // choose a random hanger sub_model_id per-closet
+		set_cube_zvals(hanger, (hanger_rod.z1() - 0.07*window_vspacing), (hanger_rod.z2() + 1.0*wire_radius));
+		unsigned const hid(hanger.get_model_id());
+		float const edge_spacing(max(4.0f*hr_radius, 0.1f*depth));
+		float const pos_min(hanger_rod.d[!c.dim][0] + edge_spacing), pos_max(hanger_rod.d[!c.dim][1] - edge_spacing);
+		float const pos_delta(pos_max - pos_min), slot_spacing(pos_delta/63.0);
+		uint64_t slots_used(0); // divide the space into 64 slots, initially all empty
+		bool const use_model(building_obj_model_loader.is_model_valid(OBJ_MODEL_CLOTHES));
+		bool const mix_hangers(rgen.rand_bool());
 
 		for (unsigned i = 0; i < num_hangers; ++i) { // since hangers are so narrow, we probably don't need to check for intersections
-			float const pos(rgen.rand_uniform((hanger_rod.d[!c.dim][0] + wire_radius), (hanger_rod.d[!c.dim][1] - wire_radius)));
-			set_wall_width(hanger, pos, wire_radius, !c.dim);
+			unsigned slot_ix(0);
+			bool found_slot(0);
+			
+			for (unsigned n = 0; n < 10; ++n) { // 10 attempts to find an unused slot
+				slot_ix = rgen.rand()&63;
+				uint64_t const slot_mask(uint64_t(1) << slot_ix);
+				if (slots_used & slot_mask) continue;
+				slots_used |= slot_mask;
+				found_slot  = 1;
+				break; // success
+			}
+			if (!found_slot) continue; // skip this hanger
+			resize_model_cube_xy(hanger, hanger.get_center_dim(c.dim), (pos_min + slot_ix*slot_spacing), hid, c.dim);
 			objects.push_back(hanger);
-		}
+			
+			if (use_model && rgen.rand_float() < 0.8) { // maybe add clothing to the hanger
+				objects.back().flags |= RO_FLAG_HANGING; // flag the hanger has having the shirt hanging on it
+				room_object_t clothes(hanger, TYPE_CLOTHES, c.room_id, c.dim, c.dir, (flags | RO_FLAG_HANGING), c.light_amt, SHAPE_CUBE, WHITE);
+				clothes.z2() -= 0.55*hanger.dz(); // top
+				clothes.z1() -= 0.3*c.dz(); // bottom
+				clothes.item_flags = rgen.rand(); // choose a random clothing sub_model_id
+				if (is_pants_model(clothes) && is_bar_hanger_model(hanger)) {++clothes.item_flags;} // hack to avoid placing pants on bar hangers
+				unsigned const cid(clothes.get_model_id());
+				float const scale(building_obj_model_loader.get_model_scale(cid));
+				if (scale != 0.0) {set_wall_width(clothes, clothes.zc(), 0.5*scale*clothes.dz(), 2);} // rescale zvals around the center
+				resize_model_cube_xy(clothes, clothes.get_center_dim(c.dim), clothes.get_center_dim(!c.dim), cid, c.dim);
+				bool skip(0);
+
+				for (auto m = objects.begin()+hanger_rod_ix+1; m != objects.end(); ++m) { // skip if this object intersects a previous hanging clothing item
+					if (m->type == TYPE_CLOTHES && m->intersects(clothes)) {skip = 1; break;}
+				}
+				if (skip) continue;
+
+				if (is_shirt_model(clothes) && rgen.rand_float() < 0.67) { // 67% of shirts and randomly colored rather than colored + textured with the model
+					clothes.color  = shirt_colors[rgen.rand()%NUM_SHIRT_COLORS];
+					clothes.flags |= RO_FLAG_UNTEXTURED;
+				}
+				objects.push_back(clothes);
+			}
+			if (mix_hangers && (rgen.rand()&7) == 0) {hanger.item_flags = rgen.rand();} // switch to a new hanger type occasionally
+		} // for i
+		objects[hanger_rod_ix].item_flags = uint16_t(objects.size() - hanger_rod_ix); // number of objects hanging on the hanger rod, including hangers and shirts
 	}
 }
 
@@ -363,6 +424,20 @@ void building_room_geom_t::get_shelf_objects(room_object_t const &c_in, cube_t c
 			C.shape      = SHAPE_CUBE; // reset for next object type
 			C.item_flags = 0; // reset for next object type
 		}
+		// add tape rolls
+		float const tape_radius(0.22*z_step), tape_height(TAPE_HEIGHT_TO_RADIUS*tape_radius); // fixed size
+
+		if (min(c_sz.x, c_sz.y) > 3.0*tape_radius) { // add if shelf wide/deep enough
+			unsigned const num_tapes(((rgen.rand()%4) < 3) ? (rgen.rand() % 4) : 0); // 0-3, 75% chance
+			C.dir  = C.dim = 0;
+			C.type = TYPE_TAPE;
+
+			for (unsigned n = 0; n < num_tapes; ++n) {
+				gen_xy_pos_for_round_obj(C, S, tape_radius, tape_height, 1.25*tape_radius, rgen);
+				C.color = tape_colors[rgen.rand() % NUM_TAPE_COLORS]; // random color
+				add_if_not_intersecting(C, objects, cubes);
+			}
+		}
 	} // for s
 }
 
@@ -487,7 +562,7 @@ void set_rand_pos_for_sz(cube_t &c, bool dim, float length, float width, rand_ge
 
 		if (length < 0.9*sz[c.dim] && width < 0.9*sz[!c.dim]) { // if it can fit
 			obj = room_object_t(drawer, TYPE_MONEY, c.room_id, c.dim, c.dir);
-			obj.z2() = (obj.z1() + 0.01*length*((rgen.rand()%20) + 1)); // 1-20 bills
+			obj.z2() = (obj.z1() + 0.01f*length*((rgen.rand()%20) + 1)); // 1-20 bills
 			set_rand_pos_for_sz(obj, c.dim, length, width, rgen);
 		}
 		break;
@@ -516,9 +591,18 @@ void set_rand_pos_for_sz(cube_t &c, bool dim, float length, float width, rand_ge
 		set_rand_pos_for_sz(obj, dim, length, diameter, rgen);
 		break;
 	}
-	case 10: // empty
+	case 10: // tape roll
+	{
+		float const diameter(0.3*c.dz());
+
+		if (diameter < 0.9*min(sz.x, sz.y)) { // if it can fit
+			obj = room_object_t(drawer, TYPE_TAPE, c.room_id, 0, 0, 0, 1.0, SHAPE_CYLIN, tape_colors[rgen.rand() % NUM_TAPE_COLORS]); // dim/dir don't matter, so use 0
+			obj.z2() = (obj.z1() + 0.5f*TAPE_HEIGHT_TO_RADIUS*diameter); // set height
+			set_rand_pos_for_sz(obj, 0, diameter, diameter, rgen);
+		}
 		break;
 	}
+	} // end switch
 	obj.flags    |= (RO_FLAG_WAS_EXP | RO_FLAG_NOCOLL);
 	obj.light_amt = c.light_amt;
 	return obj;
@@ -558,7 +642,7 @@ void building_t::add_box_contents(room_object_t const &box) {
 
 	// Note: the code below may invalidate the reference to box, so we can't use it after this point
 	for (unsigned n = 0; n < 10; ++n) { // make up to 10 attempts at placing valid item(s) in this box
-		unsigned const obj_type(rgen.rand()%6); // {book, bottles, ball, paint can, spraypaint, toilet paper}
+		unsigned const obj_type((n == 9) ? 0 : (rgen.rand()%7)); // {book, bottles, ball, paint can, spraypaint, toilet paper, tape, [box]}; place book on last iteration
 
 		if (obj_type == 0) { // books; can always be placed
 			unsigned const num_books(1 + (rgen.rand()&3)); // 1-4 books
@@ -614,13 +698,36 @@ void building_t::add_box_contents(room_object_t const &box) {
 			}
 		}
 		else if (obj_type == 5) { // toilet paper rolls
-			float const length(0.35*0.18*floor_spacing), radius(0.4*length);
-			if (!place_objects_in_box(c, obj_bcubes, radius, length)) continue; // can't fit any of this item
+			float const height(0.35*0.18*floor_spacing), radius(0.4*height);
+			if (!place_objects_in_box(c, obj_bcubes, radius, height)) continue; // can't fit any of this item
 			
 			for (auto i = obj_bcubes.begin(); i != obj_bcubes.end(); ++i) {
 				objs.emplace_back(*i, TYPE_TPROLL, room_id, 0, 0, flags, light_amt, SHAPE_CYLIN);
 			}
 		}
+		else if (obj_type == 6) { // rolls of tape
+			float height(0.032*floor_spacing), radius(height/TAPE_HEIGHT_TO_RADIUS);
+
+			for (unsigned m = 0; m < 2; ++m) {
+				if (2.0*radius < 0.95*min(c.dx(), c.dy())) break; // size is okay
+				height *= 0.9; radius *= 0.9; // can't fit any, try making it smaller
+			}
+			if (!place_objects_in_box(c, obj_bcubes, radius, height)) continue; // can't fit any of this item
+			unsigned color_ix(rgen.rand()); // random color
+
+			for (auto i = obj_bcubes.begin(); i != obj_bcubes.end(); ++i) {
+				// dim/dir don't matter, so use 0; flag as RO_FLAG_IN_CLOSET so that we know that we don't need to draw the bottom (not in a drawer)
+				objs.emplace_back(*i, TYPE_TAPE, room_id, 0, 0, (flags | RO_FLAG_IN_CLOSET), light_amt, SHAPE_CYLIN);
+				objs.back().color = tape_colors[color_ix % NUM_TAPE_COLORS];
+			}
+		}
+		else if (obj_type == 7) { // nested box (not currently enabled)
+			cube_t box2(box);
+			box2.expand_by(-0.05*box.get_size()); // shrink by 10% in all dims
+			objs.emplace_back(box2, TYPE_BOX, room_id, box.dim, box.dir, (flags | (box.flags & ~RO_FLAG_OPEN)), light_amt);
+			objs.back().obj_id += rgen.rand();
+		}
+		else {continue;} // empty box?
 		interior->room_geom->clear_static_small_vbos();
 		break; // if we got here, something was placed in the box
 	} // for n

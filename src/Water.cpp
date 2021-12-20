@@ -359,8 +359,8 @@ public:
 	}
 	void calc_vertex_colors_normals(colorRGBA const &color_in) {
 		if (verts.empty()) return;
-		// Note: frame_counter check is a hack to avoid Nvidia driver perf problem in drvValidateVersion where we get 8 FPS for a few seconds
-		bool const use_threads(!fast_water_reflect && !draw_fast && !(display_mode & 0x20) && frame_counter > 100);
+		// Note: frame_counter check is a hack to avoid Nvidia driver perf problem where we get only a few FPS for the first 8s
+		bool const use_threads(!fast_water_reflect && !draw_fast && !(display_mode & 0x20) /*&& frame_counter > 100*/);
 
 		// run on multiple threads when we have the slow ray-traced per-vertex water reflections enabled (assumes a quad core machine)
 #pragma omp parallel for num_threads(4) schedule(dynamic,8) if (use_threads)
@@ -531,7 +531,7 @@ void draw_water(bool no_update, bool draw_fast) {
 		if (DEBUG_WATER_TIME) {PRINT_TIME("5 Water Ripple Update");}
 	}
 	unsigned nin(0);
-	int xin[4], yin[4], last_wsi(-1);
+	int xin[4] = {}, yin[4] = {}, last_wsi(-1);
 	bool const disp_snow((display_mode & 0x40) && temperature <= SNOW_MAX_TEMP);
 	if (!water_is_lava) {color *= INT_WATER_ATTEN;} // attenuate for interior water
 	colorRGBA wcolor(color);

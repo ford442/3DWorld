@@ -11,6 +11,7 @@ nleaves_scale 2.0
 tree_branch_radius 0.5
 sm_tree_density 1.5
 
+start_in_inf_terrain 1
 disable_inf_terrain 0
 disable_water 0
 disable_scenery 1
@@ -20,6 +21,7 @@ ground_effects_level 2 # 1 = mesh shadows, 2 = mesh + cloud shadows
 init_tree_mode 2 # pine trees
 use_instanced_pine_trees 1 # for faster tree editing
 tt_triplanar_tex 1
+disable_tt_water_reflect 1 # too slow for museums
 
 grass_density 120
 grass_size 0.03 0.002

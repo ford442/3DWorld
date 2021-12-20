@@ -728,10 +728,12 @@ int building_t::choose_dest_room(building_ai_state_t &state, pedestrian_t &perso
 		float const height(0.7*get_window_vspace()), radius(COLL_RADIUS_SCALE*person.radius);
 		static vect_cube_t avoid; // reuse across frames/people
 		get_avoid_cubes(person.pos.z, height, radius, avoid, 0); // following_player=0
-		interior->nav_graph->find_valid_pt_in_room(avoid, radius, height, person.pos.z, get_room(loc.room_ix), rgen, dest_pos); // if center is not valid, choose a valid point
-		person.target_pos.x = dest_pos.x; person.target_pos.y = dest_pos.y;
-		state.goal_type = GOAL_TYPE_ROOM;
-		return 1;
+		
+		if (interior->nav_graph->find_valid_pt_in_room(avoid, radius, height, person.pos.z, get_room(loc.room_ix), rgen, dest_pos)) { // if center is not valid, choose a valid point
+			person.target_pos.x = dest_pos.x; person.target_pos.y = dest_pos.y;
+			state.goal_type = GOAL_TYPE_ROOM;
+			return 1;
+		}
 	}
 	return 2; // failed, but can retry
 }
@@ -933,7 +935,7 @@ bool building_t::is_player_visible(building_ai_state_t const &state, pedestrian_
 	bool const same_room_and_floor(same_room_and_floor_as_player(state, person));
 
 	if (!same_room_and_floor) { // check visibility; assume LOS if in the same room
-		point const eye_pos(person.pos + vector3d(0.0, 0.0, (0.9*person.get_height() - person.radius))); // for person
+		point const eye_pos(person.get_eye_pos());
 		if (!is_sphere_visible(target.pos, player_radius, eye_pos) && !is_sphere_visible(pp2, player_radius, eye_pos)) return 0; // check both the bottom and top of player
 	}
 	if (vis_test >= 2) { // check person FOV
@@ -1082,7 +1084,7 @@ int building_t::ai_room_update(building_ai_state_t &state, rand_gen_t &rgen, vec
 		state.next_path_pt(person, stay_on_one_floor, 1);
 		return AI_BEGIN_PATH;
 	}
-	float const max_dist(person.speed*speed_mult*fticks);
+	float const max_dist(person.speed*speed_mult*min(fticks, 4.0f)); // clamp fticks to 100ms
 	state.on_new_path_seg = 0; // clear flag for this frame
 	//person.following_player = can_target_player(state, person); // for debugging visualization
 
@@ -1141,9 +1143,7 @@ int building_t::ai_room_update(building_ai_state_t &state, rand_gen_t &rgen, vec
 				if (i->open) continue; // doors tend to block the player, don't collide with them unless they're closed
 				if (new_pos.z < i->z1() || new_pos.z > i->z2())         continue; // wrong part/floor
 				if (!sphere_cube_intersect(new_pos, person.radius, *i)) continue; // no intersection with door
-				cube_t door(*i);
-				door.expand_in_dim(i->dim, 0.5*get_wall_thickness()); // increase door thickness to a nonzero value
-				if (!door.line_intersects(person.pos, person.target_pos)) continue; // check if our path goes through the door, to allow for "glancing blows" when pushed or turning
+				if (!i->get_true_bcube().line_intersects(person.pos, person.target_pos)) continue; // check if path goes through door, to allow for "glancing blows" when pushed or turning
 
 				if (global_building_params.ai_opens_doors && !i->is_locked_or_blocked(person.has_key)) { // can open the door
 					toggle_door_state((i - interior->doors.begin()), player_in_this_building, 0, person.pos.z); // by_player=0

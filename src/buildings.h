@@ -18,6 +18,8 @@ unsigned const NUM_STAIRS_PER_FLOOR_U = 16;
 float const FLOOR_THICK_VAL_HOUSE  = 0.10; // 10% of floor spacing
 float const FLOOR_THICK_VAL_OFFICE = 0.11; // thicker for office buildings
 float const WALL_THICK_VAL         = 0.05; // 5% of floor spacing
+float const DOOR_THICK_TO_WIDTH    = 0.04; // ratio of door thickness to width for doors opening to the side
+float const DEF_CITY_MIN_ALPHA     = 0.01;
 
 float const elevator_fc_thick_scale(1.005*0.5*FLOOR_THICK_VAL_OFFICE);
 
@@ -27,6 +29,8 @@ unsigned const NUM_PAPER_COLORS = 6;
 unsigned const NUM_SPCAN_COLORS = 10;
 unsigned const NUM_LAMP_COLORS  = 6;
 unsigned const NUM_TCAN_COLORS  = 6;
+unsigned const NUM_TAPE_COLORS  = 7;
+unsigned const NUM_SHIRT_COLORS  = 14;
 colorRGBA const book_colors [NUM_BOOK_COLORS ] = {GRAY_BLACK, WHITE, LT_GRAY, GRAY, DK_GRAY, DK_BLUE, BLUE, LT_BLUE, DK_RED, RED, ORANGE, YELLOW, DK_GREEN, LT_BROWN, BROWN, DK_BROWN};
 colorRGBA const spcan_colors[NUM_SPCAN_COLORS] = {WHITE, RED, GREEN, BLUE, YELLOW, PINK, ORANGE, PURPLE, BROWN, BLACK};
 colorRGBA const lamp_colors[NUM_LAMP_COLORS]   = {WHITE, GRAY_BLACK, BROWN, LT_BROWN, DK_BROWN, OLIVE};
@@ -35,7 +39,9 @@ colorRGBA const paper_colors[NUM_PAPER_COLORS] = {WHITE, WHITE, WHITE, cream, cr
 colorRGBA const pen_colors   [4] = {WHITE, BLACK, colorRGBA(0.2, 0.4, 1.0), RED};
 colorRGBA const pencil_colors[2] = {colorRGBA(1.0, 0.75, 0.25), colorRGBA(1.0, 0.5, 0.1)};
 colorRGBA const marker_colors[8] = {BLACK, RED, BLACK, BLUE, BLACK, GREEN, RED, PURPLE};
-colorRGBA const tcan_colors[NUM_TCAN_COLORS] = {BLUE, DK_GRAY, LT_GRAY, GRAY, BLUE, WHITE};
+colorRGBA const tcan_colors [NUM_TCAN_COLORS ] = {BLUE, DK_GRAY, LT_GRAY, GRAY, BLUE, WHITE};
+colorRGBA const tape_colors [NUM_TAPE_COLORS ] = {GRAY, GRAY, GRAY, GRAY, BKGRAY, BKGRAY, colorRGBA(0.2, 0.2, 1.0)}; // gray duct tape is the most common
+colorRGBA const shirt_colors[NUM_SHIRT_COLORS] = {WHITE, WHITE, WHITE, BKGRAY, BKGRAY, GRAY, GRAY, RED, BLUE, DK_BLUE, DK_GREEN, DK_BROWN, BROWN, ORANGE};
 colorRGBA const LAMP_COLOR(1.0, 0.8, 0.6); // soft white
 colorRGBA const WOOD_COLOR(0.9, 0.7, 0.5); // light brown, multiplies wood texture color; typical value to use
 
@@ -49,6 +55,7 @@ struct building_t;
 class building_creator_t;
 class light_ix_assign_t;
 struct elevator_t;
+class brg_batch_draw_t;
 typedef vector<vert_norm_comp_tc_color> vect_vnctcc_t;
 
 struct bottle_params_t {
@@ -119,6 +126,15 @@ struct city_zone_t : public cube_t {
 
 typedef vector<city_zone_t> vect_city_zone_t;
 
+struct tid_nm_pair_dstate_t {
+	shader_t &s;
+	int bmm_loc;
+	float bump_map_mag;
+	tid_nm_pair_dstate_t(shader_t &s_) : s(s_), bmm_loc(-1), bump_map_mag(1.0) {}
+	void set_for_shader(float new_bump_map_mag);
+	~tid_nm_pair_dstate_t();
+};
+
 struct tid_nm_pair_t { // size=28
 
 	int tid, nm_tid; // Note: assumes each tid has only one nm_tid
@@ -134,17 +150,18 @@ struct tid_nm_pair_t { // size=28
 	void set_specular(float mag, float shine) {spec_mag = (unsigned char)(CLIP_TO_01(mag)*255.0f); shininess = (unsigned char)max(1, min(255, round_fp(shine)));}
 	bool enabled() const {return (tid >= 0 || nm_tid >= 0);}
 
-	bool is_compatible(tid_nm_pair_t const &t) const {
-		return (tid == t.tid && nm_tid == t.nm_tid && emissive == t.emissive && spec_mag == t.spec_mag && shininess == t.shininess && shadowed == t.shadowed);
+	bool is_compat_ignore_shadowed(tid_nm_pair_t const &t) const {
+		return (tid == t.tid && nm_tid == t.nm_tid && emissive == t.emissive && spec_mag == t.spec_mag && shininess == t.shininess);
 	}
+	bool is_compatible(tid_nm_pair_t const &t) const {return (is_compat_ignore_shadowed(t) && shadowed == t.shadowed);}
 	bool operator==(tid_nm_pair_t const &t) const {return (is_compatible(t) && tscale_x == t.tscale_x && tscale_y == t.tscale_y && txoff == t.txoff && tyoff == t.tyoff);}
 	bool operator!=(tid_nm_pair_t const &t) const {return !operator==(t);}
 	int get_nm_tid() const {return ((nm_tid < 0) ? FLAT_NMAP_TEX : nm_tid);}
 	colorRGBA get_avg_color() const {return texture_color(tid);}
 	tid_nm_pair_t get_scaled_version(float scale) const;
 	bool bind_reflection_shader() const;
-	void set_gl(shader_t &s) const;
-	void unset_gl(shader_t &s) const;
+	void set_gl(tid_nm_pair_dstate_t &state) const;
+	void unset_gl(tid_nm_pair_dstate_t &state) const;
 	void toggle_transparent_windows_mode();
 };
 
@@ -264,17 +281,19 @@ struct building_geom_t { // describes the physical shape of a building
 	bool is_cube()    const {return (num_sides == 4);}
 	bool is_simple_cube()    const {return (is_cube() && !half_offset && flat_side_amt == 0.0 && alt_step_factor == 0.0);}
 	bool use_cylinder_coll() const {return (num_sides > 8 && flat_side_amt == 0.0);} // use cylinder collision if not a cube, triangle, octagon, etc. (approximate)
-	void do_xy_rotate(point const &center, point &pos) const;
+	void do_xy_rotate    (point const &center, point &pos) const;
 	void do_xy_rotate_inv(point const &center, point &pos) const;
 	void do_xy_rotate_normal(point &n) const;
 	void do_xy_rotate_normal_inv(point &n) const;
 };
 
 struct tquad_with_ix_t : public tquad_t {
-	// roof, roof access cover, wall, chimney cap, house door, building door, garage door, interior door, roof door
-	enum {TYPE_ROOF=0, TYPE_ROOF_ACC, TYPE_WALL, TYPE_CCAP, TYPE_HDOOR, TYPE_BDOOR, TYPE_GDOOR, TYPE_IDOOR, TYPE_IDOOR2, TYPE_RDOOR, TYPE_HELIPAD, TYPE_SOLAR, TYPE_TRIM};
-	bool is_exterior_door() const {return (type == TYPE_HDOOR || type == TYPE_BDOOR || type == TYPE_GDOOR || type == TYPE_RDOOR);}
-	bool is_interior_door() const {return (type == TYPE_IDOOR || type == TYPE_IDOOR2);}
+	// roof, roof access cover, wall, chimney cap, house door, building front door, building back door, garage door, interior door back face, office door, roof door
+	enum {TYPE_ROOF=0, TYPE_ROOF_ACC, TYPE_WALL, TYPE_HDOOR, TYPE_BDOOR, TYPE_BDOOR2, TYPE_GDOOR,
+		TYPE_IDOOR, TYPE_IDOOR2, TYPE_ODOOR, TYPE_ODOOR2, TYPE_RDOOR, TYPE_HELIPAD, TYPE_SOLAR, TYPE_TRIM};
+	bool is_building_door() const {return (type == TYPE_BDOOR || type == TYPE_BDOOR2);} // for office buildings
+	bool is_exterior_door() const {return (type == TYPE_HDOOR || type == TYPE_GDOOR  || type == TYPE_RDOOR || is_building_door());}
+	bool is_interior_door() const {return (type == TYPE_IDOOR || type == TYPE_IDOOR2 || type == TYPE_ODOOR || type == TYPE_ODOOR2);}
 
 	unsigned type;
 	tquad_with_ix_t(unsigned npts_=0, unsigned type_=TYPE_ROOF) : tquad_t(npts_), type(type_) {}
@@ -300,10 +319,10 @@ enum {
 	TYPE_WALL_TRIM, TYPE_RAILING, TYPE_CRATE, TYPE_BOX, TYPE_MIRROR, TYPE_SHELVES, TYPE_KEYBOARD, TYPE_SHOWER, TYPE_RDESK, TYPE_BOTTLE,
 	TYPE_WINE_RACK, TYPE_COMPUTER, TYPE_MWAVE, TYPE_PAPER, TYPE_BLINDS, TYPE_PEN, TYPE_PENCIL, TYPE_PAINTCAN, TYPE_LG_BALL, TYPE_HANGER_ROD,
 	TYPE_DRAIN, TYPE_MONEY, TYPE_PHONE, TYPE_TPROLL, TYPE_SPRAYCAN, TYPE_MARKER, TYPE_BUTTON, TYPE_CRACK, TYPE_SWITCH, TYPE_PLATE,
-	TYPE_LAPTOP, TYPE_FPLACE, TYPE_LBASKET, TYPE_WHEATER,
-	/* these next ones are all 3D models */
+	TYPE_LAPTOP, TYPE_FPLACE, TYPE_LBASKET, TYPE_WHEATER, TYPE_TAPE,
+	/* these next ones are all 3D models - see logic in room_object_t::is_obj_model_type() */
 	TYPE_TOILET, TYPE_SINK, TYPE_TUB, TYPE_FRIDGE, TYPE_STOVE, TYPE_TV, TYPE_MONITOR, TYPE_COUCH, TYPE_OFF_CHAIR, TYPE_URINAL,
-	TYPE_LAMP, TYPE_WASHER, TYPE_DRYER, TYPE_KEY, TYPE_HANGER, NUM_ROBJ_TYPES};
+	TYPE_LAMP, TYPE_WASHER, TYPE_DRYER, TYPE_KEY, TYPE_HANGER, TYPE_CLOTHES, NUM_ROBJ_TYPES};
 typedef uint8_t room_object;
 enum {SHAPE_CUBE=0, SHAPE_CYLIN, SHAPE_SPHERE, SHAPE_STAIRS_U, SHAPE_TALL, SHAPE_SHORT, SHAPE_ANGLED};
 typedef uint8_t room_obj_shape;
@@ -317,8 +336,8 @@ enum {SHAPE_STRAIGHT=0, SHAPE_U, SHAPE_WALLED, SHAPE_WALLED_SIDES};
 typedef uint8_t stairs_shape;
 enum {ROOM_WALL_INT=0, ROOM_WALL_SEP, ROOM_WALL_EXT};
 enum {/*building models*/ OBJ_MODEL_TOILET=0, OBJ_MODEL_SINK, OBJ_MODEL_TUB, OBJ_MODEL_FRIDGE, OBJ_MODEL_STOVE, OBJ_MODEL_TV, OBJ_MODEL_MONITOR,
-	OBJ_MODEL_COUCH, OBJ_MODEL_OFFICE_CHAIR, OBJ_MODEL_URINAL, OBJ_MODEL_LAMP, OBJ_MODEL_WASHER, OBJ_MODEL_DRYER, OBJ_MODEL_KEY, OBJ_MODEL_HANGER,
-	/*city models*/ OBJ_MODEL_FHYDRANT, NUM_OBJ_MODELS};
+	OBJ_MODEL_COUCH, OBJ_MODEL_OFFICE_CHAIR, OBJ_MODEL_URINAL, OBJ_MODEL_LAMP, OBJ_MODEL_WASHER, OBJ_MODEL_DRYER, OBJ_MODEL_KEY, OBJ_MODEL_HANGER, OBJ_MODEL_CLOTHES,
+	/*city models*/ OBJ_MODEL_FHYDRANT, OBJ_MODEL_SUBSTATION, OBJ_MODEL_UMBRELLA, NUM_OBJ_MODELS};
 
 // object flags
 unsigned const RO_FLAG_LIT     = 0x01; // light is on
@@ -331,13 +350,14 @@ unsigned const RO_FLAG_NODYNAM = 0x40; // for light shadow maps
 unsigned const RO_FLAG_INTERIOR= 0x80; // applies to containing room
 // object flags, second byte
 unsigned const RO_FLAG_EMISSIVE= 0x0100; // for signs, lights, and phones
-unsigned const RO_FLAG_HANGING = 0x0200; // for signs and blinds; treated as "folding" for closet doors
+unsigned const RO_FLAG_HANGING = 0x0200; // for signs, blinds, hangers, and shirts; treated as "folding" for closet doors
 unsigned const RO_FLAG_ADJ_LO  = 0x0400; // for kitchen counters/closets/door trim/blinds/railings
 unsigned const RO_FLAG_ADJ_HI  = 0x0800; // for kitchen counters/closets/door trim/blinds/railings
 unsigned const RO_FLAG_ADJ_BOT = 0x1000; // for door trim
 unsigned const RO_FLAG_ADJ_TOP = 0x2000; // for door trim/railings
 unsigned const RO_FLAG_IS_HOUSE= 0x4000; // used for mirror reflections and shelves
 unsigned const RO_FLAG_RAND_ROT= 0x8000; // random rotation; used for office chairs, papers, and pictures
+unsigned const RO_FLAG_UNTEXTURED = 0x1000; // for shirts, aliased with RO_FLAG_ADJ_BOT
 // object flags, third byte, for pickup/interact state
 unsigned const RO_FLAG_TAKEN1  = 0x010000; // no picture / no bed pillows
 unsigned const RO_FLAG_TAKEN2  = 0x020000; // no bed sheets
@@ -404,12 +424,13 @@ struct room_object_t : public cube_t {
 	bool is_obj_model_type() const {return (type >= TYPE_TOILET && type < NUM_ROBJ_TYPES);}
 	bool is_small_closet() const {return (get_sz_dim(!dim) < 1.2*dz());}
 	bool is_bottle_empty() const {return ((obj_id & 192) == 192);} // empty if both bits 6 and 7 are set
-	bool can_use        () const {return (type == TYPE_SPRAYCAN || type == TYPE_MARKER || type == TYPE_TPROLL || type == TYPE_BOOK || type == TYPE_PHONE);} // excludes dynamic objects
+	bool can_use        () const;
 	bool is_interactive () const {return (has_dstate() || can_use());}
 	bool can_place_onto () const;
 	unsigned get_bottle_type() const {return ((obj_id&63) % NUM_BOTTLE_TYPES);} // first 6 bits are bottle type
 	unsigned get_orient () const {return (2*dim + dir);}
 	float get_radius() const;
+	cylinder_3dw get_cylinder() const;
 	void toggle_lit_state() {flags ^= RO_FLAG_LIT;}
 	static bool enable_rugs();
 	static bool enable_pictures();
@@ -419,7 +440,7 @@ struct room_object_t : public cube_t {
 	int get_comp_monitor_tid() const;
 	int get_sheet_tid() const;
 	int get_paper_tid() const;
-	int get_model_id () const {return ((type == TYPE_MONITOR) ? OBJ_MODEL_TV : (type + OBJ_MODEL_TOILET - TYPE_TOILET));} // monitor has same model as TV
+	int get_model_id () const;
 	void set_as_bottle(unsigned rand_id, unsigned max_type=NUM_BOTTLE_TYPES-1, bool no_empty=0);
 	colorRGBA get_color() const;
 	colorRGBA get_model_color() const;
@@ -460,9 +481,10 @@ class rgeom_mat_t : public rgeom_storage_t { // simplified version of building_d
 	indexed_vao_manager_with_shadow_t vao_mgr;
 public:
 	unsigned num_verts, num_ixs; // for drawing
+	uint8_t dir_mask; // {-x, +x, -y, +y, -z, +z}
 	bool en_shadows;
 
-	rgeom_mat_t(tid_nm_pair_t const &tex_=tid_nm_pair_t()) : rgeom_storage_t(tex_), num_verts(0), num_ixs(0), en_shadows(0) {}
+	rgeom_mat_t(tid_nm_pair_t const &tex_=tid_nm_pair_t()) : rgeom_storage_t(tex_), num_verts(0), num_ixs(0), dir_mask(0), en_shadows(0) {}
 	//~rgeom_mat_t() {assert(vbo_mgr.vbo == 0); assert(vbo_mgr.ivbo == 0);} // VBOs should be freed before destruction
 	void enable_shadows() {en_shadows = 1;}
 	void clear();
@@ -479,8 +501,9 @@ public:
 	void add_sphere_to_verts(cube_t const &c, colorRGBA const &color, bool low_detail=0, vector3d const &skip_hemi_dir=zero_vector, xform_matrix const *const matrix=nullptr);
 	void create_vbo(building_t const &building);
 	void create_vbo_inner();
-	void draw(shader_t &s, bool shadow_only, bool reflection_pass);
-	void upload_draw_and_clear(shader_t &s);
+	void draw(tid_nm_pair_dstate_t &state, brg_batch_draw_t *bbd, int shadow_only, bool reflection_pass);
+	void draw_inner(tid_nm_pair_dstate_t &state, int shadow_only) const;
+	void upload_draw_and_clear(tid_nm_pair_dstate_t &state);
 };
 
 struct building_materials_t : public vector<rgeom_mat_t> {
@@ -488,8 +511,27 @@ struct building_materials_t : public vector<rgeom_mat_t> {
 	unsigned count_all_verts() const;
 	rgeom_mat_t &get_material(tid_nm_pair_t const &tex, bool inc_shadows);
 	void create_vbos(building_t const &building);
-	void draw(shader_t &s, bool shadow_only, bool reflection_pass);
+	void draw(brg_batch_draw_t *bbd, shader_t &s, int shadow_only, bool reflection_pass);
 	void upload_draw_and_clear(shader_t &s);
+};
+
+class brg_batch_draw_t {
+	struct mat_entry_t {
+		tid_nm_pair_t tex;
+		vector<rgeom_mat_t const *> mats;
+		mat_entry_t() {}
+		mat_entry_t(rgeom_mat_t const &m) : tex(m.tex) {mats.push_back(&m);}
+	};
+	vector<mat_entry_t> to_draw;
+	vector<int> tid_to_first_mat_map; // -1 is unset
+public:
+	uint8_t camera_dir_mask;
+
+	brg_batch_draw_t() : camera_dir_mask(0) {}
+	void clear() {to_draw.clear(); tid_to_first_mat_map.clear();}
+	void set_camera_dir_mask(point const &camera_bs, cube_t const &bcube);
+	void add_material(rgeom_mat_t const &m);
+	void draw_and_clear(shader_t &s);
 };
 
 struct obj_model_inst_t {
@@ -504,8 +546,10 @@ struct paint_draw_t {
 };
 struct building_decal_manager_t {
 	paint_draw_t paint_draw[2]; // {interior, exterior}
-	quad_batch_draw blood_qbd, tp_qbd;
-	void draw_building_interior_decals(bool player_in_building) const;
+	quad_batch_draw blood_qbd, tp_qbd, tape_qbd, pend_tape_qbd;
+
+	void commit_pend_tape_qbd();
+	void draw_building_interior_decals(bool player_in_building, bool shadow_only) const;
 };
 
 struct building_room_geom_t {
@@ -520,8 +564,8 @@ struct building_room_geom_t {
 	vector<room_obj_dstate_t> obj_dstate;
 	vector<obj_model_inst_t> obj_model_insts;
 	vector<unsigned> moved_obj_ids;
-	// {large static, small static, dynamic, lights, plants, transparent, door} materials
-	building_materials_t mats_static, mats_small, mats_dynamic, mats_lights, mats_plants, mats_alpha, mats_doors;
+	// {large static, small static, dynamic, lights, alpha mask, transparent, door} materials
+	building_materials_t mats_static, mats_small, mats_dynamic, mats_lights, mats_amask, mats_alpha, mats_doors;
 	vect_cube_t light_bcubes;
 	building_decal_manager_t decal_manager;
 
@@ -534,7 +578,7 @@ struct building_room_geom_t {
 	void clear_static_small_vbos();
 	void clear_and_recreate_lights() {lights_changed = 1;} // cache the state and apply the change later in case this is called from a different thread
 	unsigned get_num_verts() const {return (mats_static.count_all_verts() + mats_small.count_all_verts() + mats_dynamic.count_all_verts() +
-		mats_lights.count_all_verts() + mats_plants.count_all_verts() + mats_alpha.count_all_verts() + mats_doors.count_all_verts());}
+		mats_lights.count_all_verts() + mats_amask.count_all_verts() + mats_alpha.count_all_verts() + mats_doors.count_all_verts());}
 	rgeom_mat_t &get_material(tid_nm_pair_t const &tex, bool inc_shadows=0, bool dynamic=0, bool small=0, bool transparent=0);
 	rgeom_mat_t &get_untextured_material(bool inc_shadows=0, bool dynamic=0, bool small=0, bool transparent=0) {
 		return get_material(tid_nm_pair_t(-1, 1.0, inc_shadows), inc_shadows, dynamic, small, transparent);
@@ -589,6 +633,7 @@ struct building_room_geom_t {
 	void add_money(room_object_t const &c);
 	void add_phone(room_object_t const &c);
 	void add_tproll(room_object_t const &c);
+	void add_tape(room_object_t const &c);
 	static void add_spraycan_to_material(room_object_t const &c, rgeom_mat_t &mat);
 	void add_spraycan(room_object_t const &c);
 	void add_button(room_object_t const &c);
@@ -629,7 +674,7 @@ struct building_room_geom_t {
 	bool closet_light_is_on(cube_t const &closet) const;
 	int find_nearest_pickup_object(building_t const &building, point const &at_pos, vector3d const &in_dir, float range, float &obj_dist) const;
 	bool cube_intersects_moved_obj(cube_t const &c, int ignore_obj_id=-1) const;
-	bool open_nearest_drawer(building_t &building, point const &at_pos, vector3d const &in_dir, float range, bool pickup_item);
+	bool open_nearest_drawer(building_t &building, point const &at_pos, vector3d const &in_dir, float range, bool pickup_item, bool check_only);
 	void remove_object(unsigned obj_id, building_t &building);
 	bool player_pickup_object(building_t &building, point const &at_pos, vector3d const &in_dir);
 	void update_draw_state_for_room_object(room_object_t const &obj, building_t &building, bool was_taken);
@@ -646,7 +691,7 @@ struct building_room_geom_t {
 	void create_lights_vbos(building_t const &building);
 	void create_dynamic_vbos(building_t const &building);
 	void create_door_vbos(building_t const &building);
-	void draw(shader_t &s, building_t const &building, occlusion_checker_noncity_t &oc, vector3d const &xlate,
+	void draw(brg_batch_draw_t *bbd, shader_t &s, building_t const &building, occlusion_checker_noncity_t &oc, vector3d const &xlate,
 		unsigned building_ix, bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building);
 	unsigned allocate_dynamic_state();
 	room_obj_dstate_t &get_dstate(room_object_t const &obj);
@@ -655,7 +700,7 @@ private:
 	static unsigned get_shelves_for_object(room_object_t const &c, cube_t shelves[4]);
 	static void get_shelf_objects(room_object_t const &c_in, cube_t const shelves[4], unsigned num_shelves, vector<room_object_t> &objects);
 	static void add_wine_rack_bottles(room_object_t const &c, vector<room_object_t> &objects);
-	static void add_vert_tproll_to_material(room_object_t const &c, rgeom_mat_t &mat, float sz_ratio=1.0);
+	static void add_vert_roll_to_material(room_object_t const &c, rgeom_mat_t &mat, float sz_ratio=1.0, bool player_held=0);
 }; // building_room_geom_t
 
 struct elevator_t : public cube_t {
@@ -741,7 +786,9 @@ struct door_stack_t : public cube_t {
 	door_stack_t(cube_t const &c, bool dim_, bool dir, bool os=0, bool hs=0) :
 		cube_t(c), dim(dim_), open_dir(dir), hinge_side(hs), on_stairs(os) {assert(is_strictly_normalized());}
 	bool get_check_dirs() const {return (dim ^ open_dir ^ hinge_side ^ 1);}
-	float get_width() const {return get_sz_dim(!dim);}
+	float get_width    () const {return get_sz_dim(!dim);}
+	float get_thickness() const {return DOOR_THICK_TO_WIDTH*get_width();}
+	cube_t get_true_bcube() const {cube_t bc(*this); bc.expand_in_dim(dim, 0.5*get_thickness()); return bc;}
 };
 struct door_t : public door_stack_t {
 	bool open, locked, blocked;
@@ -792,6 +839,8 @@ struct building_interior_t {
 		vector<room_object_t>::const_iterator self, vector3d &cnorm, float &hardness, int &obj_ix) const;
 	bool check_sphere_coll_walls_elevators_doors(building_t const &building, point &pos, point const &p_last, float radius,
 		float wall_test_extra_z, bool check_open_doors, vector3d *cnorm) const;
+	bool line_coll(building_t const &building, point const &p1, point const &p2, point &p_int) const;
+	point find_closest_pt_on_obj_to_pos(building_t const &building, point const &pos, float pad_dist, bool no_ceil_floor) const;
 	void update_dynamic_draw_data() {assert(room_geom); room_geom->update_dynamic_draw_data();}
 	void get_avoid_cubes(vect_cube_t &avoid, float z1, float z2, float floor_thickness, bool same_as_player) const;
 };
@@ -840,8 +889,8 @@ struct building_t : public building_geom_t {
 	unsigned mat_ix;
 	uint8_t hallway_dim, real_num_parts, roof_type; // main hallway dim: 0=x, 1=y, 2=none
 	uint8_t street_dir; // encoded as 2*dim + dir + 1; 0 is unassigned
-	int8_t open_door_ix, basement_part_ix;
-	bool is_house, has_chimney, has_garage, has_shed, has_int_garage, has_courtyard, has_complex_floorplan, has_helipad, has_ac;
+	int8_t open_door_ix, basement_part_ix, has_chimney; // has_chimney: 0=none, 1=interior, 2=exterior with fireplace
+	bool is_house, has_garage, has_shed, has_int_garage, has_courtyard, has_complex_floorplan, has_helipad, has_ac, has_int_fplace;
 	colorRGBA side_color, roof_color, detail_color, door_color, wall_color;
 	cube_t bcube, pri_hall, driveway, porch, assigned_plot;
 	vect_cube_t parts, fences;
@@ -855,11 +904,12 @@ struct building_t : public building_geom_t {
 	friend class building_indir_light_mgr_t;
 
 	building_t(unsigned mat_ix_=0) : mat_ix(mat_ix_), hallway_dim(2), real_num_parts(0), roof_type(ROOF_TYPE_FLAT), street_dir(0), open_door_ix(-1),
-		basement_part_ix(-1), is_house(0), has_chimney(0), has_garage(0), has_shed(0), has_int_garage(0), has_courtyard(0), has_complex_floorplan(0),
-		has_helipad(0), has_ac(0), side_color(WHITE), roof_color(WHITE), detail_color(BLACK), door_color(WHITE), wall_color(WHITE), ao_bcz2(0.0), ground_floor_z1(0.0) {}
+		basement_part_ix(-1), has_chimney(0), is_house(0), has_garage(0), has_shed(0), has_int_garage(0), has_courtyard(0), has_complex_floorplan(0),
+		has_helipad(0), has_ac(0), has_int_fplace(0), side_color(WHITE), roof_color(WHITE), detail_color(BLACK), door_color(WHITE), wall_color(WHITE),
+		ao_bcz2(0.0), ground_floor_z1(0.0) {}
 	building_t(building_geom_t const &bg) : building_geom_t(bg), mat_ix(0), hallway_dim(2), real_num_parts(0), roof_type(ROOF_TYPE_FLAT), street_dir(0), open_door_ix(-1),
-		basement_part_ix(-1), is_house(0), has_chimney(0), has_garage(0), has_shed(0), has_int_garage(0), has_courtyard(0), has_complex_floorplan(0), has_helipad(0),
-		has_ac(0), side_color(WHITE), roof_color(WHITE), detail_color(BLACK), door_color(WHITE), wall_color(WHITE), ao_bcz2(0.0), ground_floor_z1(0.0) {}
+		basement_part_ix(-1), has_chimney(0), is_house(0), has_garage(0), has_shed(0), has_int_garage(0), has_courtyard(0), has_complex_floorplan(0), has_helipad(0),
+		has_ac(0), has_int_fplace(0), side_color(WHITE), roof_color(WHITE), detail_color(BLACK), door_color(WHITE), wall_color(WHITE), ao_bcz2(0.0), ground_floor_z1(0.0) {}
 	static float get_scaled_player_radius();
 	static float get_min_front_clearance() {return 2.05f*get_scaled_player_radius();} // slightly larger than the player diameter
 	bool is_valid() const {return !bcube.is_all_zeros();}
@@ -869,6 +919,7 @@ struct building_t : public building_geom_t {
 	bool has_pri_hall () const {return (hallway_dim <= 1);} // otherswise == 2
 	bool has_basement () const {return (basement_part_ix >= 0);}
 	bool has_driveway () const {return !driveway.is_all_zeros();}
+	bool has_a_garage () const {return (has_garage || has_int_garage);} // external or internal
 	bool enable_driveway_coll() const {return !is_rotated();} // no collision with rotated driveways/porches for now
 	bool is_basement(vect_cube_t::const_iterator it) const {return (int(it - parts.begin()) == basement_part_ix);}
 	bool is_pos_in_basement(point const &pos) const {return (has_basement() && parts[basement_part_ix].contains_pt(pos));};
@@ -893,8 +944,8 @@ struct building_t : public building_geom_t {
 	vect_cube_t::const_iterator get_real_parts_end() const {return (parts.begin() + real_num_parts);}
 	vect_cube_t::const_iterator get_real_parts_end_inc_sec() const {return (get_real_parts_end() + has_sec_bldg());}
 	cube_t const &get_sec_bldg () const {assert(has_sec_bldg()); assert(real_num_parts < parts.size()); return parts[real_num_parts];}
-	cube_t const &get_chimney  () const {assert(has_chimney && parts.size() > 1); return parts.back();}
-	cube_t const &get_fireplace() const {assert(has_chimney && parts.size() > 2); return parts[parts.size()-2];}
+	cube_t const &get_chimney  () const {assert(has_chimney == 2 && parts.size() > 1); return parts.back();}
+	cube_t const &get_fireplace() const {assert(has_chimney == 2 && parts.size() > 2); return parts[parts.size()-2];}
 	void end_add_parts() {assert(parts.size() < 256); real_num_parts = uint8_t(parts.size());}
 	cube_t get_coll_bcube() const;
 
@@ -907,6 +958,7 @@ struct building_t : public building_geom_t {
 	bool check_sphere_coll_interior(point &pos, point const &p_last, vect_cube_t const &ped_bcubes, float radius, bool xy_only, vector3d *cnorm=nullptr) const;
 	unsigned check_line_coll(point const &p1, point const &p2, float &t, vector<point> &points, bool occlusion_only=0, bool ret_any_pt=0, bool no_coll_pt=0) const;
 	bool check_point_or_cylin_contained(point const &pos, float xy_radius, vector<point> &points) const;
+	bool check_point_xy_in_part(point const &pos) const;
 	bool ray_cast_interior(point const &pos, vector3d const &dir, cube_bvh_t const &bvh, point &cpos, vector3d &cnorm, colorRGBA &ccolor) const;
 	void create_building_volume_light_texture(unsigned bix, point const &target, unsigned &tid) const;
 	bool ray_cast_camera_dir(point const &camera_bs, point &cpos, colorRGBA &ccolor) const;
@@ -917,8 +969,9 @@ struct building_t : public building_geom_t {
 		float door_center_shift, float width_scale, bool can_fail, bool opens_up, rand_gen_t &rgen) const;
 	void gen_house(cube_t const &base, rand_gen_t &rgen);
 	bool maybe_add_house_driveway(cube_t const &plot, vect_cube_t &driveways, unsigned building_ix) const;
+	bool get_power_point(vector<point> &ppts) const;
 	void add_solar_panels(rand_gen_t &rgen);
-	bool add_door(cube_t const &c, unsigned part_ix, bool dim, bool dir, bool for_building, bool roof_access=0);
+	bool add_door(cube_t const &c, unsigned part_ix, bool dim, bool dir, bool for_office_building, bool roof_access=0);
 	float gen_peaked_roof(cube_t const &top_, float peak_height, bool dim, float extend_to, float max_dz, unsigned skip_side_tri);
 	float gen_hipped_roof(cube_t const &top_, float peak_height, float extend_to);
 	void place_roof_ac_units(unsigned num, float sz_scale, cube_t const &bounds, vect_cube_t const &avoid, bool avoid_center, rand_gen_t &rgen);
@@ -937,7 +990,9 @@ struct building_t : public building_geom_t {
 	void connect_stacked_parts_with_stairs(rand_gen_t &rgen, cube_t const &part);
 	void gen_room_details(rand_gen_t &rgen, vect_cube_t const &ped_bcubes, unsigned building_ix);
 	void add_stairs_and_elevators(rand_gen_t &rgen);
+	int get_ext_door_dir(cube_t const &door_bcube, bool dim) const;
 	void add_sign_by_door(tquad_with_ix_t const &door, bool outside, std::string const &text, colorRGBA const &color, bool emissive);
+	void add_doorbell(tquad_with_ix_t const &door);
 	void add_exterior_door_signs(rand_gen_t &rgen);
 	void gen_building_doors_if_needed(rand_gen_t &rgen);
 	void maybe_add_special_roof(rand_gen_t &rgen);
@@ -947,7 +1002,8 @@ struct building_t : public building_geom_t {
 	void get_all_drawn_verts(building_draw_t &bdraw, bool get_exterior, bool get_interior, bool get_int_ext_walls);
 	void get_all_drawn_window_verts(building_draw_t &bdraw, bool lights_pass=0, float offset_scale=1.0, point const *const only_cont_pt_in=nullptr) const;
 	void get_all_drawn_window_verts_as_quads(vect_vnctcc_t &verts) const;
-	bool get_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, point const &pos, float dist, unsigned &door_type);
+	bool get_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, point const &pos, float dist);
+	void get_all_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, vector<point> const &pts, float dist);
 	void player_not_near_building() {register_open_ext_door_state(-1);}
 	int find_ext_door_close_to_point(tquad_with_ix_t &door, point const &pos, float dist) const;
 	bool get_building_door_pos_closest_to(point const &target_pos, point &door_pos) const;
@@ -957,7 +1013,7 @@ struct building_t : public building_geom_t {
 	void add_room_lights(vector3d const &xlate, unsigned building_id, bool camera_in_building, int ped_ix, occlusion_checker_noncity_t &oc, vect_cube_t &ped_bcubes, cube_t &lights_bcube);
 	bool toggle_room_light(point const &closest_to, bool sound_from_closest_to=0, int room_id=-1, bool inc_lamps=1);
 	void toggle_light_object(room_object_t const &light, point const &sound_pos);
-	bool apply_player_action_key(point const &closest_to_in, vector3d const &in_dir_in, int mode);
+	bool apply_player_action_key(point const &closest_to_in, vector3d const &in_dir_in, int mode, bool check_only=0);
 	bool move_nearest_object(point const &at_pos, vector3d const &in_dir, float range, int mode);
 	bool interact_with_object(unsigned obj_ix, point const &int_pos, vector3d const &int_dir);
 	bool adjust_blinds_state(unsigned obj_ix);
@@ -970,8 +1026,9 @@ struct building_t : public building_geom_t {
 	void register_player_exit_building () const;
 	bool check_for_wall_ceil_floor_int(point const &p1, point const &p2) const;
 	bool maybe_use_last_pickup_room_object(point const &player_pos);
-	void draw_room_geom(shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, unsigned building_ix, bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building);
-	void gen_and_draw_room_geom(shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, vect_cube_t &ped_bcubes,
+	bool maybe_update_tape(point const &player_pos, bool end_of_tape);
+	void draw_room_geom(brg_batch_draw_t *bbd, shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, unsigned building_ix, bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building);
+	void gen_and_draw_room_geom(brg_batch_draw_t *bbd, shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, vect_cube_t &ped_bcubes,
 		unsigned building_ix, int ped_ix, bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building);
 	void add_split_roof_shadow_quads(building_draw_t &bdraw) const;
 	void clear_room_geom(bool force);
@@ -1013,9 +1070,11 @@ struct building_t : public building_geom_t {
 		bool dim, bool dir, bool opened, bool opens_out, bool exterior, bool on_stairs=0, bool hinge_side=0) const;
 	tquad_with_ix_t set_door_from_cube(cube_t const &c, bool dim, bool dir, unsigned type, float pos_adj,
 		bool exterior, bool opened, bool opens_out, bool opens_up, bool swap_sides) const;
+	tquad_with_ix_t set_interior_door_from_cube(door_t const &door) const;
 	void invalidate_nav_graph();
 	point local_to_camera_space(point const &pos) const;
 	void play_door_open_close_sound(point const &pos, bool open, float gain=1.0, float pitch=1.0) const;
+	void maybe_gen_chimney_smoke() const;
 private:
 	void finish_gen_geometry(rand_gen_t &rgen, bool has_overlapping_cubes);
 	bool add_outdoor_ac_unit(rand_gen_t &rgen);
@@ -1091,6 +1150,7 @@ private:
 	bool can_be_bathroom(room_t const &room) const;
 	bool find_mirror_in_room(unsigned room_id, vector3d const &xlate, bool check_visibility) const;
 	bool find_mirror_needing_reflection(vector3d const &xlate) const;
+	tquad_with_ix_t const &find_main_roof_tquad(rand_gen_t &rgen, bool skip_if_has_other_obj) const;
 	void add_extra_obj_slots();
 	void add_wall_and_door_trim();
 	unsigned count_num_int_doors(room_t const &room) const;
@@ -1229,6 +1289,7 @@ inline float get_tc_leg_width(cube_t const &c, float width) {return 0.5f*width*(
 void get_city_plot_zones(vect_city_zone_t &zones);
 void get_city_building_occluders(pos_dir_up const &pdu, building_occlusion_state_t &state);
 bool check_city_pts_occluded(point const *const pts, unsigned npts, building_occlusion_state_t &state);
+bool city_single_cube_visible_check(point const &pos, cube_t const &c);
 cube_t get_building_lights_bcube();
 unsigned get_street_dir(cube_t const &inner, cube_t const &outer);
 cube_t get_open_closet_door(room_object_t const &c, cube_t const &closed_door);
@@ -1237,7 +1298,7 @@ void get_bed_cubes   (room_object_t const &c, cube_t cubes[6]);
 void get_table_cubes (room_object_t const &c, cube_t cubes[5], bool is_desk);
 void get_chair_cubes (room_object_t const &c, cube_t cubes[3]);
 void get_tc_leg_cubes(cube_t const &c, float width, cube_t cubes[4]);
-float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_only);
+float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_only, bool inside_only);
 float get_cabinet_doors(room_object_t const &c, vect_cube_t &doors);
 void get_cabinet_or_counter_doors(room_object_t const &c, vect_cube_t &doors);
 cube_t get_elevator_car_panel(room_object_t const &c);
@@ -1265,12 +1326,15 @@ void add_tquad_to_verts(building_geom_t const &bg, tquad_with_ix_t const &tquad,
 void get_driveway_sphere_coll_cubes(point const &pos, float radius, bool xy_only, vect_cube_t &out);
 bool have_buildings_ext_paint();
 void draw_buildings_ext_paint();
+void subtract_cube_xy(cube_t const &c, cube_t const &r, cube_t *out);
+bool have_secondary_buildings();
 // functions in city_gen.cc
 void city_shader_setup(shader_t &s, cube_t const &lights_bcube, bool use_dlights, int use_smap, int use_bmap,
-	float min_alpha=0.0, bool force_tsl=0, float pcf_scale=1.0, bool use_texgen=0, bool indir_lighting=0);
+	float min_alpha=0.0, bool force_tsl=0, float pcf_scale=1.0, bool use_texgen=0, bool indir_lighting=0, bool is_outside=1);
 void enable_animations_for_shader(shader_t &s);
 void setup_city_lights(vector3d const &xlate);
 void draw_peds_in_building(int first_ped_ix, ped_draw_vars_t const &pdv); // from city_gen.cpp
+void get_locations_of_peds_in_building(int first_ped_ix, vector<point> &locs); // from city_gen.cpp
 void get_ped_bcubes_for_building(int first_ped_ix, unsigned bix, vect_cube_t &bcubes, bool moving_only=0); // from city_gen.cpp
 void register_person_hit(unsigned person_ix, room_object_t const &obj, vector3d const &velocity);
 void draw_player_model(shader_t &s, vector3d const &xlate, bool shadow_only);
@@ -1280,4 +1344,5 @@ void draw_cars_in_garages(vector3d const &xlate, bool shadow_only);
 void create_mirror_reflection_if_needed();
 void draw_city_roads(int trans_op_mask, vector3d const &xlate);
 void get_closest_dim_dir_xy(cube_t const &inner, cube_t const &outer, bool &dim, bool &dir);
+bool check_city_tline_cube_intersect_xy(cube_t const &c);
 

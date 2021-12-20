@@ -6,6 +6,7 @@
 #include "3DWorld.h"
 
 struct xform_matrix;
+class tree_cont_t;
 
 int omp_get_thread_num_3dw();
 
@@ -189,14 +190,17 @@ void draw_circle_normal(float r_inner, float r_outer, int ndiv, int invert_norma
 void draw_circle_normal(float r_inner, float r_outer, int ndiv, int invert_normals, float zval=0.0);
 void begin_cylin_vertex_buffering();
 void flush_cylin_vertex_buffer();
-void gen_cone_triangles(vector<vert_norm_tc> &verts, vector_point_norm const &vpn, bool two_sided_lighting=0, float tc_t0=0.0, float tc_t1=1.0, vector3d const &xlate=zero_vector);
+void gen_cone_triangles(vector<vert_norm_tc> &verts, vector_point_norm const &vpn,
+	bool two_sided_lighting=0, float tc_t0=0.0, float tc_t1=1.0, float ts_scale=1.0, vector3d const &xlate=zero_vector);
 void gen_cone_triangles_tp(vector<vert_norm_texp> &verts, vector_point_norm const &vpn, bool two_sided_lighting, texgen_params_t const &tp);
-void gen_cylinder_triangle_strip(vector<vert_norm_tc> &verts, vector_point_norm const &vpn, bool two_sided_lighting=0, float tc_t0=0.0, float tc_t1=1.0, vector3d const &xlate=zero_vector);
+void gen_cylinder_triangle_strip(vector<vert_norm_tc> &verts, vector_point_norm const &vpn,
+	bool two_sided_lighting=0, float tc_t0=0.0, float tc_t1=1.0, float ts_scale=1.0, vector3d const &xlate=zero_vector);
 void gen_cylinder_quads(vector<vert_norm_tc> &verts, vector_point_norm const &vpn, bool two_sided_lighting);
 void gen_cylinder_quads(vector<vert_norm_texp> &verts, vector_point_norm const &vpn, texgen_params_t const &tp, bool two_sided_lighting);
 void add_cylin_ends(float radius1, float radius2, int ndiv, bool texture, int draw_sides_ends, vector3d const &v12, point const ce[2], point const &xlate, vector_point_norm const &vpn);
 void draw_fast_cylinder(point const &p1, point const &p2, float radius1, float radius2, int ndiv, bool texture,
-	int draw_sides_ends=0, bool two_sided_lighting=0, float const *const perturb_map=NULL, float tex_scale_len=1.0, float tex_t_start=0.0, point const *inst_pos=NULL, unsigned num_insts=0);
+	int draw_sides_ends=0, bool two_sided_lighting=0, float const *const perturb_map=NULL, float tex_scale_len=1.0,
+	float tex_t_start=0.0, point const *inst_pos=NULL, unsigned num_insts=0, float tex_width_scale=1.0);
 void draw_shadow_cylinder(point const &p1, point const &p2, float radius1, float radius2, int ndiv, int draw_ends, float const *const perturb_map);
 void draw_cylindrical_section(float length, float r_inner, float r_outer, int ndiv, bool texture=0, float tex_scale_len=1.0, float z_offset=0.0);
 void draw_cube_mapped_sphere(point const &center, float radius, unsigned ndiv, bool texture=0);
@@ -278,7 +282,7 @@ void update_tiled_terrain_grass_vbos();
 void draw_tiled_terrain_water(shader_t &s, float zval);
 bool sphere_int_tiled_terrain(point &pos, float radius);
 bool check_player_tiled_terrain_collision();
-bool line_intersect_tiled_mesh(point const &v1, point const &v2, point &p_int);
+bool line_intersect_tiled_mesh(point const &v1, point const &v2, point &p_int, bool inc_trees=0);
 void change_inf_terrain_fire_mode(int val, bool mouse_wheel);
 void inf_terrain_fire_weapon();
 void inf_terrain_undo_hmap_mod();
@@ -343,7 +347,7 @@ bool is_night(float adj=0.0);
 bool parse_city_option(FILE *fp);
 bool have_cities();
 bool have_city_models();
-float get_road_max_len();
+vector2d get_road_max_len();
 float get_road_max_width();
 float get_min_obj_spacing();
 void gen_cities(float *heightmap, unsigned xsize, unsigned ysize);
@@ -533,6 +537,7 @@ float line_line_dist(point const &p1a, point const &p1b, point const &p2a, point
 float get_cylinder_params(point const &cp1, point const &cp2, point const &pos, vector3d &v1, vector3d &v2);
 int  line_intersect_trunc_cone(point const &p1, point const &p2, point const &cp1, point const &cp2,
 							   float r1, float r2, bool check_ends, float &t, bool swap_ends=0);
+bool line_intersect_cylinder_with_t(point const &p1, point const &p2, cylinder_3dw const &c, bool check_ends, float &t);
 bool line_intersect_cylinder(point const &p1, point const &p2, cylinder_3dw const &c, bool check_ends);
 int  line_int_thick_cylinder(point const &p1, point const &p2, point const &cp1, point const &cp2,
 							 float ri1, float ri2, float ro1, float ro2, bool check_ends, float &t);
@@ -557,6 +562,9 @@ void rotate_vector3d_by_vr_multi(vector3d v1, vector3d v2, vector3d *vout, unsig
 void rotate_norm_vector3d_into_plus_z_multi(vector3d const &v1, vector3d *vout, unsigned num_vout, float rot_dir_sign=1.0);
 cube_t rotate_cube(cube_t const &cube, vector3d const &axis, float angle_in_radians);
 void mirror_about_plane(vector3d const &norm, point const &pt);
+bool line_segs_intersect_2d(vector2d const &L1a, vector2d const &L1b, vector2d const &L2a, vector2d const &L2b);
+float point_line_seg_dist_2d(vector2d const &pt, vector2d const &La, vector2d const &Lb);
+float line_seg_line_seg_dist_2d(vector2d const &L1a, vector2d const &L1b, vector2d const &L2a, vector2d const &L2b);
 vector3d rtp_to_xyz(float radius, double theta, double phi);
 vector3d gen_rand_vector_uniform(float mag);
 vector3d gen_rand_vector(float mag, float zscale=1.0, float phi_term=PI);
@@ -727,7 +735,7 @@ void draw_blasts(shader_t &s);
 void draw_universe_blasts();
 
 // function prototypes - scenery
-void gen_scenery();
+void gen_scenery(tree_cont_t const &trees);
 void draw_scenery(bool shadow_only=0);
 void draw_scenery_fires(shader_t &s);
 bool update_scenery_zvals(int x1, int y1, int x2, int y2);
@@ -1010,6 +1018,7 @@ int get_building_bcube_contains_pos(point const &pos);
 bool check_buildings_ped_coll(point const &pos, float radius, unsigned plot_id, unsigned &building_id);
 bool select_building_in_plot(unsigned plot_id, unsigned rand_val, unsigned &building_id);
 void get_building_bcubes(cube_t const &xy_range, vect_cube_t &bcubes);
+void get_building_power_points(cube_t const &xy_range, vector<point> &ppts);
 bool get_buildings_line_hit_color(point const &p1, point const &p2, colorRGBA &color);
 bool have_buildings();
 unsigned get_buildings_gpu_mem_usage();
@@ -1026,7 +1035,7 @@ bool any_cube_contains_pt_xy(vect_cube_t const &cubes, vector3d const &pos);
 bool line_int_cubes_xy(point const &p1, point const &p2, vect_cube_t const &cubes);
 bool remove_cube_if_contains_pt_xy(vect_cube_t &cubes, vector3d const &pos, unsigned start=0);
 
-void alut_sleep(float seconds); // this is generally useful for sleep so has been added here
+void sleep_for_ms(unsigned milliseconds);
 void checked_fclose(FILE *fp);
 
 #include "inlines.h"

@@ -62,13 +62,13 @@ struct city_params_t {
 	unsigned num_cities, num_samples, num_conn_tries, city_size_min, city_size_max, city_border, road_border, slope_width, num_rr_tracks, park_rate;
 	float road_width, road_spacing, road_spacing_rand, road_spacing_xy_add, conn_road_seg_len, max_road_slope, residential_probability;
 	unsigned make_4_way_ints; // 0=all 3-way intersections; 1=allow 4-way; 2=all connector roads must have at least a 4-way on one end; 3=only 4-way (no straight roads)
+	unsigned add_tlines; // 0=never, 1=always, 2=only when there are no secondary buildings
 	bool assign_house_plots, new_city_conn_road_alg;
 	// cars
 	unsigned num_cars;
 	float car_speed, traffic_balance_val, new_city_prob, max_car_scale;
-	bool enable_car_path_finding, convert_model_files;
+	bool enable_car_path_finding, convert_model_files, cars_use_driveways;
 	vector<city_model_t> car_model_files, ped_model_files, hc_model_files;
-	city_model_t fire_hydrant_model_file;
 	// parking lots
 	unsigned min_park_spaces, min_park_rows;
 	float min_park_density, max_park_density;
@@ -85,13 +85,13 @@ struct city_params_t {
 	float ped_speed;
 	bool ped_respawn_at_dest;
 	// buildings; maybe should be building params, but we have the model loading code here
-	city_model_t building_models[NUM_OBJ_MODELS];
+	vector<city_model_t> building_models[NUM_OBJ_MODELS]; // multiple model files per type
 
 	city_params_t() : num_cities(0), num_samples(100), num_conn_tries(50), city_size_min(0), city_size_max(0), city_border(0), road_border(0), slope_width(0),
 		num_rr_tracks(0), park_rate(0), road_width(0.0), road_spacing(0.0), road_spacing_rand(0.0), road_spacing_xy_add(0.0), conn_road_seg_len(1000.0),
-		max_road_slope(1.0), residential_probability(0.0), make_4_way_ints(0), assign_house_plots(0), new_city_conn_road_alg(0), num_cars(0), car_speed(0.0),
-		traffic_balance_val(0.5), new_city_prob(1.0), max_car_scale(1.0), enable_car_path_finding(0), convert_model_files(0), min_park_spaces(12),
-		min_park_rows(1), min_park_density(0.0), max_park_density(1.0), car_shadows(0), max_lights(1024), max_shadow_maps(0), smap_size(0),
+		max_road_slope(1.0), residential_probability(0.0), make_4_way_ints(0), add_tlines(2), assign_house_plots(0), new_city_conn_road_alg(0), num_cars(0),
+		car_speed(0.0), traffic_balance_val(0.5), new_city_prob(1.0), max_car_scale(1.0), enable_car_path_finding(0), convert_model_files(0), cars_use_driveways(0),
+		min_park_spaces(12), min_park_rows(1), min_park_density(0.0), max_park_density(1.0), car_shadows(0), max_lights(1024), max_shadow_maps(0), smap_size(0),
 		max_trees_per_plot(0), tree_spacing(1.0), max_benches_per_plot(0), num_peds(0), num_building_peds(0), ped_speed(0.0), ped_respawn_at_dest(0) {}
 	bool enabled() const {return (num_cities > 0 && city_size_min > 0);}
 	bool roads_enabled() const {return (road_width > 0.0 && road_spacing > 0.0);}
@@ -106,6 +106,7 @@ struct city_params_t {
 
 
 struct car_base_t;
+struct driveway_t;
 
 struct road_gen_base_t {
 	virtual cube_t get_bcube_for_car(car_base_t const &car) const = 0;
@@ -120,14 +121,16 @@ struct waiting_obj_t {
 	float get_wait_time_secs() const {return (float(tfticks) - waiting_start)/TICKS_PER_SECOND;} // Note: only meaningful for cars stopped at lights or peds stopped at roads
 };
 
-struct car_base_t { // the part needed for the pedestrian interface (size = 36)
+struct car_base_t { // the part needed for the pedestrian interface (size = 48)
 	cube_t bcube;
 	bool dim, dir, stopped_at_light;
 	unsigned char cur_road_type, turn_dir;
 	unsigned short cur_city, cur_road, cur_seg;
+	short dest_driveway; // -1 is unset
 	float max_speed, cur_speed;
 
-	car_base_t() : bcube(all_zeros), dim(0), dir(0), stopped_at_light(0), cur_road_type(TYPE_RSEG), turn_dir(TURN_NONE), cur_city(0), cur_road(0), cur_seg(0), max_speed(0.0), cur_speed(0.0) {}
+	car_base_t() : bcube(all_zeros), dim(0), dir(0), stopped_at_light(0), cur_road_type(TYPE_RSEG), turn_dir(TURN_NONE),
+		cur_city(0), cur_road(0), cur_seg(0), dest_driveway(-1), max_speed(0.0), cur_speed(0.0) {}
 	point get_center() const {return bcube.get_cube_center();}
 	unsigned get_orient() const {return (2*dim + dir);}
 	unsigned get_orient_in_isec() const {return (2*dim + (!dir));} // invert dir (incoming, not outgoing)
@@ -143,35 +146,52 @@ struct car_base_t { // the part needed for the pedestrian interface (size = 36)
 	point get_front(float dval=0.5) const;
 };
 
-struct car_t : public car_base_t, public waiting_obj_t { // size = 96
+struct car_t : public car_base_t, public waiting_obj_t { // size = 100
 	cube_t prev_bcube;
-	bool entering_city, in_tunnel, dest_valid, destroyed, in_reverse;
+	bool is_truck, entering_city, in_tunnel, dest_valid, destroyed, in_reverse, engine_running;
 	unsigned char color_id, front_car_turn_dir, model_id;
 	unsigned short dest_city, dest_isec;
-	short dest_driveway; // -1 is unset
-	float height, dz, rot_z, turn_val, waiting_pos;
+	float height, dz, rot_z, turn_val, waiting_pos, wake_time;
 	car_t const *car_in_front;
 
-	car_t() : prev_bcube(all_zeros), entering_city(0), in_tunnel(0), dest_valid(0), destroyed(0), in_reverse(0), color_id(0), front_car_turn_dir(TURN_UNSPEC),
-		model_id(0), dest_city(0), dest_isec(0), dest_driveway(-1), height(0.0), dz(0.0), rot_z(0.0), turn_val(0.0), waiting_pos(0.0), car_in_front(nullptr) {}
-	bool is_valid() const {return !bcube.is_all_zeros();}
+	car_t() : prev_bcube(all_zeros), is_truck(0), entering_city(0), in_tunnel(0), dest_valid(0), destroyed(0), in_reverse(0), engine_running(0),
+		color_id(0), front_car_turn_dir(TURN_UNSPEC), model_id(0), dest_city(0), dest_isec(0), height(0.0), dz(0.0), rot_z(0.0),
+		turn_val(0.0), waiting_pos(0.0), wake_time(0.0), car_in_front(nullptr) {}
+	void set_bcube(point const &center, vector3d const &sz);
+	bool is_valid   () const {return !bcube.is_all_zeros();}
+	bool is_sleeping() const {return (wake_time > 0.0);}
 	float get_max_lookahead_dist() const;
 	bool headlights_on() const;
 	float get_turn_rot_z(float dist_to_turn) const;
+	bool is_close_to_player() const;
 	colorRGBA const &get_color() const {assert(color_id < NUM_CAR_COLORS); return car_colors[color_id];}
+	unsigned get_unique_id() const {return (unsigned(1000000.0*max_speed) + color_id + (model_id<<8));} // not guaranteed to be unique, but pretty close
 	void apply_scale(float scale);
 	void destroy();
 	float get_min_sep_dist_to_car(car_t const &c, bool add_one_car_len=0) const;
 	string str() const;
 	string label_str() const;
+	void choose_max_speed(rand_gen_t &rgen);
 	void move(float speed_mult);
+	void set_target_speed(float speed_factor);
 	void maybe_accelerate(float mult=0.02);
 	void accelerate(float mult=0.02) {cur_speed = min(get_max_speed(), (cur_speed + mult*fticks*max_speed));}
 	void decelerate(float mult=0.05) {cur_speed = max(0.0f, (cur_speed - mult*fticks*max_speed));}
 	void decelerate_fast() {decelerate(10.0);} // Note: large decel to avoid stopping in an intersection
 	void park() {cur_speed = max_speed = 0.0;}
 	void stop() {cur_speed = 0.0;} // immediate stop
-	void move_by(float val) {bcube.d[dim][0] += val; bcube.d[dim][1] += val;}
+	void sleep(rand_gen_t &rgen, float min_time_secs);
+	bool maybe_wake(rand_gen_t &rgen);
+	void move_by(float val) {bcube.translate_dim(dim, val);}
+	void begin_turn() {turn_val = bcube.get_center_dim(!dim);}
+	bool maybe_apply_turn(float centerline, bool for_driveway);
+	void complete_turn_and_swap_dim();
+	bool must_wait_entering_or_crossing_road(vector<car_t> const &cars, driveway_t const &driveway, unsigned road_ix, float lookahead_time) const;
+	bool check_for_road_clear_and_wait(vector<car_t> const &cars, driveway_t const &driveway, unsigned road_ix);
+	bool run_enter_driveway_logic(vector<car_t> const &cars, driveway_t const &driveway);
+	void pull_into_driveway(driveway_t const &driveway, rand_gen_t &rgen);
+	void back_or_pull_out_of_driveway(driveway_t const &driveway);
+	bool exit_driveway_to_road(vector<car_t> const &cars, driveway_t const &driveway, float centerline, unsigned road_ix, rand_gen_t &rgen);
 	bool check_collision(car_t &c, road_gen_base_t const &road_gen);
 	bool proc_sphere_coll(point &pos, point const &p_last, float radius, vector3d const &xlate, vector3d *cnorm) const;
 	bool front_intersects_car(car_t const &c) const;
@@ -196,7 +216,8 @@ struct comp_car_road {
 };
 struct comp_car_city_then_road {
 	bool operator()(car_base_t const &c1, car_base_t const &c2) const {
-		return ((c1.cur_city != c2.cur_city) ? (c1.cur_city < c2.cur_city) : (c1.cur_road < c2.cur_road));
+		if (c1.cur_city != c2.cur_city) return (c1.cur_city < c2.cur_city);
+		return ((c1.is_parked() != c2.is_parked()) ? c2.is_parked() : (c1.cur_road < c2.cur_road));
 	}
 };
 struct comp_car_road_then_pos {
@@ -277,16 +298,24 @@ struct road_seg_t : public road_t {
 
 struct driveway_t : public cube_t {
 	bool dim, dir; // direction to road; d[dim][dir] is the edge shared with the road
-	mutable bool in_use; // either reserves the spot, or car <car_ix> is parked there; modified by car_manager in a different thread - must be mutable, maybe should be atomic
+	// in_use is modified by car_manager in a different thread - must be mutable, maybe should be atomic
+	mutable uint8_t in_use; // either reserves the spot, or a car is parked there; 1=temporary, 2=permanent
+	mutable uint8_t ped_count; // count of pedestrians in the driveway
 	unsigned plot_ix;
-	int car_ix; // driveway can old exactly one car; -1 = none
-	driveway_t() : dim(0), dir(0), in_use(0), plot_ix(0), car_ix(-1) {}
-	driveway_t(cube_t const &c, bool dim_, bool dir_, unsigned pix) : cube_t(c), dim(dim_), dir(dir_), in_use(0), plot_ix(pix), car_ix(-1) {}
+	driveway_t() : dim(0), dir(0), in_use(0), ped_count(0), plot_ix(0) {}
+	driveway_t(cube_t const &c, bool dim_, bool dir_, unsigned pix) : cube_t(c), dim(dim_), dir(dir_), in_use(0), ped_count(0), plot_ix(pix) {}
 	float get_edge_at_road() const {return d[dim][dir];}
-	float get_length() const {return get_sz_dim(dim);}
-	int get_cur_car()  const {return (in_use ? car_ix : -1);} // if not in use, return -1/none even if car_ix hasn't been reset
-	void add_car(unsigned ix) {assert(!in_use); car_ix = ix; in_use = 1;}
+	float get_length() const {return get_sz_dim( dim);}
+	float get_width () const {return get_sz_dim(!dim);}
+	cube_t extend_across_road() const;
 	tex_range_t get_tex_range(float ar) const;
+};
+
+struct dw_query_t {
+	driveway_t const *const driveway;
+	unsigned dix;
+	dw_query_t() : driveway(nullptr), dix(0) {}
+	dw_query_t(driveway_t const *const driveway_, unsigned dix_) : driveway(driveway_), dix(dix_) {}
 };
 
 struct road_plot_t : public cube_t {
@@ -381,37 +410,54 @@ namespace stoplight_ns {
 	};
 } // end stoplight_ns
 
+class hedge_draw_t : public vao_manager_t {
+	unsigned num_verts;
+	cube_t bcube;
+	vect_cube_t to_draw;
+
+	void create(cube_t const &bc);
+public:
+	hedge_draw_t() : num_verts(0) {}
+	bool empty() const {return to_draw.empty();}
+	void add(cube_t const &bc) {to_draw.push_back(bc);}
+	void draw_and_clear(shader_t &s);
+};
 
 struct draw_state_t {
 	shader_t s;
 	vector3d xlate;
 	bool use_building_lights;
 	unsigned pass_ix;
+	float draw_tile_dist;
+	hedge_draw_t hedge_draw;
 protected:
 	bool use_smap, use_bmap, shadow_only, use_dlights, emit_now;
 	point_sprite_drawer_sized light_psd; // for car/traffic lights
 	string label_str;
 	point label_pos;
 public:
-	draw_state_t() : use_building_lights(0), pass_ix(0), use_smap(0), use_bmap(0), shadow_only(0), use_dlights(0), emit_now(0) {}
+	draw_state_t() : use_building_lights(0), pass_ix(0), draw_tile_dist(0.0), use_smap(0), use_bmap(0), shadow_only(0), use_dlights(0), emit_now(0) {}
  	virtual ~draw_state_t() {}
 	void set_enable_normal_map(bool val) {use_bmap = val;}
+	bool normal_maps_enabled() const {return use_bmap;}
 	virtual void draw_unshadowed() {}
 	void begin_tile(point const &pos, bool will_emit_now=0, bool ensure_active=0);
 	void pre_draw(vector3d const &xlate_, bool use_dlights_, bool shadow_only_, bool always_setup_shader);
 	void end_draw();
 	virtual void post_draw();
+	void set_untextured_material();
+	void unset_untextured_material();
 	void ensure_shader_active();
 	void draw_and_clear_light_flares();
 	bool check_sphere_visible(point const &pos, float radius) const {return camera_pdu.sphere_visible_test((pos + xlate), radius);}
-	bool check_cube_visible(cube_t const &bc, float dist_scale=1.0, bool shadow_only=0) const;
+	bool check_cube_visible(cube_t const &bc, float dist_scale=1.0) const;
 	static void set_cube_pts(cube_t const &c, float z1f, float z1b, float z2f, float z2b, bool d, bool D, point p[8]);
 	static void set_cube_pts(cube_t const &c, float z1, float z2, bool d, bool D, point p[8]) {set_cube_pts(c, z1, z1, z2, z2, d, D, p);}
 	static void set_cube_pts(cube_t const &c, bool d, bool D, point p[8]) {set_cube_pts(c, c.z1(), c.z2(), d, D, p);}
 	static void rotate_pts(point const &center, float sine_val, float cos_val, int d, int e, point p[8]);
 	void draw_cube(quad_batch_draw &qbd, color_wrapper const &cw, point const &center, point const p[8], bool skip_bottom,
 		bool invert_normals=0, float tscale=0.0, unsigned skip_dims=0) const;
-	void draw_cube(quad_batch_draw &qbd, cube_t const &c, color_wrapper const &cw, bool skip_bottom, float tscale=0.0, unsigned skip_dims=0) const;
+	void draw_cube(quad_batch_draw &qbd, cube_t const &c, color_wrapper const &cw, bool skip_bottom=0, float tscale=0.0, unsigned skip_dims=0) const;
 	bool add_light_flare(point const &flare_pos, vector3d const &n, colorRGBA const &color, float alpha, float radius);
 	void set_label_text(string const &str, point const &pos) {label_str = str; label_pos = pos;}
 	void show_label_text();
@@ -524,6 +570,19 @@ struct tunnel_t : public road_connector_t {
 	bool line_intersect(point const &p1, point const &p2, float &t) const;
 };
 
+struct transmission_line_t {
+	unsigned city1, city2;
+	float tower_height;
+	point p1, p2, p1_wire_pts[3], p2_wire_pts[3];
+	cube_t bcube;
+	vector<point> tower_pts;
+	transmission_line_t(unsigned c1, unsigned c2, float tower_height_, point const &p1_, point const &p2_) :
+		city1(c1), city2(c2), tower_height(tower_height_), p1(p1_), p2(p2_) {}
+	void calc_bcube();
+	bool sphere_intersect_xy(point const &pos, float radius) const;
+	bool cube_intersect_xy(cube_t const &c) const;
+};
+
 struct range_pair_t {
 	unsigned s, e; // Note: e is one past the end
 	range_pair_t(unsigned s_=0, unsigned e_=0) : s(s_), e(e_) {}
@@ -535,6 +594,7 @@ class road_draw_state_t : public draw_state_t {
 	float ar;
 
 	void draw_city_region_int(quad_batch_draw &cache, unsigned type_ix);
+	void draw_transmission_line_wires(point const &p1, point const &p2, point const wire_pts1[3], point const wire_pts2[3], float radius);
 public:
 	road_draw_state_t() : ar(1.0) {}
 	void pre_draw(vector3d const &xlate_, bool use_dlights_, bool shadow_only, bool always_setup_shader=0);
@@ -562,6 +622,7 @@ public:
 	void add_bridge_quad(point const pts[4], color_wrapper const &cw, float normal_scale);
 	void draw_tunnel(tunnel_t const &tunnel, bool shadow_only);
 	void draw_stoplights(vector<road_isec_t> const &isecs, range_pair_t const &rp, bool shadow_only);
+	void draw_transmission_line(transmission_line_t const &tline);
 }; // road_draw_state_t
 
 class ao_draw_state_t : public draw_state_t {
@@ -590,7 +651,7 @@ public:
 	void pre_draw(vector3d const &xlate_, bool use_dlights_, bool shadow_only_);
 	virtual void draw_unshadowed();
 	void add_car_headlights(vector<car_t> const &cars, vector3d const &xlate_, cube_t &lights_bcube);
-	void gen_car_pts(car_t const &car, bool include_top, point pb[8], point pt[8]) const;
+	static void gen_car_pts(car_t const &car, bool include_top, point pb[8], point pt[8]);
 	void draw_car(car_t const &car, bool is_dlight_shadows, bool in_garage);
 	void draw_helicopter(helicopter_t const &h, bool shadow_only);
 	void add_car_headlights(car_t const &car, cube_t &lights_bcube);
@@ -601,6 +662,7 @@ public:
 class city_road_gen_t;
 struct pedestrian_t;
 class ped_manager_t;
+class city_spectate_manager_t;
 
 struct ped_city_vect_t {
 	vector<vector<vector<sphere_t>>> peds; // per city per road
@@ -653,6 +715,7 @@ class car_manager_t { // and trucks and helicopters
 	vector3d get_helicopter_size(unsigned model_id);
 	void draw_helicopters(bool shadow_only);
 public:
+	friend class city_spectate_manager_t;
 	car_manager_t(city_road_gen_t const &road_gen_) :
 		road_gen(road_gen_), dstate(car_model_loader, helicopter_model_loader), first_parked_car(0), first_garage_car(0), car_destroyed(0) {}
 	bool empty() const {return cars.empty();}
@@ -690,20 +753,23 @@ struct pedestrian_t : public waiting_obj_t {
 	unsigned plot, next_plot, dest_plot, dest_bldg; // Note: can probably be made unsigned short later, though these are global plot and building indices
 	unsigned short city, model_id, ssn, colliding_ped, cur_rseed;
 	unsigned char stuck_count;
-	bool collided, ped_coll, is_stopped, in_the_road, at_crosswalk, at_dest, has_dest_bldg, has_dest_car, destroyed, in_building, following_player, is_on_stairs, has_key;
+	bool collided, ped_coll, is_stopped, in_the_road, at_crosswalk, at_dest, has_dest_bldg, has_dest_car, destroyed, in_building, following_player, is_on_stairs, has_key, is_female;
 
 	pedestrian_t(float radius_) : target_pos(all_zeros), dir(zero_vector), vel(zero_vector), pos(all_zeros), radius(radius_), speed(0.0), anim_time(0.0), retreat_time(0.0),
 		plot(0), next_plot(0), dest_plot(0), dest_bldg(0), city(0), model_id(0), ssn(0), colliding_ped(0), cur_rseed(1), stuck_count(0), collided(0), ped_coll(0), is_stopped(0),
-		in_the_road(0), at_crosswalk(0), at_dest(0), has_dest_bldg(0), has_dest_car(0), destroyed(0), in_building(0), following_player(0), is_on_stairs(0), has_key(0) {}
+		in_the_road(0), at_crosswalk(0), at_dest(0), has_dest_bldg(0), has_dest_car(0), destroyed(0), in_building(0), following_player(0), is_on_stairs(0), has_key(0), is_female(0) {}
 	bool operator<(pedestrian_t const &ped) const {return ((city == ped.city) ? (plot < ped.plot) : (city < ped.city));} // currently only compares city + plot
 	string get_name() const;
 	string str() const;
+	unsigned get_unique_id() const {return ssn;} // technically only unique if there are <= 65536 people
 	float get_speed_mult() const;
 	float get_height () const {return PED_HEIGHT_SCALE*radius;}
 	float get_width  () const {return PED_WIDTH_SCALE *radius;}
+	float get_coll_radius() const {return 0.6f*radius;} // using a smaller radius to allow peds to get close to each other
 	float get_z1     () const {return (pos.z - radius);}
 	float get_z2     () const {return (get_z1() + get_height());}
 	cube_t get_bcube () const;
+	point get_eye_pos() const {return (pos + vector3d(0.0, 0.0, (0.9*get_height() - radius)));}
 	bool target_valid() const {return (target_pos != all_zeros);}
 	//bool on_stairs   () const {return (fabs(pos.z - target_pos.z) > 0.01*radius);} // walking on a slope; allow for some floating-point error
 	bool on_stairs   () const {return is_on_stairs;}
@@ -721,7 +787,7 @@ struct pedestrian_t : public waiting_obj_t {
 	bool check_road_coll(ped_manager_t const &ped_mgr, cube_t const &plot_bcube, cube_t const &next_plot_bcube) const;
 	bool is_valid_pos(vect_cube_t const &colliders, bool &ped_at_dest, ped_manager_t const *const ped_mgr) const;
 	bool try_place_in_plot(cube_t const &plot_cube, vect_cube_t const &colliders, unsigned plot_id, rand_gen_t &rgen);
-	point get_dest_pos(cube_t const &plot_bcube, cube_t const &next_plot_bcube, ped_manager_t const &ped_mgr) const;
+	point get_dest_pos(cube_t const &plot_bcube, cube_t const &next_plot_bcube, ped_manager_t const &ped_mgr, int &debug_state) const;
 	bool choose_alt_next_plot(ped_manager_t const &ped_mgr);
 	void get_avoid_cubes(ped_manager_t const &ped_mgr, vect_cube_t const &colliders, cube_t const &plot_bcube, cube_t const &next_plot_bcube, point &dest_pos, vect_cube_t &avoid) const;
 	void next_frame(ped_manager_t &ped_mgr, vector<pedestrian_t> &peds, unsigned pid, rand_gen_t &rgen, float delta_dir);
@@ -802,10 +868,13 @@ class ped_manager_t { // pedestrians
 	bool draw_ped(pedestrian_t const &ped, shader_t &s, pos_dir_up const &pdu, vector3d const &xlate, float def_draw_dist, float draw_dist_sq,
 		bool &in_sphere_draw, bool shadow_only, bool is_dlight_shadows, bool enable_animations);
 public:
+	friend class city_spectate_manager_t;
 	// for use in pedestrian_t, mostly for collisions and path finding
 	path_finder_t path_finder;
 	vect_cube_t const &get_colliders_for_plot(unsigned city_ix, unsigned plot_ix) const;
 	road_plot_t const &get_city_plot_for_peds(unsigned city_ix, unsigned plot_ix) const;
+	dw_query_t get_nearby_driveway(unsigned city_ix, unsigned plot_ix, point const &pos, float dist) const;
+	car_base_t const *find_car_using_driveway(unsigned city_ix, dw_query_t const &dw) const;
 	cube_t get_expanded_city_bcube_for_peds(unsigned city_ix) const;
 	cube_t get_expanded_city_plot_bcube_for_peds(unsigned city_ix, unsigned plot_ix) const;
 	bool is_city_residential(unsigned city_ix) const;
@@ -839,6 +908,7 @@ public:
 	void get_peds_crossing_roads(ped_city_vect_t &pcv) const;
 	void draw(vector3d const &xlate, bool use_dlights, bool shadow_only, bool is_dlight_shadows);
 	void draw_peds_in_building(int first_ped_ix, ped_draw_vars_t const &pdv);
+	void get_locations_of_peds_in_building(int first_ped_ix, vector<point> &locs) const;
 	void get_ped_bcubes_for_building(int first_ped_ix, unsigned bix, vect_cube_t &bcubes, bool moving_only) const;
 	void register_person_hit(unsigned person_ix, room_object_t const &obj, vector3d const &velocity);
 	void draw_player_model(shader_t &s, vector3d const &xlate, bool shadow_only);
@@ -856,8 +926,12 @@ template <typename T> void remove_destroyed(vector<T> &objs) {
 bool check_line_clip_update_t(point const &p1, point const &p2, float &t, cube_t const &c);
 point rand_xy_pt_in_cube(cube_t const &c, float radius, rand_gen_t &rgen);
 bool sphere_in_light_cone_approx(pos_dir_up const &pdu, point const &center, float radius);
+cube_t get_city_bcube(unsigned city_id);
+float get_sidewalk_width();
+float get_inner_sidewalk_width();
 
 // from gen_buildings.cpp
+bool have_city_buildings();
 bool enable_building_people_ai();
 bool place_building_people(vect_building_place_t &locs, float radius, float speed_mult, unsigned num);
 void update_building_ai_state(vector<pedestrian_t> &people, float delta_dir);
@@ -865,3 +939,9 @@ void get_all_garages(vect_cube_t &garages);
 void get_all_city_helipads(vect_cube_t &helipads);
 bool check_city_building_line_coll_bs(point const &p1, point const &p2, point &p_int);
 void update_buildings_zmax_for_line(point const &p1, point const &p2, float radius, float house_extra_zval, float &cur_zmax);
+
+// from city_interact.cpp
+void init_city_spectate_manager(car_manager_t &car_manager, ped_manager_t &ped_manager);
+bool skip_bai_draw(pedestrian_t const &bai);
+bool skip_ped_draw(pedestrian_t const &ped);
+bool skip_car_draw(car_t        const &car);

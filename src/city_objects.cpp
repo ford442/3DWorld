@@ -5,11 +5,19 @@
 #include "city_objects.h"
 #include "tree_3dw.h" // for tree_placer_t
 
+extern int display_mode;
 extern unsigned max_unique_trees;
 extern double camera_zh;
 extern tree_placer_t tree_placer;
 extern city_params_t city_params;
 extern object_model_loader_t building_obj_model_loader;
+
+unsigned const q2t_ixs[6] = {0,2,1,0,3,2}; // quad => 2 tris
+
+bool check_city_building_line_coll_bs_any(point const &p1, point const &p2);
+
+float get_power_pole_offset() {return 0.045*city_params.road_width;}
+
 
 struct plot_divider_type_t {
 	bool is_occluder, has_alpha_mask;
@@ -48,13 +56,13 @@ plot_divider_type_t plot_divider_types[DIV_NUM_TYPES] = {
 };
 
 void add_house_driveways_for_plot(cube_t const &plot, vect_cube_t &driveways);
-float get_sidewalk_width();
-float get_inner_sidewalk_width();
 
 
 bool city_obj_t::proc_sphere_coll(point &pos_, point const &p_last, float radius_, point const &xlate, vector3d *cnorm) const {
 	return sphere_cube_int_update_pos(pos_, radius_, (bcube + xlate), p_last, 1, 0, cnorm);
 }
+
+// benches
 
 void bench_t::calc_bcube() {
 	bcube.set_from_point(pos);
@@ -64,8 +72,8 @@ void bench_t::calc_bcube() {
 /*static*/ void bench_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
 	if (!shadow_only) {select_texture(FENCE_TEX);} // normal map?
 }
-void bench_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scale, bool shadow_only) const {
-	if (!dstate.check_cube_visible(bcube, dist_scale, shadow_only)) return;
+void bench_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const {
+	if (!dstate.check_cube_visible(bcube, dist_scale)) return;
 
 	cube_t cubes[] = { // Note: taken from mapx/bench.txt
 		cube_t(-0.4, 0.0,  -5.0,   5.0,   1.6, 5.0), // back (straight)
@@ -82,7 +90,7 @@ void bench_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scale,
 		cube_t( 2.8, 3.2,   4.9,   5.1,   2.0, 3.0),
 	};
 	point const center(pos + dstate.xlate);
-	float const dist_val(shadow_only ? 0.0 : p2p_dist(camera_pdu.pos, center)/get_draw_tile_dist());
+	float const dist_val(shadow_only ? 0.0 : p2p_dist(camera_pdu.pos, center)/dstate.draw_tile_dist);
 	cube_t bc; // bench bbox
 
 	for (unsigned i = 0; i < 12; ++i) { // back still contributes to bbox
@@ -116,6 +124,8 @@ void bench_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scale,
 	}
 }
 
+// tree planters
+
 tree_planter_t::tree_planter_t(point const &pos_, float radius_, float height) : city_obj_t(pos_, radius_) {
 	bcube.set_from_point(pos);
 	bcube.expand_by_xy(radius);
@@ -124,8 +134,20 @@ tree_planter_t::tree_planter_t(point const &pos_, float radius_, float height) :
 /*static*/ void tree_planter_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
 	if (!shadow_only) {select_texture((dstate.pass_ix == 0) ? (int)DIRT_TEX : get_texture_by_name("roads/sidewalk.jpg"));}
 }
-void tree_planter_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scale, bool shadow_only) const {
-	if (!dstate.check_cube_visible(bcube, dist_scale, shadow_only)) return;
+void draw_xy_walls(cube_t const &bcube, cube_t const &hole, color_wrapper const &cw, float tscale, draw_state_t &dstate, quad_batch_draw &qbd) {
+	cube_t walls[4] = {bcube, bcube, bcube, bcube}; // -X, +X, -Y, +Y
+	walls[0].x2() = walls[2].x1() = walls[3].x1() = hole.x1();
+	walls[1].x1() = walls[2].x2() = walls[3].x2() = hole.x2();
+	walls[2].y2() = hole.y1();
+	walls[3].y1() = hole.y2();
+
+	for (unsigned d = 0; d < 2; ++d) {
+		dstate.draw_cube(qbd, walls[d  ], cw, 1, tscale, 0); // X
+		dstate.draw_cube(qbd, walls[d+2], cw, 1, tscale, 1); // Y, skip X dims
+	}
+}
+void tree_planter_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const {
+	if (!dstate.check_cube_visible(bcube, dist_scale)) return;
 	color_wrapper const cw(LT_GRAY);
 	cube_t dirt(bcube);
 	dirt.expand_by_xy(-0.1*dirt.get_size()); // shrink 10% on all XY sides
@@ -135,19 +157,80 @@ void tree_planter_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist
 		dstate.draw_cube(qbd, dirt, cw, 1, 0.0, 3); // top only (skip X, Y, and bottom)
 	}
 	else { // draw stone
-		cube_t walls[4] = {bcube, bcube, bcube, bcube}; // -X, +X, -Y, +Y
-		walls[0].x2() = walls[2].x1() = walls[3].x1() = dirt.x1();
-		walls[1].x1() = walls[2].x2() = walls[3].x2() = dirt.x2();
-		walls[2].y2() = dirt.y1();
-		walls[3].y1() = dirt.y2();
-		float const tscale(40.0);
-			
-		for (unsigned d = 0; d < 2; ++d) {
-			dstate.draw_cube(qbd, walls[d  ], cw, 1, tscale, 0); // X
-			dstate.draw_cube(qbd, walls[d+2], cw, 1, tscale, 1); // Y, skip X dims
+		draw_xy_walls(bcube, dirt, cw, 40.0, dstate, qbd);
+	}
+}
+
+// trashcans
+
+trashcan_t::trashcan_t(point const &pos_, float radius_, float height, bool is_cylin_) : city_obj_t(pos_, radius_), is_cylin(is_cylin_) {
+	bcube.set_from_point(pos);
+	bcube.expand_by_xy(radius);
+	bcube.z2() += height;
+	set_bsphere_from_bcube(); // recompute bcube from bsphere
+}
+/*static*/ void trashcan_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
+	if (shadow_only) {} // nothing to do
+	else if (dstate.pass_ix == 0) {select_texture(get_texture_by_name("roads/asphalt.jpg"));} // cube city/park
+	else { // cylinder residential
+		select_texture (get_texture_by_name("buildings/corrugated_metal.tif"));
+		select_multitex(get_texture_by_name("buildings/corrugated_metal_normal.tif", 1), 5);
+		dstate.s.set_cur_color(GRAY);
+	}
+}
+/*static*/ void trashcan_t::post_draw(draw_state_t &dstate, bool shadow_only) {
+	if (!shadow_only && dstate.pass_ix > 0) {select_multitex(FLAT_NMAP_TEX, 5);} // restore to default for cylindrical trashcan
+	city_obj_t::post_draw(dstate, shadow_only);
+}
+void trashcan_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const {
+	if (is_cylin != (dstate.pass_ix == 1)) return; // wrong pass
+	if (!dstate.check_cube_visible(bcube, dist_scale)) return;
+
+	if (is_cylin) { // cylindrical residential trashcan
+		point const camera_bs(camera_pdu.pos - dstate.xlate);
+		unsigned const ndiv(shadow_only ? 16 : max(4U, min(32U, unsigned(2.0f*dist_scale*dstate.draw_tile_dist/p2p_dist(camera_bs, pos)))));
+		float const cylin_radius(get_cylin_radius());
+		draw_fast_cylinder(point(pos.x, pos.y, bcube.z1()), point(pos.x, pos.y, bcube.z2()), cylin_radius, cylin_radius,
+			ndiv, 1, 4, 0, nullptr, 1.0, 0.0, nullptr, 0, 2.5); // draw sides + top, with texture repeated 2.5x
+	}
+	else { // cube city/park trashcan
+		if (shadow_only) {dstate.draw_cube(qbd, bcube, WHITE, 1); return;} // draw a cube for the shadow
+		color_wrapper const tan(colorRGBA(0.8, 0.6, 0.3, 1.0));
+		cube_t hole(bcube);
+		hole.expand_by_xy(-0.08*bcube.get_size()); // shrink on all XY sides
+		draw_xy_walls(bcube, hole, tan, 25.0, dstate, qbd); // sides
+
+		if (bcube.closest_dist_less_than((camera_pdu.pos - dstate.xlate), 0.4*dist_scale*dstate.draw_tile_dist)) {
+			float const height(bcube.dz());
+			cube_t bottom(hole);
+			bottom.z2() -= 0.95*height;
+			dstate.draw_cube(qbd, bottom, tan, 1, 30.0, 3); // inside bottom, top surface only
+			cube_t top(hole);
+			top.z1() += 0.92*height;
+			top.z2() -= 0.02*height;
+			cube_t top_hole(top);
+			top_hole.expand_by_xy(-0.22*bcube.get_size()); // shrink on all XY sides
+			draw_xy_walls(top, top_hole, color_wrapper(BROWN), 200.0, dstate, qbd); // brown top; technically don't need to draw some of the interior surfaces
 		}
 	}
 }
+// used for trashcans and fire hydrants
+bool sphere_city_obj_cylin_coll(point const &cpos, float cradius, point &spos, point const &p_last, float sradius, point const &xlate, vector3d *cnorm) {
+	point const pos2(cpos + xlate);
+	float const r_sum(cradius + sradius);
+	if (!dist_less_than(spos, pos2, r_sum)) return 0; // use sphere/vert cylinder instead?
+	// since this is a cylinder, and we're not supposed to stand on top of it, assume collision normal is in the XY plane
+	vector3d const coll_norm(vector3d((spos.x - pos2.x), (spos.y - pos2.y), 0.0).get_norm());
+	spos += coll_norm*(r_sum - p2p_dist(spos, pos2)); // move away from pos2
+	if (cnorm) {*cnorm = coll_norm;}
+	return 1;
+}
+bool trashcan_t::proc_sphere_coll(point &pos_, point const &p_last, float radius_, point const &xlate, vector3d *cnorm) const {
+	if (!is_cylin) {return city_obj_t::proc_sphere_coll(pos_, p_last, radius_, xlate, cnorm);} // use base class cube coll for cube trashcans
+	return sphere_city_obj_cylin_coll(pos, get_cylin_radius(), pos_, p_last, radius_, xlate, cnorm);
+}
+
+// fire hydrants
 
 fire_hydrant_t::fire_hydrant_t(point const &pos_, float radius_, float height, vector3d const &orient_) : city_obj_t(pos_, radius_), cylin_radius(radius), orient(orient_) {
 	bcube.set_from_sphere(*this);
@@ -156,33 +239,48 @@ fire_hydrant_t::fire_hydrant_t(point const &pos_, float radius_, float height, v
 	max_eq(radius, 0.5f*height); // use a more accurate bounding sphere; Note: no cube root of (r*r + r*r + h*h)
 }
 /*static*/ void fire_hydrant_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
-	if (!shadow_only) {select_texture(WHITE_TEX);}
-	if (!shadow_only) {dstate.s.set_cur_color(colorRGBA(1.0, 0.75, 0.0));}
+	if (!shadow_only) {dstate.s.set_cur_color(colorRGBA(1.0, 0.75, 0.0));} // override with custom color since the model color is black
+	if (!shadow_only) {dstate.s.add_uniform_float("hemi_lighting_scale", 0.0);} // disable hemispherical lighting
 }
 /*static*/ void fire_hydrant_t::post_draw(draw_state_t &dstate, bool shadow_only) {
 	if (!shadow_only) {dstate.s.set_cur_color(WHITE);} // restore to default color
+	if (!shadow_only) {dstate.s.add_uniform_float("hemi_lighting_scale", 0.5);} // set hemispherical lighting back to the default
 	city_obj_t::post_draw(dstate, shadow_only);
 }
-void fire_hydrant_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scale, bool shadow_only) const { // Note: qbd is unused
-	if (!dstate.check_cube_visible(bcube, dist_scale, shadow_only)) return;
+void fire_hydrant_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const { // Note: qbds are unused
+	if (!dstate.check_cube_visible(bcube, dist_scale)) return;
 
-	if (!shadow_only && building_obj_model_loader.is_model_valid(OBJ_MODEL_FHYDRANT)) {
+	if (!shadow_only) {
 		building_obj_model_loader.draw_model(dstate.s, pos, bcube, orient, WHITE, dstate.xlate, OBJ_MODEL_FHYDRANT, shadow_only);
 	}
-	else { // draw as a simple cylinder, untextured, top end only
-		draw_fast_cylinder(point(pos.x, pos.y, bcube.z1()), point(pos.x, pos.y, bcube.z2()), 0.8*cylin_radius, 0.8*cylin_radius, (shadow_only ? 12 : N_CYL_SIDES), 0, 4);
+	else { // shadow pass: draw as a simple cylinder, untextured, top end only
+		draw_fast_cylinder(point(pos.x, pos.y, bcube.z1()), point(pos.x, pos.y, bcube.z2()), 0.8*cylin_radius, 0.8*cylin_radius, 12, 0, 4); // ndiv=12
 	}
 }
 bool fire_hydrant_t::proc_sphere_coll(point &pos_, point const &p_last, float radius_, point const &xlate, vector3d *cnorm) const {
-	point const pos2(pos + xlate);
-	float const r_sum(cylin_radius + radius_);
-	if (!dist_less_than(pos_, pos2, r_sum)) return 0; // use sphere/vert cylinder instead?
-	// since this is a cylinder, and we're not supposed to stand on top of it, assume collision normal is in the XY plane
-	vector3d const coll_norm(vector3d((pos_.x - pos2.x), (pos_.y - pos2.y), 0.0).get_norm());
-	pos_ += coll_norm*(r_sum - p2p_dist(pos_, pos2)); // move away from pos2
-	if (cnorm) {*cnorm = coll_norm;}
-	return 1;
+	return sphere_city_obj_cylin_coll(pos, cylin_radius, pos_, p_last, radius_, xlate, cnorm);
 }
+
+// substations
+
+substation_t::substation_t(cube_t const &bcube_, bool dim_, bool dir_) : dim(dim_), dir(dir_) {
+	bcube = bcube_;
+	set_bsphere_from_bcube(); // recompute bcube from bsphere
+}
+/*static*/ void substation_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
+	if (!shadow_only) {dstate.s.add_uniform_float("hemi_lighting_scale", 0.0);} // disable hemispherical lighting
+}
+/*static*/ void substation_t::post_draw(draw_state_t &dstate, bool shadow_only) {
+	if (!shadow_only) {dstate.s.add_uniform_float("hemi_lighting_scale", 0.5);} // set hemispherical lighting back to the default
+}
+void substation_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const {
+	if (!dstate.check_cube_visible(bcube, dist_scale)) return;
+	vector3d orient(zero_vector);
+	orient[dim] = (dir ? 1.0 : -1.0);
+	building_obj_model_loader.draw_model(dstate.s, pos, bcube, orient, WHITE, dstate.xlate, OBJ_MODEL_SUBSTATION, shadow_only);
+}
+
+// plot dividers
 
 /*static*/ void divider_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
 	if (dstate.pass_ix == DIV_NUM_TYPES) { // fence post pass - untextured
@@ -201,9 +299,9 @@ bool fire_hydrant_t::proc_sphere_coll(point &pos_, point const &p_last, float ra
 	}
 	else {plot_divider_types[dstate.pass_ix].post_draw(shadow_only);}
 }
-void divider_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scale, bool shadow_only) const {
+void divider_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const {
 	if (dstate.pass_ix == DIV_NUM_TYPES && type == DIV_CHAINLINK) { // add chainlink fence posts
-		if (!dstate.check_cube_visible(bcube, 1.5*dist_scale, shadow_only)) return;
+		if (!dstate.check_cube_visible(bcube, 1.5*dist_scale)) return;
 		float const length(bcube.get_sz_dim(!dim)), height(bcube.dz()), thickness(bcube.get_sz_dim(dim));
 		float const post_hwidth(1.5*thickness), post_width(2.0*post_hwidth), top_width(1.5*thickness);
 		unsigned const num_sections(ceil(0.3*length/height)), num_posts(num_sections + 1);
@@ -225,16 +323,80 @@ void divider_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scal
 	}
 	if (type != dstate.pass_ix) return; // this type not enabled in this pass
 	if (type == DIV_CHAINLINK) {dist_scale *= 0.5;} // less visible
-	if (!dstate.check_cube_visible(bcube, dist_scale, shadow_only)) return;
+	if (!dstate.check_cube_visible(bcube, dist_scale)) return;
 	assert(dstate.pass_ix < DIV_NUM_TYPES);
 	plot_divider_type_t const &pdt(plot_divider_types[dstate.pass_ix]);
 	dstate.draw_cube(qbd, bcube, color_wrapper(pdt.color), 1, pdt.tscale/bcube.dz(), skip_dims); // skip bottom, scale texture to match the height
+
+	if (!shadow_only && type == DIV_HEDGE && bcube.closest_dist_less_than((camera_pdu.pos - dstate.xlate), 0.25f*(X_SCENE_SIZE + Y_SCENE_SIZE))) {
+		dstate.hedge_draw.add(bcube); // draw detailed leaves for nearby hedges
+	}
 }
 bool divider_t::proc_sphere_coll(point &pos_, point const &p_last, float radius_, point const &xlate, vector3d *cnorm) const {
 	cube_t bcube_wide(bcube + xlate);
 	bcube_wide.expand_in_dim(dim, max(0.0f, 0.5f*(0.5f*building_t::get_scaled_player_radius() - bcube.get_sz_dim(dim)))); // make sure it's at least half player radius in thickness
 	return sphere_cube_int_update_pos(pos_, radius_, bcube_wide, p_last, 1, 0, cnorm);
 }
+
+void hedge_draw_t::create(cube_t const &bc) {
+	bcube = bc - bc.get_cube_center(); // centered on the origin
+	unsigned const target_num_leaves(40000);
+	vector3d const sz(bcube.get_size());
+	float const leaf_sz(0.05*sz.z), surf_area(sz.x*sz.y + 2.0f*sz.z*(sz.x + sz.y));
+	float const side_areas[5] = {sz.y*sz.z, sz.y*sz.z, sz.x*sz.z, sz.x*sz.z, sz.x*sz.y};
+	rand_gen_t rgen;
+	quad_batch_draw qbd;
+	qbd.verts.reserve(6*target_num_leaves);
+
+	for (unsigned n = 0; n < 5; ++n) { // {+X, -X, +Y, -Y, +Z} sides
+		unsigned const dim(n>>1), dir(n&1), d1((dim+1)%3), d2((dim+2)%3);
+		unsigned const num_this_face(target_num_leaves*side_areas[n]/surf_area);
+		point pos;
+		pos[dim] = bcube.d[dim][!dir];
+
+		for (unsigned n = 0; n < num_this_face; ++n) {
+			pos[d1] = rgen.rand_uniform(bcube.d[d1][0], bcube.d[d1][1]);
+			pos[d2] = rgen.rand_uniform(bcube.d[d2][0], bcube.d[d2][1]);
+			vector3d const normal(rgen.signed_rand_vector_spherical().get_norm());
+			float const angle(TWO_PI*rgen.rand_float());
+			vector3d tangent;
+			rotate_vector3d(cross_product(normal, plus_x), normal, angle, tangent);
+			vector3d const binormal(cross_product(normal, tangent));
+			qbd.add_quad_dirs(pos, leaf_sz*tangent, leaf_sz*binormal, WHITE, normal);
+		} // for n
+	} // for s
+	num_verts = qbd.verts.size();
+	create_and_upload(qbd.verts, 0, 1);
+}
+void hedge_draw_t::draw_and_clear(shader_t &s) {
+	if (empty()) return;
+	if (!vbo_valid()) {create(to_draw.front());}
+	select_texture(get_texture_by_name("pine2.jpg"));
+	enable_blend(); // slightly smoother, but a bit of background shows through
+	s.add_uniform_float("min_alpha", 0.5);
+	pre_render();
+	vector3d const sz_mult(bcube.get_size().inverse());
+	// we can almost use an instance_render here, but that requires changes to the shader or a custom shader
+
+	for (auto c = to_draw.begin(); c != to_draw.end(); ++c) {
+		bool const swap_dims((c->dx() < c->dy()) ^ (bcube.dx() < bcube.dy())); // wrong dim, rotate 90 degrees
+		vector3d sz(c->get_size());
+		if (swap_dims) {swap(sz.x, sz.y);}
+		fgPushMatrix();
+		translate_to(c->get_cube_center()); // align the center
+		if (swap_dims) {fgRotate(90.0, 0.0, 0.0, 1.0);}
+		scale_by(sz_mult*sz); // scale to match the size
+		s.upload_mvm();
+		glDrawArrays(GL_TRIANGLES, 0, num_verts);
+		fgPopMatrix();
+	} // for c
+	post_render();
+	s.add_uniform_float("min_alpha", DEF_CITY_MIN_ALPHA); // restore to the default
+	disable_blend();
+	to_draw.clear();
+}
+
+// swimming pools
 
 // passes: 0=in-ground walls, 1=in-ground water, 2=above ground sides, 3=above ground water
 /*static*/ void swimming_pool_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
@@ -245,18 +407,52 @@ bool divider_t::proc_sphere_coll(point &pos_, point const &p_last, float radius_
 		else {assert(0);}
 	}
 }
-void swimming_pool_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dist_scale, bool shadow_only) const {
+void swimming_pool_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const {
 	if ((dstate.pass_ix > 1) ^ above_ground) return; // not drawn in this pass
-	if (!dstate.check_cube_visible(bcube, dist_scale, shadow_only)) return;
+	if (!dstate.check_cube_visible(bcube, dist_scale)) return;
 
 	if (above_ground) { // cylindrical; bcube should be square in XY
 		point const camera_bs(camera_pdu.pos - dstate.xlate);
-		float const radius(get_radius()), xc(bcube.xc()), yc(bcube.yc());
-		unsigned const ndiv(shadow_only ? 24 : max(4U, min(64U, unsigned(4.0f*dist_scale*get_draw_tile_dist()/p2p_dist(camera_bs, bcube.closest_pt(camera_bs))))));
+		float const radius(get_radius()), xc(bcube.xc()), yc(bcube.yc()), dscale(dist_scale*dstate.draw_tile_dist);
+		unsigned const ndiv(shadow_only ? 24 : max(4U, min(64U, unsigned(6.0f*dscale/p2p_dist(camera_bs, pos)))));
 
-		if (dstate.pass_ix == 2) { // draw sides
+		if (dstate.pass_ix == 2) { // draw sides, and maybe ladder
 			dstate.s.set_cur_color(color);
 			draw_fast_cylinder(point(xc, yc, bcube.z1()), point(xc, yc, bcube.z2()), radius, radius, ndiv, 0, 0); // untextured, no ends
+			point const camera_bs(camera_pdu.pos - dstate.xlate);
+
+			if (bcube.closest_dist_less_than(camera_bs, 0.5*dscale)) { // draw ladder
+				unsigned const num_steps = 5;
+				color_wrapper const step_color(LT_GRAY);
+				cube_t ladder;
+				float const side_pos(bcube.d[dim][dir]), swidth((dir ? 1.0 : -1.0)*0.065*radius); // ladder is on this side of the pool
+				float const height(1.2*bcube.dz()), step_delta(height/(num_steps + 0.25)), step_offset(0.25*step_delta), step_height(0.14*step_delta);
+				ladder.d[dim][!dir] = side_pos;
+				ladder.d[dim][ dir] = side_pos + swidth;
+				set_wall_width(ladder, (dim ? xc : yc), 0.16*radius, !dim);
+				bool const is_close(bcube.closest_dist_less_than(camera_bs, 0.2*dscale));
+				bool const is_very_close(is_close && bcube.closest_dist_less_than(camera_bs, 0.1*dscale));
+
+				for (unsigned n = 0; n < num_steps; ++n) { // draw steps
+					ladder.z1() = bcube .z1() + n*step_delta + step_offset;
+					ladder.z2() = ladder.z1() + step_height;
+					dstate.draw_cube(qbd, ladder, step_color, !is_very_close); // skip bottom if not close
+				}
+				if (is_close) { // draw bars
+					float const bars_top(bcube.z1() + height), bar_radius(0.012*radius);
+					bool const draw_top(is_very_close && camera_bs.z > bars_top);
+					unsigned const bars_ndiv(max(3U, min(12U, ndiv/4)));
+					point pt;
+					pt.z    = bcube.z1();
+					pt[dim] = side_pos + 0.4*swidth; // slightly off center
+					dstate.s.set_cur_color(colorRGBA(0.33, 0.33, 0.33));
+
+					for (unsigned n = 0; n < 2; ++n) {
+						pt[!dim] = ladder.d[!dim][n] + (n ? -1.0 : 1.0)*2.0*bar_radius;
+						draw_fast_cylinder(pt, point(pt.x, pt.y, bars_top), bar_radius, bar_radius, bars_ndiv, 0, (draw_top ? 4 : 0)); // untextured with top
+					}
+				}
+			}
 		}
 		else if (dstate.pass_ix == 3) { // draw water surface
 			dstate.s.set_cur_color(wcolor);
@@ -289,12 +485,431 @@ void swimming_pool_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, float dis
 }
 bool swimming_pool_t::proc_sphere_coll(point &pos_, point const &p_last, float radius_, point const &xlate, vector3d *cnorm) const {
 	if (above_ground) {
+		if (!sphere_cube_intersect((pos_ - xlate), radius_, bcube)) return 0; // optimization
 		float const radius(get_radius()), xc(bcube.xc() + xlate.x), yc(bcube.yc() + xlate.y), z1(bcube.z1() + xlate.z), z2(bcube.z2() + xlate.z);
 		return sphere_vert_cylin_intersect(pos_, radius_, cylinder_3dw(point(xc, yc, z1), point(xc, yc, z2), radius, radius), cnorm); // checks sides
 	}
 	cube_t bcube_tall(bcube + xlate);
 	bcube_tall.z2() += CAMERA_RADIUS + camera_zh; // extend upward so that player collision detection works better
 	return sphere_cube_int_update_pos(pos_, radius_, bcube_tall, p_last, 1, 0, cnorm);
+}
+
+// power poles
+
+power_pole_t::power_pole_t(point const &base_, point const &center_, float pole_radius_, float height, float wires_offset_,
+	float const pole_spacing_[2], uint8_t dims_, bool at_grid_edge_, bool const at_line_end_[2], bool residential_) :
+	at_grid_edge(at_grid_edge_), residential(residential_), dims(dims_), pole_radius(pole_radius_), wires_offset(wires_offset_), base(base_), center(center_)
+{
+	UNROLL_2X(pole_spacing[i_] = pole_spacing_[i_]; at_line_end[i_] = at_line_end_[i_];)
+	bcube.set_from_point(center);
+	bcube.z2() += height;
+	pos    = bcube.get_cube_center();
+	radius = bcube.get_bsphere_radius();
+	for (unsigned d = 0; d < 2; ++d) {bcube.expand_in_dim(d, (has_dim_set(!d) ? get_bar_extend() : pole_radius));} // add bar if dim bit not set
+	bcube_with_wires = bcube; // cache for visibility query; could also recompute on each call
+
+	for (unsigned d = 0; d < 2; ++d) {
+		if (at_line_end[d] || !has_dim_set(d)) continue;
+		bcube_with_wires.d[d][0] -= pole_spacing[d]; // extend to include wires
+		bcube_with_wires.translate_dim(d, wires_offset); // Note: wires_offset should be 0 for poles that have both wire dims enabled
+	}
+	bsphere_radius = bcube_with_wires.furthest_dist_to_pt(pos);
+}
+cube_t power_pole_t::get_ped_occluder() const {
+	cube_t occluder(base);
+	occluder.z2() = bcube.z2();
+	occluder.expand_by_xy(pole_radius/SQRT2); // take inner radius to reduce the occluder side for the pedestrian
+	return occluder;
+}
+cube_t power_pole_t::calc_cbar(bool d) const {
+	cube_t cbar;
+	cbar.z1() = bcube.z1() + (d ? 0.90 : 0.96)*bcube.dz(); // stagger the heights in X vs. Y so that wires don't intersect on poles that have them in both dims
+	cbar.z2() = cbar .z1() + 0.7*pole_radius;
+	set_wall_width(cbar, (center[ d] + 1.3*pole_radius), 0.3*pole_radius, d); // offset
+	set_wall_width(cbar,  center[!d], get_bar_extend(), !d);
+	return cbar;
+}
+void power_pole_t::get_wires_conn_pts(point pts[3], bool d) const {
+	float const wire_spacing(get_hwire_spacing()), wire_radius(get_wire_radius()), standoff_height(get_standoff_height());
+	float const offsets[3] = {-wire_spacing, -0.3f*wire_spacing, wire_spacing}; // offset from the center to avoid intersecting the pole
+	cube_t const cbar(calc_cbar(d));
+
+	for (unsigned n = 0; n < 3; ++n) {
+		pts[n][d]  = cbar.get_center_dim(d);
+		pts[n][!d] = center[!d] + offsets[n]; // set wire offset
+		pts[n].z   = cbar.z2()  + standoff_height + wire_radius; // resting on top of the standoff
+	}
+}
+point power_pole_t::get_nearest_connection_point(point const &to_pos, bool near_power_pole) const {
+	float dmin_sq(0.0);
+	point ret(to_pos); // start at to_pos; will return this if no wires can be connected to
+
+	for (unsigned d = 0; d < 2; ++d) {
+		if (!has_dim_set(d) || at_line_end[d]) continue; // no wires in this dim
+		point pw(center);
+		pw[!d] = base[!d] + ((center[!d] != base[!d]) ? -1.0 : 1.0)*0.5*get_power_pole_offset(); // on the side of the pole
+		pw.z  += 0.75*bcube.dz() - get_vwire_spacing(); // connect to middle wire; must match value used in drawing
+		cube_t wires_bcube(pw, pw);
+		wires_bcube.d[d][0] -= pole_spacing[d]; // extend to the adjacent pole
+		wires_bcube.translate_dim(d, wires_offset); // offset wires in case the pole was moved to avoid a driveway
+		point conn_pos(wires_bcube.closest_pt(to_pos)); // will be directly across with conn_pos[d] = to_pos[d]
+		
+		if (near_power_pole) { // off to the side of the pole
+			// offset by an additional value based on distance so that wires coming from different points intersect at different places
+			float const run_delta(to_pos[d] - base[d]);
+			conn_pos[d] = base[d] + SIGN(run_delta)*pole_radius*(2.0 + 4.0*fabs(run_delta)/pole_spacing[d]);
+		}
+		float const dsq(p2p_dist_sq(to_pos, conn_pos));
+		if (dmin_sq == 0.0 || dsq < dmin_sq) {ret = conn_pos; dmin_sq = dsq;}
+	} // for d
+	return ret;
+}
+bool power_pole_t::add_wire(point const &p1, point const &p2, bool add_pole) { // Note: p1 connects to building or streetlight; p2 connects to wires on pole
+	wire_t wire(p1, p2);
+	
+	if (add_pole) { // used for houses
+		wire.pts[0]   .z += 0.040*bcube.dz(); // set the wire pole height
+		wire.pole_base.z -= 0.006*bcube.dz(); // extend below the roof
+		if (check_city_building_line_coll_bs_any(wire.pts[0], wire.pts[1])) return 0; // placement failed
+	}
+	wires.push_back(wire);
+	for (unsigned d = 0; d < 2; ++d) {bcube_with_wires.union_with_sphere(wire.pts[d], get_wire_radius());} // okay to omit pole_base
+	bsphere_radius = bcube_with_wires.furthest_dist_to_pt(pos); // recompute
+	return 1;
+}
+/*static*/ void power_pole_t::pre_draw(draw_state_t &dstate, bool shadow_only) {
+	if (shadow_only) return;
+	select_texture(WOOD2_TEX);
+	select_multitex(get_texture_by_name("normal_maps/wood_NRM.jpg", 1), 5);
+}
+/*static*/ void power_pole_t::post_draw(draw_state_t &dstate, bool shadow_only) {
+	if (!shadow_only) {select_multitex(FLAT_NMAP_TEX, 5);} // restore to default
+	city_obj_t::post_draw(dstate, shadow_only);
+}
+
+void add_cylin_as_tris(vector<vert_norm_tc_color> &verts, point const ce[2], float r1, float r2, color_wrapper const &cw,
+	unsigned ndiv, unsigned draw_top_bot, float tst=1.0, float tss=1.0, bool swap_ts_tt=0)
+{
+	// added as individual triangles; would be more efficient to use indexed triangles
+	vector3d v12; // will be plus_z
+	vector_point_norm const &vpn(gen_cylinder_data(ce, r1, r2, ndiv, v12));
+	vert_norm_tc_color quad_pts[4];
+
+	for (unsigned i = 0; i < ndiv; ++i) { // similar to gen_cylinder_quads(), but with a color
+		for (unsigned j = 0; j < 2; ++j) {
+			unsigned const S(i + j), s(S%ndiv);
+			vector3d const normal(vpn.n[s] + vpn.n[(S+ndiv-1)%ndiv]); // normalize?
+			float const ts(S*tss);
+			quad_pts[2*j+0].assign(vpn.p[(s<<1)+!j], normal, (swap_ts_tt ?      j *tst : ts), (swap_ts_tt ? ts :      j *tst), cw.c);
+			quad_pts[2*j+1].assign(vpn.p[(s<<1)+ j], normal, (swap_ts_tt ? (1.0-j)*tst : ts), (swap_ts_tt ? ts : (1.0-j)*tst), cw.c);
+		}
+		for (unsigned n = 0; n < 6; ++n) {verts.push_back(quad_pts[q2t_ixs[n]]);}
+
+		for (unsigned d = 0; d < 2; ++d) { // draw bottom and top triangle(s)
+			if (!(draw_top_bot & (1<<d))) continue;
+			unsigned const I((i+1)%ndiv);
+			vector3d const normal(d ? plus_z : -plus_z);
+			verts.emplace_back(ce[d], normal, 0.5, 0.5, cw);
+			verts.emplace_back(vpn.p[(i<<1)+d], normal, 0.5*(1.0 + vpn.n[i].x), 0.5*(1.0 + vpn.n[i].y), cw);
+			verts.emplace_back(vpn.p[(I<<1)+d], normal, 0.5*(1.0 + vpn.n[I].x), 0.5*(1.0 + vpn.n[I].y), cw);
+		}
+	} // for i
+}
+void draw_wire(point const *const pts, float radius, color_wrapper const &cw, quad_batch_draw &untex_qbd) { // pts is size 2
+	unsigned const ndiv(4);
+	vector3d v12;
+	vector_point_norm const &vpn(gen_cylinder_data(pts, radius, radius, ndiv, v12));
+
+	for (unsigned i = 0; i < ndiv; ++i) { // similar to gen_cylinder_quads()
+		unsigned const in((i+1)%ndiv);
+		unsigned const pt_ixs[4] = {(i<<1)+1, (i<<1), (in<<1), (in<<1)+1};
+		for (unsigned n = 0; n < 6; ++n) {untex_qbd.verts.emplace_back(vpn.p[pt_ixs[q2t_ixs[n]]], plus_z, 0, 0, cw.c);}
+	}
+}
+void draw_ortho_wire(point const &p, float radius, float pole_spacing, bool d, color_wrapper const &cw, draw_state_t &dstate, quad_batch_draw &untex_qbd) {
+	cube_t wire(p, p);
+	wire.d[d][0] -= pole_spacing; // extend to the adjacent pole
+	wire.expand_in_dim(!d, radius);
+	wire.expand_in_dim(2,  radius);
+	// black, don't need normals/tcs/colors; could use indexed triangles, but the time taken to draw these wires is insignificant (< 1% of total frame time)
+	dstate.draw_cube(untex_qbd, wire, cw, 0); // since wires are black, and we can't see the ends, we can't even tell they're cubes rather than cylinders
+}
+void draw_standoff_geom(point const ce[2], float radius, float dmax, point const &camera_bs, color_wrapper const &cw, quad_batch_draw &untex_qbd) {
+	unsigned const ndiv(max(4U, min(32U, unsigned(0.33f*dmax/p2p_dist(camera_bs, ce[1])))));
+
+	if (ndiv <= 16) { // single truncated cone
+		bool const draw_top(dot_product((ce[1] - ce[0]), (camera_bs - ce[1])) > 0.0);
+		add_cylin_as_tris(untex_qbd.verts, ce, radius, 0.75*radius, cw, ndiv, (draw_top ? 2 : 0));
+	}
+	else { // multiple truncated cones
+		unsigned const num_segs = 4;
+		vector3d const step_delta((ce[1] - ce[0])/num_segs);
+		point const ce_part[2] = {ce[0], ce[0]+step_delta};
+		unsigned const verts_start(untex_qbd.verts.size());
+		add_cylin_as_tris(untex_qbd.verts, ce_part, radius, 0.75*radius, cw, 16, 3); // truncated cone with top and bottom
+		unsigned const verts_end(untex_qbd.verts.size());
+	
+		for (unsigned n = 1; n < num_segs; ++n) {
+			vector3d const delta(n*step_delta);
+		
+			for (unsigned v = verts_start; v < verts_end; ++v) {
+				untex_qbd.verts.push_back(untex_qbd.verts[v]);
+				untex_qbd.verts.back().v += delta;
+			}
+		}
+	}
+}
+void draw_vert_standoff(point const &p1, point const &camera_bs, float height, float radius, float delta_offset, float dmax, bool dim,
+	bool is_first, unsigned verts_start, unsigned &verts_end, color_wrapper const &cw, quad_batch_draw &untex_qbd)
+{
+	if (is_first) { // first standoff, draw a truncated cone
+		point ce[2] = {p1, p1};
+		ce[1].z += height;
+		draw_standoff_geom(ce, radius, dmax, camera_bs, cw, untex_qbd);
+		verts_end = untex_qbd.verts.size();
+	}
+	else { // next standoff, copy and translate the previous truncated cone
+		for (unsigned v = verts_start; v < verts_end; ++v) {
+			untex_qbd.verts.push_back(untex_qbd.verts[v]);
+			untex_qbd.verts.back().v[!dim] += delta_offset;
+		}
+	}
+}
+
+// Note: power line connectivity is all handled here in draw();
+// the current grid is fully connected, forming loops on both the upper three high voltage lines and lower three low voltage lines;
+// maybe this isn't realistic, but it does have a nice symmetry and higher apparent wiring complexity; the user will likely not notice
+void power_pole_t::draw(draw_state_t &dstate, quad_batch_draw &qbd, quad_batch_draw &untex_qbd, float dist_scale, bool shadow_only) const {
+	point const camera_bs(camera_pdu.pos - dstate.xlate);
+	float const dmax(shadow_only ? camera_pdu.far_ : dist_scale*dstate.draw_tile_dist);
+	if (!bcube.closest_dist_less_than(camera_bs, dmax)) return;
+	if (!camera_pdu.cube_visible((shadow_only ? bcube : bcube_with_wires) + dstate.xlate)) return;
+	color_wrapper const black(BLACK), white(colorRGBA(0.7, 0.7, 0.7)), gray(colorRGBA(0.4, 0.4, 0.4)), cw(LT_BROWN); // darken the wood color
+	bool const pole_visible(camera_pdu.cube_visible(bcube + dstate.xlate));
+	float const wire_radius(get_wire_radius());
+	cube_t tf_bcube;
+	point conduit_top(all_zeros);
+
+	if (pole_visible) {
+		unsigned const ndiv(shadow_only ? 16 : max(4U, min(32U, unsigned(1.5f*dmax/p2p_dist(camera_bs, pos)))));
+		unsigned const pole_ndiv(min(ndiv, 24U));
+		float const vert_tscale = 10.0;
+		point ce[2] = {base, get_top()};
+		bool const draw_top(ce[1].z < camera_bs.z);
+		add_cylin_as_tris(qbd.verts, ce, pole_radius, pole_radius, cw, pole_ndiv, (draw_top ? 2 : 0), vert_tscale, 1.0/pole_ndiv, 1); // swap_ts_tt=1
+
+		if (dims == 3 && (shadow_only || bcube.closest_dist_less_than(camera_bs, 0.7*dmax))) { // draw transformer, untextured
+			float const tf_radius(2.0*pole_radius), pole_height(bcube.dz()), tf_height(0.1*pole_height), y_sign(at_line_end[1] ? 1.0 : -1.0);
+			ce[0].z = base.z  + 0.77*pole_height;
+			ce[1].z = ce[0].z + tf_height;
+			ce[0].x = ce[1].x = base.x;
+			ce[0].y = ce[1].y = base.y + y_sign*(tf_radius + pole_radius); // offset in -y, +y at end (so that wires across above it)
+			bool const draw_top_bot(camera_bs.z > 0.5f*(ce[0].z + ce[1].z));
+			add_cylin_as_tris(untex_qbd.verts, ce, tf_radius, tf_radius, gray, ndiv, (draw_top_bot ? 2 : 1));
+			tf_bcube.set_from_points(ce, 2);
+			tf_bcube.expand_by_xy(tf_radius);
+
+			if (!residential && ndiv > 4) { // draw conduit for wires that go into the ground
+				float const cradius(3.5*wire_radius);
+				conduit_top.assign(base.x, (base.y + y_sign*(0.5f*cradius + pole_radius)), (base.z + 0.6*pole_height)); // below the transformer
+				point const cce[2] = {point(conduit_top.x, conduit_top.y, base.z), conduit_top};
+				bool const draw_top(ndiv > 8 && camera_bs.z > conduit_top.z);
+				add_cylin_as_tris(untex_qbd.verts, cce, cradius, cradius, gray, min(ndiv, 16U), (draw_top ? 2 : 0));
+			}
+		}
+	}
+	float const wire_spacing(get_hwire_spacing()), vwire_spacing(get_vwire_spacing());
+	float const standoff_height(get_standoff_height()), standoff_radius(0.25*pole_radius);
+	point wire_pts[3][2];
+	unsigned wire_mask(0);
+	bool drew_wires(0);
+
+	for (unsigned d = 0; d < 2; ++d) {
+		if (!has_dim_set(d)) continue; // no wires in this dim
+		float const offsets[3] = {-wire_spacing, -0.3f*wire_spacing, wire_spacing}; // offset from the center to avoid intersecting the pole
+		cube_t const cbar(calc_cbar(d));
+		point p1;
+		p1[d] = cbar.get_center_dim(d);
+		p1.z  = cbar.z2(); // resting on top of the bar
+		
+		if (pole_visible && (shadow_only || cbar.closest_dist_less_than(camera_bs, 0.5*dmax))) { // could test cbar cube visible, but unclear if that's faster
+			dstate.draw_cube(qbd, cbar, cw, 0, 0.8/cbar.dz()); // draw all sides
+
+			if (!shadow_only && cbar.closest_dist_less_than(camera_bs, 0.15*dmax)) { // draw insulator standoffs
+				unsigned verts_start(untex_qbd.verts.size()), verts_end(0);
+
+				for (unsigned n = 0; n < 3; ++n) {
+					p1[!d] = center[!d] + offsets[n]; // set wire offset
+					wire_pts[n][d] = p1 + vector3d(0.0, 0.0, (standoff_height + wire_radius));
+
+					if (n == 1 && d == 1) { // offset middle wire from standoff to avoid clipping through pole
+						if      (!at_line_end[1]) {wire_pts[n][1].y = wire_pts[n][0].y;}
+						else if (!at_line_end[0]) {wire_pts[n][0].x = wire_pts[n][1].x;}
+						else {} // I guess it clips through the pole in this case
+					}
+					float const delta_offset(offsets[n] - offsets[0]);
+					draw_vert_standoff(p1, camera_bs, standoff_height, standoff_radius, delta_offset, dmax, d, (n == 0), verts_start, verts_end, white, untex_qbd);
+				} // for n
+				wire_mask |= (1 << d); // mark wires as drawn in this dim
+			}
+			if (d == 1 && !tf_bcube.is_all_zeros()) { // connect wire to transformer if running in y dim
+				float const spacing(0.3*tf_bcube.get_sz_dim(!d));
+				point const tf_top_center(tf_bcube.xc(), tf_bcube.yc(), tf_bcube.z2());
+
+				for (unsigned n = 0; n < 3; ++n) {
+					point const pts[2] = {point(center.x+offsets[n], tf_top_center.y, p1.z+standoff_height+wire_radius),
+						(tf_top_center + vector3d((n - 1.0)*spacing, 0.0, standoff_height-0.5f*wire_radius))}; // top wire, bottom transformer
+					draw_wire(pts, wire_radius, black, untex_qbd);
+				}
+				if (!shadow_only && tf_bcube.closest_dist_less_than(camera_bs, 0.1*dmax)) { // draw insulator standoffs
+					unsigned verts_start(untex_qbd.verts.size()), verts_end(0);
+
+					for (unsigned n = 0; n < 3; ++n) {
+						point const p2((tf_top_center.x + (n - 1.0)*spacing), tf_top_center.y, tf_top_center.z);
+						draw_vert_standoff(p2, camera_bs, standoff_height, standoff_radius, n*spacing, dmax, d, (n == 0), verts_start, verts_end, white, untex_qbd);
+					}
+					wire_mask |= (1 << d); // mark wires as drawn in this dim
+				}
+			}
+		}
+		if (shadow_only) continue; // skip wires for shadow pass since they don't show up reliably
+		bool const is_offset(center[!d] != base[!d]);
+		float const sep_dist(0.5*get_power_pole_offset()), offset_sign(is_offset ? -1.0 : 1.0);
+		float const bot_wire_zval(base.z + 0.75*bcube.dz()), bot_wire_pos(base[!d] + offset_sign*sep_dist);
+
+		if (!at_line_end[d]) { // no wires at end pole
+			cube_t wires_bcube(cbar);
+			min_eq(wires_bcube.z1(), bot_wire_zval); // include lower wires
+			UNROLL_2X(wires_bcube.d[d][i_] = bcube_with_wires.d[d][i_];)
+			if (!wires_bcube.closest_dist_less_than(camera_bs, 0.45*dmax) || !camera_pdu.cube_visible(wires_bcube + dstate.xlate)) continue; // wires distance/VFC
+			// draw the three top wires and one bottom wire in this dim
+			p1[d] += wires_offset; // offset wires in case the pole was moved to avoid a driveway
+			p1.z  += standoff_height + wire_radius; // resting on top of the standoff
+
+			for (unsigned n = 0; n < 3; ++n) { // top wires
+				p1[!d] = center[!d] + offsets[n]; // set wire spacing
+				draw_ortho_wire(p1, wire_radius, pole_spacing[d], d, black, dstate, untex_qbd);
+			}
+			// bottom 3 wires: split the difference between the offset corner and street power poles and attach to different sides of the poles
+			float const wire_extend(sep_dist - pole_radius - 0.5*cbar.get_sz_dim(d)); // extend to fill gap between outer wire at standoffs and wire ending at cbar
+			point pw;
+			pw[!d] = bot_wire_pos; // on the side of the pole
+			pw.z   = bot_wire_zval;
+			pw[d]  = p1[d] + wire_extend; // extend slightly to meet the crossing wire
+			float const bot_wire_extend(pole_spacing[d] + sep_dist + wire_radius); // overlap with next wire if there is one, extend past standoff at last pole
+
+			for (unsigned n = 0; n < 3; ++n) { // 3 bottom wires as well
+				draw_ortho_wire(pw, wire_radius, bot_wire_extend, d, black, dstate, untex_qbd);
+				pw.z -= vwire_spacing;
+			}
+			drew_wires = 1;
+		}
+		if (pole_visible && bcube.closest_dist_less_than(camera_bs, 0.15*dmax)) {
+			// bottom standoffs, even if there's no wire (because it will extend on end pole)
+			point pb;
+			pb[ d] = base[d]; // reset to the center of the pole
+			pb[!d] = bot_wire_pos;
+			pb.z   = bot_wire_zval;
+			point ce[2] = {pb, pb};
+			ce[1][!d] -= offset_sign*wire_radius; // end attached to the wire
+			ce[0][!d]  = base[!d] + 0.96*offset_sign*pole_radius; // end attached to the pole, slightly offset into the pole
+			unsigned verts_start(untex_qbd.verts.size()), verts_end(0);
+
+			for (unsigned n = 0; n < 3; ++n) {
+				if (n == 0) { // first standoff, draw a truncated cone
+					draw_standoff_geom(ce, standoff_radius, dmax, camera_bs, white, untex_qbd);
+					verts_end = untex_qbd.verts.size();
+				}
+				else { // next standoff, copy and translate the previous truncated cone
+					for (unsigned v = verts_start; v < verts_end; ++v) {
+						untex_qbd.verts.push_back(untex_qbd.verts[v]);
+						untex_qbd.verts.back().v.z -= n*vwire_spacing;
+					}
+				}
+			}
+			if (d == 1 && !tf_bcube.is_all_zeros()) { // vertical wire up to transformer
+				point const tf_conn_pt(pb.x, (tf_bcube.yc() - 0.5f*tf_bcube.dy()), (tf_bcube.z1() + 0.9*tf_bcube.dz())); // along the side near the top
+				cube_t wire(tf_conn_pt, tf_conn_pt);
+				wire.z1()  = pb.z + wire_radius - 2.0*vwire_spacing; // meet the top of the lowest wire
+				wire.z2() += wire_radius; // span entire standoff
+				wire.expand_by_xy(wire_radius);
+				dstate.draw_cube(untex_qbd, wire, black, 1); // skip bottom
+				// standoff for wire
+				point ce[2] = {tf_conn_pt, tf_conn_pt};
+				vector3d const so_dir(-1.0, 1.0, 0.0);
+				ce[0] += 0.4*pole_radius*so_dir;
+				ce[1] += 0.5*wire_radius*so_dir;
+				draw_standoff_geom(ce, standoff_radius, dmax, camera_bs, white, untex_qbd);
+
+				if (conduit_top != all_zeros) { // draw wires to the top of the ground conduit
+					point const conn_pt(tf_conn_pt.x, tf_conn_pt.y, (pb.z - 2.0*vwire_spacing)); // connect to bottom wire
+					point const pts[2] = {(conduit_top - vector3d(0.0, 0.0, wire_radius)), conn_pt};
+					draw_wire(pts, wire_radius, black, untex_qbd);
+				}
+			}
+		}
+	} // for d
+	if (drew_wires && wire_mask == 3 && bcube.closest_dist_less_than(camera_bs, 0.25*dmax)) { // both dims set, connect X and Y wires
+		for (unsigned n = 0; n < 3; ++n) {draw_wire(wire_pts[n], wire_radius, black, untex_qbd);}
+	}
+	if (!shadow_only && !wires.empty() && bcube_with_wires.closest_dist_less_than(camera_bs, 0.3*dmax)) {
+		for (auto &w : wires) { // represents all three wires tied together
+			draw_wire(w.pts, wire_radius, black, untex_qbd);
+			// draw vertical wire segment connecting the three, which also represents all three power wires tied together
+			cube_t wire(w.pts[1], w.pts[1]); // connection point to bottom horizontal wires
+			wire.expand_in_dim(2, vwire_spacing); // connect to wires above and below
+			wire.expand_by_xy(wire_radius);
+			dstate.draw_cube(untex_qbd, wire, black, 1, 0.0, 4); // skip top and bottom
+			if (w.pole_base.z == w.pts[0].z || !dist_less_than(w.pts[0], camera_bs, 0.15*dmax)) continue; // no pole, or too far away
+			point const ce[2] = {w.pole_base, (w.pts[0] + vector3d(0.0, 0.0, wire_radius))};
+			float const radius(1.5f*wire_radius);
+			unsigned const ndiv(max(4U, min(16U, unsigned(0.1f*dmax/p2p_dist(camera_bs, ce[1])))));
+			bool const draw_top(camera_bs.z > 0.5f*(ce[0].z + ce[1].z));
+			add_cylin_as_tris(untex_qbd.verts, ce, radius, radius, gray, ndiv, (draw_top ? 2 : 1));
+		} // for w
+	}
+}
+bool power_pole_t::proc_sphere_coll(point &pos_, point const &p_last, float radius_, point const &xlate, vector3d *cnorm) const {
+	if (!sphere_cube_intersect((pos_ - xlate), radius_, bcube)) return 0; // optimization
+	// for now we only check the pole itself rather than the cross bar
+	return sphere_vert_cylin_intersect(pos_, radius_, cylinder_3dw((base + xlate), (get_top() + xlate), pole_radius, pole_radius), cnorm); // check pole using the base radius
+}
+
+// transmission lines
+
+float get_tline_right_of_way() {return 0.3*city_params.road_width;} // include tower bar length (.25) plus some extra spacing
+
+void transmission_line_t::calc_bcube() { // bcube of the right of way
+	bcube = cube_t(p1, p2); // endpoints
+
+	for (unsigned n = 0; n < 3; ++n) { // probably only need to include center point [1], but okay to include them all
+		bcube.union_with_pt(p1_wire_pts[n]);
+		bcube.union_with_pt(p2_wire_pts[n]);
+	}
+	bcube.z1() -= tower_height; // approximate
+	bcube.expand_by_xy(get_tline_right_of_way());
+}
+bool transmission_line_t::sphere_intersect_xy(point const &pos, float radius) const {
+	if (!sphere_cube_intersect_xy(pos, radius, bcube)) return 0;
+	float const right_of_way(radius + get_tline_right_of_way());
+	if (point_line_seg_dist_2d(pos, p1, p2            ) < right_of_way) return 1; // check the line of towers
+	if (point_line_seg_dist_2d(pos, p1, p1_wire_pts[1]) < right_of_way) return 1; // check end points using center wire
+	if (point_line_seg_dist_2d(pos, p2, p2_wire_pts[1]) < right_of_way) return 1; // check end points using center wire
+	return 0;
+}
+bool transmission_line_t::cube_intersect_xy(cube_t const &c) const {
+	if (bcube.is_all_zeros()) { // endpoints not yet connected; check p1-p2 only (for building generation)
+		cube_t c_exp(c);
+		c_exp.expand_by_xy(get_tline_right_of_way());
+		return check_line_clip_xy(p1, p2, c_exp.d);
+	}
+	if (!bcube.intersects_xy(c)) return 0;
+	cube_t c_exp(c);
+	c_exp.expand_by_xy(get_tline_right_of_way());
+	if (check_line_clip_xy(p1, p2, c_exp.d)) return 1; // check the line of towers
+	if (check_line_clip_xy(p1, p1_wire_pts[1], c_exp.d)) return 1; // check end points using center wire
+	if (check_line_clip_xy(p2, p2_wire_pts[1], c_exp.d)) return 1; // check end points using center wire
+	return 0;
 }
 
 
@@ -353,13 +968,9 @@ bool city_obj_placer_t::gen_parking_lots_for_plot(cube_t plot, vector<car_t> &ca
 		// fill the parking lot with cars
 		vector<unsigned char> &used_spaces(parking_lots.back().used_spaces);
 		used_spaces.resize(nspaces, 0); // start empty
-		vector3d car_sz(nom_car_size);
-		car.dim    = car_dim;
-		car.dir    = car_dir;
-		car.height = car_sz.z;
-		if (car.dim) {swap(car_sz.x, car_sz.y);}
-		point pos(corner_pos.x, corner_pos.y, (plot.z2() + 0.5*car_sz.z));
-		pos[ car_dim] += 0.5*dr + (car_dim ? 0.15 : -0.15)*fabs(dr); // offset for centerline, biased toward the front of the parking space
+		car.dim = car_dim; car.dir = car_dir;
+		point pos(corner_pos.x, corner_pos.y, plot.z2());
+		pos[car_dim] += 0.5*dr + (car_dim ? 0.15 : -0.15)*fabs(dr); // offset for centerline, biased toward the front of the parking space
 		float const car_density(rgen.rand_uniform(city_params.min_park_density, city_params.max_park_density));
 
 		for (unsigned row = 0; row < park.num_rows; ++row) {
@@ -377,8 +988,7 @@ bool city_obj_placer_t::gen_parking_lots_for_plot(cube_t plot, vector<car_t> &ca
 						cpos[!car_dim] += dw*rgen.rand_uniform(0.3, 0.35);
 						prev_was_bad = 1;
 					}
-					car.bcube.set_from_point(cpos);
-					car.bcube.expand_by(0.5*car_sz);
+					car.set_bcube(pos, nom_car_size);
 					cars.push_back(car);
 					if ((rgen.rand()&7) == 0) {cars.back().dir ^= 1;} // pack backwards 1/8 of the time
 					used_spaces[row*park.num_rows + col] = 1;
@@ -414,30 +1024,27 @@ bool city_obj_placer_t::gen_parking_lots_for_plot(cube_t plot, vector<car_t> &ca
 	return has_parking;
 }
 
-// non-const because this sets driveway_t::car_ix
+// non-const because this sets driveway_t::car_ix through add_car()
 void city_obj_placer_t::add_cars_to_driveways(vector<car_t> &cars, vector<road_plot_t> const &plots, vector<vect_cube_t> &plot_colliders, unsigned city_id, rand_gen_t &rgen) {
 	car_t car;
 	car.park();
 	car.cur_city = city_id;
 	car.cur_road_type = TYPE_DRIVEWAY;
+	vector3d const nom_car_size(city_params.get_nom_car_size()); // {length, width, height}
 
 	for (auto i = driveways.begin(); i != driveways.end(); ++i) {
 		if (rgen.rand_float() < 0.5) continue; // no car in this driveway 50% of the time
 		car.cur_road = (unsigned short)i->plot_ix; // store plot_ix in road field
 		car.cur_seg  = (unsigned short)(i - driveways.begin()); // store driveway index in cur_seg
-		vector3d car_sz(city_params.get_nom_car_size()); // {length, width, height}
 		cube_t const &plot(plots[i->plot_ix]);
-		car.dim    = (i->y1() == plot.y1() || i->y2() == plot.y2()); // check which edge of the plot the driveway is connected to, which is more accurate than the aspect ratio
-		if (i->get_sz_dim(car.dim) < 1.6*car_sz.x || i->get_sz_dim(!car.dim) < 1.25*car_sz.y) continue; // driveway is too small to fit this car
-		car.dir    = rgen.rand_bool(); // randomly pulled in vs. backed in, since we don't know the direction to the house anyway
-		car.height = car_sz.z;
-		float const pad_l(0.75*car_sz.x), pad_w(0.6*car_sz.y); // needs to be a bit larger to fit trucks
-		if (car.dim) {swap(car_sz.x, car_sz.y);}
-		point cpos(0.0, 0.0, (i->z2() + 0.5*car_sz.z));
+		car.dim = (i->y1() == plot.y1() || i->y2() == plot.y2()); // check which edge of the plot the driveway is connected to, which is more accurate than the aspect ratio
+		if (i->get_sz_dim(car.dim) < 1.6*nom_car_size.x || i->get_sz_dim(!car.dim) < 1.25*nom_car_size.y) continue; // driveway is too small to fit this car
+		car.dir = rgen.rand_bool(); // randomly pulled in vs. backed in, since we don't know the direction to the house anyway
+		float const pad_l(0.75*nom_car_size.x), pad_w(0.6*nom_car_size.y); // needs to be a bit larger to fit trucks
+		point cpos(0.0, 0.0, i->z2());
 		cpos[ car.dim] = rgen.rand_uniform(i->d[ car.dim][0]+pad_l, i->d[ car.dim][1]-pad_l);
 		cpos[!car.dim] = rgen.rand_uniform(i->d[!car.dim][0]+pad_w, i->d[!car.dim][1]-pad_w); // not quite centered
-		car.bcube.set_from_point(cpos);
-		car.bcube.expand_by(0.5*car_sz);
+		car.set_bcube(cpos, nom_car_size);
 		// check if this car intersects another parked car; this can only happen if two driveways intersect, which should be rare
 		bool intersects(0);
 
@@ -446,7 +1053,7 @@ void city_obj_placer_t::add_cars_to_driveways(vector<car_t> &cars, vector<road_p
 			if (car.bcube.intersects(c->bcube)) {intersects = 1; break;}
 		}
 		if (intersects) continue; // skip
-		i->add_car(cars.size());
+		i->in_use = 2; // permanently in use
 		cars.push_back(car);
 		plot_colliders[i->plot_ix].push_back(car.bcube); // prevent pedestrians from walking through this parked car
 	} // for i
@@ -521,7 +1128,7 @@ template<typename T> void city_obj_groups_t::add_obj(T const &obj, vector<T> &ob
 	by_tile[get_tile_id_for_cube(obj.bcube)].push_back(objs.size());
 	objs.push_back(obj);
 }
-template<typename T> void city_obj_groups_t::create_groups(vector<T> &objs) {
+template<typename T> void city_obj_groups_t::create_groups(vector<T> &objs, cube_t &all_objs_bcube) {
 	vector<T> new_objs;
 	new_objs.reserve(objs.size());
 	reserve(by_tile.size()); // the number of actual groups
@@ -532,12 +1139,13 @@ template<typename T> void city_obj_groups_t::create_groups(vector<T> &objs) {
 
 		for (auto i = g->second.begin(); i != g->second.end(); ++i) {
 			assert(*i < objs.size());
-			group.assign_or_union_with_cube(objs[*i].bcube);
+			group.assign_or_union_with_cube(objs[*i].get_outer_bcube());
 			new_objs.push_back(objs[*i]);
 		}
 		sort(new_objs.begin()+group_start, new_objs.end());
 		group.ix = new_objs.size();
 		push_back(group);
+		all_objs_bcube.assign_or_union_with_cube(group);
 	} // for g
 	objs.swap(new_objs);
 	by_tile.clear(); // no longer needed
@@ -545,12 +1153,12 @@ template<typename T> void city_obj_groups_t::create_groups(vector<T> &objs) {
 
 // Note: blockers are used for placement of objects within this plot; colliders are used for pedestrian AI
 void city_obj_placer_t::place_detail_objects(road_plot_t const &plot, vect_cube_t &blockers, vect_cube_t &colliders,
-	vector<point> const &tree_pos, rand_gen_t &rgen, bool is_residential)
+	vector<point> const &tree_pos, rand_gen_t &rgen, bool is_residential, bool have_streetlights)
 {
 	float const car_length(city_params.get_nom_car_size().x); // used as a size reference for other objects
 
-	// place fire_hydrants; don't add fire hydrants in parks
-	if (!plot.is_park) {
+	// place fire_hydrants if the model has been loaded; don't add fire hydrants in parks
+	if (!plot.is_park && building_obj_model_loader.is_model_valid(OBJ_MODEL_FHYDRANT)) {
 		// we want the fire hydrant on the edge of the sidewalk next to the road, not next to the plot; this makes it outside the plot itself
 		float const radius(0.04*car_length), height(0.18*car_length), dist_from_road(-0.5*radius - get_sidewalk_width());
 		point pos(0.0, 0.0, plot.z2()); // XY will be assigned below
@@ -565,7 +1173,7 @@ void city_obj_placer_t::place_detail_objects(road_plot_t const &plot, vect_cube_
 				vector3d orient(zero_vector);
 				orient[!dim] = (dir ? 1.0 : -1.0); // oriented perpendicular to the road
 				fire_hydrant_t const fire_hydrant(pos, radius, height, orient);
-				fire_hydrant_groups.add_obj(fire_hydrant, fire_hydrants);
+				fhydrant_groups.add_obj(fire_hydrant, fhydrants);
 				colliders.push_back(fire_hydrant.bcube);
 			} // for dir
 		} // for dim
@@ -598,6 +1206,108 @@ void city_obj_placer_t::place_detail_objects(road_plot_t const &plot, vect_cube_
 		for (auto i = tree_pos.begin(); i != tree_pos.end(); ++i) {
 			planter_groups.add_obj(tree_planter_t(*i, planter_radius, planter_height), planters); // no colliders for planters; pedestrians avoid the trees instead
 		}
+	}
+	// place power poles if there are houses or streetlights
+	point corner_pole_pos(all_zeros);
+
+	if ((is_residential && have_city_buildings()) || have_streetlights) {
+		float const road_width(city_params.road_width), pole_radius(0.015*road_width), height(0.9*road_width);
+		float const xspace(plot.dx() + road_width), yspace(plot.dy() + road_width); // == city_params.road_spacing?
+		float const xyspace[2] = {0.5f*xspace, 0.5f*yspace};
+		// we can move in toward the plot center so that they don't block pedestrians, but then they can block driveways;
+		// if we move them into the road, then they block traffic light crosswalks;
+		// so we move them toward the road in an assymetic way and allow the pole to be not centered with the wires
+		float const offset(0.075*road_width), extra_offset(get_power_pole_offset()); // assymmetric offset to match the aspect ratio of stoplights
+		float const pp_x(plot.x2() + offset + extra_offset), pp_y(plot.y2() + offset);
+		point pts[3]; // one on the corner and two on each side: {corner, x, y}
+		for (unsigned i = 0; i < 3; ++i) {pts[i].assign(pp_x, pp_y, plot.z2());} // start at plot upper corner
+		pts[1].x -= 0.5*xspace;
+		pts[2].y -= 0.5*yspace;
+		unsigned const dims[3] = {3, 1, 2};
+		unsigned const pp_start(ppoles.size());
+
+		for (unsigned i = 0; i < 3; ++i) {
+			point pos(pts[i]);
+			float wires_offset(0.0);
+
+			if (i > 0 && !driveways.empty()) {
+				bool const dim(i == 2);
+				float const prev_val(pos[dim]);
+				move_to_not_intersect_driveway(pos, (pole_radius + get_sidewalk_width()), dim);
+				wires_offset = prev_val - pos[dim];
+			}
+			point base(pos);
+			if (i == 1) {base.y += extra_offset;} // shift the pole off the sidewalk and off toward the road to keep it out of the way of pedestrians
+			bool const at_line_end[2] = {0, 0};
+			bool const at_grid_edge(plot.xpos+1U == num_x_plots || plot.ypos+1U == num_y_plots);
+			ppole_groups.add_obj(power_pole_t(base, pos, pole_radius, height, wires_offset, xyspace, dims[i], at_grid_edge, at_line_end, is_residential), ppoles);
+			if (i == 0) {corner_pole_pos = base;}
+		}
+		if (plot.xpos == 0) { // no -x neighbor plot, but need to add the power poles there
+			unsigned const pole_ixs[2] = {0, 2};
+
+			for (unsigned i = 0; i < 2; ++i) {
+				point pt(pts[pole_ixs[i]]);
+				pt.x -= xspace;
+				bool const at_line_end[2] = {1, 0};
+				ppole_groups.add_obj(power_pole_t(pt, pt, pole_radius, height, 0.0, xyspace, dims[pole_ixs[i]], 1, at_line_end, is_residential), ppoles);
+			}
+		}
+		if (plot.ypos == 0) { // no -y neighbor plot, but need to add the power poles there
+			unsigned const pole_ixs[2] = {0, 1};
+
+			for (unsigned i = 0; i < 2; ++i) {
+				point pt(pts[pole_ixs[i]]);
+				pt.y -= yspace;
+				point base(pt);
+				if (i == 1) {base.y += extra_offset;}
+				bool const at_line_end[2] = {0, 1};
+				ppole_groups.add_obj(power_pole_t(base, pt, pole_radius, height, 0.0, xyspace, dims[pole_ixs[i]], 1, at_line_end, is_residential), ppoles);
+			}
+		}
+		if (plot.xpos == 0 && plot.ypos == 0) { // pole at the corner of the grid
+			point pt(pts[0]);
+			pt.x -= xspace;
+			pt.y -= yspace;
+			bool const at_line_end[2] = {1, 1};
+			ppole_groups.add_obj(power_pole_t(pt, pt, pole_radius, height, 0.0, xyspace, dims[0], 1, at_line_end, is_residential), ppoles);
+		}
+		for (auto i = (ppoles.begin() + pp_start); i != ppoles.end(); ++i) {colliders.push_back(i->get_ped_occluder());}
+	}
+	// place substations in commercial cities, near the corner pole that routes power into the ground, if the model has been loaded
+	if (!is_residential && corner_pole_pos != all_zeros && building_obj_model_loader.is_model_valid(OBJ_MODEL_SUBSTATION)) {
+		bool const dim(rgen.rand_bool()), dir(rgen.rand_bool());
+		float const ss_height(0.08*city_params.road_width), dist_from_corner(0.12); // distance from corner relative to plot size
+		vector3d const ss_center((1.0 - dist_from_corner)*corner_pole_pos + dist_from_corner*plot.get_cube_center());
+		vector3d const model_sz(building_obj_model_loader.get_model_world_space_size(OBJ_MODEL_SUBSTATION));
+		vector3d bcube_exp;
+		bcube_exp[ dim] = 0.5*ss_height*model_sz.x/model_sz.z;
+		bcube_exp[!dim] = 0.5*ss_height*model_sz.y/model_sz.z;
+		cube_t ss_bcube(ss_center, ss_center);
+		ss_bcube.expand_by_xy(bcube_exp);
+		ss_bcube.z2() += ss_height;
+		
+		if (!has_bcube_int_xy(ss_bcube, blockers, 0.2*ss_height)) { // skip if intersects a building or parking lot
+			sstation_groups.add_obj(substation_t(ss_bcube, dim, dir), sstations);
+			colliders.push_back(ss_bcube);
+			blockers.push_back(ss_bcube);
+		}
+	}
+	// place trashcans next to sidewalks in commercial cities and parks; after substations so that we don't block them
+	if (!is_residential || plot.is_park) {
+		bool const is_city_park(!is_residential || plot.is_park), is_cylin(!is_city_park);
+		float const tc_height(0.18*car_length), tc_radius((is_cylin ? 0.3 : 0.4)*tc_height), dist_from_corner(0.06); // dist from corner relative to plot size
+
+		for (unsigned d = 0; d < 4; ++d) { // try all 4 corners
+			vector3d const tc_center((1.0 - dist_from_corner)*point(plot.d[0][d&1], plot.d[1][d>>1], plot.z2()) + dist_from_corner*plot.get_cube_center());
+			trashcan_t const trashcan(tc_center, tc_radius, tc_height, is_cylin);
+
+			if (!has_bcube_int_xy(trashcan.bcube, blockers, 1.5*tc_radius)) { // skip if intersects a building or parking lot, with some padding
+				trashcan_groups.add_obj(trashcan, trashcans);
+				colliders.push_back(trashcan.bcube);
+				blockers.push_back(trashcan.bcube);
+			}
+		} // for d
 	}
 }
 
@@ -698,11 +1408,12 @@ void city_obj_placer_t::place_residential_plot_objects(road_plot_t const &plot, 
 		// place swimming pools
 		if (!i->is_residential || i->is_park || i->street_dir == 0) continue; // not a residential plot along a road
 		if (rgen.rand_float() < 0.1) continue; // add pools 90% of the time
+		bcubes.clear();
+		if (have_buildings()) {get_building_bcubes(*i, bcubes);}
+		if (bcubes.empty()) continue; // no house, skip adding swimming pool
+		assert(bcubes.size() == 1); // there should be exactly one building/house in this sub-plot
 		bool const dim((i->street_dir-1)>>1), dir((i->street_dir-1)&1); // direction to the road
 		bool const above_ground(rgen.rand_bool());
-		bcubes.clear();
-		get_building_bcubes(*i, bcubes);
-		assert(bcubes.size() == 1); // there should be exactly one building/house in this sub-plot
 		cube_t const &house(bcubes.front());
 		cube_t pool_area(*i);
 		pool_area.d[dim][dir] = house.d[dim][!dir]; // limit the pool to the back yard
@@ -777,7 +1488,7 @@ void city_obj_placer_t::place_residential_plot_objects(road_plot_t const &plot, 
 				fences[side] = divider_t(fence, DIV_CHAINLINK, fence_dim, dir, 0); // Note: dir is unused in divider_t so doesn't have to be set correctly
 			} // for side
 			if (bad_fence_place) continue; // failed to fence off the pool, don't place it here
-			pool_groups.add_obj(swimming_pool_t(pool, color, wcolor, above_ground), pools);
+			pool_groups.add_obj(swimming_pool_t(pool, color, wcolor, above_ground, dim, dir), pools);
 			pool.z2() += 0.1*city_params.road_width; // extend upward to make a better collider
 			colliders.push_back(pool);
 			blockers .push_back(pool);
@@ -808,38 +1519,51 @@ void city_obj_placer_t::add_house_driveways(road_plot_t const &plot, vect_cube_t
 }
 
 template<typename T> void city_obj_placer_t::draw_objects(vector<T> const &objs, city_obj_groups_t const &groups,
-	draw_state_t &dstate, float dist_scale, bool shadow_only, bool not_using_qbd)
+	draw_state_t &dstate, float dist_scale, bool shadow_only, bool has_immediate_draw)
 {
 	if (objs.empty()) return;
 	T::pre_draw(dstate, shadow_only);
 	unsigned start_ix(0);
-	assert(qbd.empty());
+	assert(qbd.empty() && untex_qbd.empty());
 
 	for (auto g = groups.begin(); g != groups.end(); start_ix = g->ix, ++g) {
-		if (!dstate.check_cube_visible(*g, dist_scale, shadow_only)) continue; // VFC/distance culling for group
-		if (not_using_qbd) {dstate.begin_tile(g->get_cube_center(), 1, 1);} // must setup shader and tile shadow map before drawing
+		if (!dstate.check_cube_visible(*g, dist_scale)) continue; // VFC/distance culling for group
+		if (has_immediate_draw) {dstate.begin_tile(g->get_cube_center(), 1, 1);} // must setup shader and tile shadow map before drawing
 		assert(start_ix <= g->ix && g->ix <= objs.size());
 
 		for (unsigned i = start_ix; i < g->ix; ++i) {
 			T const &obj(objs[i]);
-			if (dstate.check_sphere_visible(obj.pos, obj.radius)) {obj.draw(dstate, qbd, dist_scale, shadow_only);}
+			if (dstate.check_sphere_visible(obj.pos, obj.get_bsphere_radius(shadow_only))) {obj.draw(dstate, qbd, untex_qbd, dist_scale, shadow_only);}
 		}
-		if (!qbd.empty()) { // we have something to draw
-			dstate.begin_tile(g->get_cube_center(), 1, 1); // will_emit_now=1, ensure_active=1
+		if (!qbd.empty() || !untex_qbd.empty() || !dstate.hedge_draw.empty()) { // we have something to draw
+			if (!has_immediate_draw) {dstate.begin_tile(g->get_cube_center(), 1, 1);} // will_emit_now=1, ensure_active=1
 			qbd.draw_and_clear(); // draw this group with current smap
+			bool must_restore_state(!dstate.hedge_draw.empty());
+			dstate.hedge_draw.draw_and_clear(dstate.s);
+
+			if (!untex_qbd.empty()) {
+				dstate.set_untextured_material();
+				untex_qbd.draw_and_clear();
+				dstate.unset_untextured_material();
+				must_restore_state = 1;
+			}
+			if (!shadow_only && must_restore_state) {T::pre_draw(dstate, shadow_only);} // re-setup for next tile
 		}
 	} // for g
 	T::post_draw(dstate, shadow_only);
 }
 
 void city_obj_placer_t::clear() {
-	parking_lots.clear(); benches.clear(); planters.clear(); fire_hydrants.clear(); driveways.clear(); dividers.clear(); pools.clear();
-	bench_groups.clear(); planter_groups.clear(); fire_hydrant_groups.clear(); divider_groups.clear(); pool_groups.clear();
+	parking_lots.clear(); benches.clear(); planters.clear(); trashcans.clear(); fhydrants.clear(); sstations.clear();
+	driveways.clear(); dividers.clear(); pools.clear(); ppoles.clear();
+	bench_groups.clear(); planter_groups.clear(); trashcan_groups.clear(); fhydrant_groups.clear(); sstation_groups.clear();
+	divider_groups.clear(); pool_groups.clear(); ppole_groups.clear();
+	all_objs_bcube.set_to_zeros();
 	num_spaces = filled_spaces = 0;
 }
 
 void city_obj_placer_t::gen_parking_and_place_objects(vector<road_plot_t> &plots, vector<vect_cube_t> &plot_colliders, vector<car_t> &cars,
-	unsigned city_id, bool have_cars, bool is_residential)
+	unsigned city_id, bool have_cars, bool is_residential, bool have_streetlights)
 {
 	// Note: fills in plots.has_parking
 	//timer_t timer("Gen Parking Lots and Place Objects");
@@ -852,6 +1576,10 @@ void city_obj_placer_t::gen_parking_and_place_objects(vector<road_plot_t> &plots
 	bool const add_parking_lots(have_cars && !is_residential && city_params.min_park_spaces > 0 && city_params.min_park_rows > 0);
 	float const sidewalk_width(get_sidewalk_width());
 
+	for (auto i = plots.begin(); i != plots.end(); ++i) { // calculate num_x_plots and num_y_plots; these are used for determining edge power poles
+		max_eq(num_x_plots, i->xpos+1U);
+		max_eq(num_y_plots, i->ypos+1U);
+	}
 	for (auto i = plots.begin(); i != plots.end(); ++i) {
 		tree_pos.clear();
 		bcubes.clear();
@@ -875,19 +1603,24 @@ void city_obj_placer_t::gen_parking_and_place_objects(vector<road_plot_t> &plots
 		} // for j
 		if (city_params.assign_house_plots && plot_subdiv_sz > 0.0) {place_residential_plot_objects(*i, bcubes, colliders, detail_rgen);} // before placing trees
 		place_trees_in_plot (*i, bcubes, colliders, tree_pos, detail_rgen, buildings_end);
-		place_detail_objects(*i, bcubes, colliders, tree_pos, detail_rgen, is_residential);
+		place_detail_objects(*i, bcubes, colliders, tree_pos, detail_rgen, is_residential, have_streetlights);
 	} // for i
+	connect_power_to_buildings(plots);
 	if (have_cars) {add_cars_to_driveways(cars, plots, plot_colliders, city_id, rgen);}
 	for (auto i = plot_colliders.begin(); i != plot_colliders.end(); ++i) {sort(i->begin(), i->end(), cube_by_x1());}
-	bench_groups.create_groups(benches);
-	planter_groups.create_groups(planters);
-	fire_hydrant_groups.create_groups(fire_hydrants);
-	divider_groups.create_groups(dividers);
-	pool_groups.create_groups(pools);
+	bench_groups   .create_groups(benches,   all_objs_bcube);
+	planter_groups .create_groups(planters,  all_objs_bcube);
+	trashcan_groups.create_groups(trashcans, all_objs_bcube);
+	fhydrant_groups.create_groups(fhydrants, all_objs_bcube);
+	sstation_groups.create_groups(sstations, all_objs_bcube);
+	divider_groups .create_groups(dividers,  all_objs_bcube);
+	pool_groups    .create_groups(pools,     all_objs_bcube);
+	ppole_groups   .create_groups(ppoles,    all_objs_bcube);
 
 	if (0) { // debug info printing
-		cout << TXT(benches.size()) << TXT(bench_groups.size()) << TXT(planters.size()) << TXT(planter_groups.size()) << TXT(fire_hydrants.size())
-			 << TXT(fire_hydrant_groups.size()) << TXT(dividers.size()) << TXT(divider_groups.size()) << TXT(pools.size()) << TXT(pool_groups.size()) << endl;
+		cout << TXT(benches.size()) << TXT(bench_groups.size()) << TXT(planters.size()) << TXT(planter_groups.size()) << TXT(trashcan_groups.size())
+			 << TXT(fhydrants.size())  << TXT(fhydrant_groups.size()) << TXT(sstations.size()) << TXT(sstation_groups.size()) << TXT(dividers.size())
+			 << TXT(divider_groups.size()) << TXT(pools.size()) << TXT(pool_groups.size()) << TXT(ppoles.size()) << TXT(ppole_groups.size()) << endl;
 	}
 	if (add_parking_lots) {
 		cout << "parking lots: " << parking_lots.size() << ", spaces: " << num_spaces << ", filled: " << filled_spaces << ", benches: " << benches.size() << endl;
@@ -922,10 +1655,73 @@ void city_obj_placer_t::gen_parking_and_place_objects(vector<road_plot_t> &plots
 	return 1;
 }
 
+bool city_obj_placer_t::connect_power_to_point(point const &at_pos, bool near_power_pole) {
+	float dmax_sq(0.0);
+
+	for (unsigned n = 0; n < 4; ++n) { // make up to 4 attempts to connect a to a power pole without intersecting a building
+		float dmin_sq(0.0);
+		unsigned best_pole(0);
+		point best_pos;
+
+		for (auto p = ppoles.begin(); p != ppoles.end(); ++p) {
+			point const cur_pos(p->get_nearest_connection_point(at_pos, near_power_pole));
+			if (cur_pos == at_pos) continue; // bad point
+			float const dsq(p2p_dist_sq(at_pos, cur_pos));
+			if (dsq <= dmax_sq) continue; // this pole was previously flagged as bad
+			if (dmin_sq == 0.0 || dsq < dmin_sq) {best_pos = cur_pos; dmin_sq = dsq; best_pole = (p - ppoles.begin());}
+		} // for p
+		if (dmin_sq == 0.0) return 0; // failed (no power poles?)
+		if (ppoles[best_pole].add_wire(at_pos, best_pos, near_power_pole)) return 1; // add a wire pole for houses
+		dmax_sq = dmin_sq; // prevent this pole from being used in the next iteration
+	} // for n
+	return 0; // failed
+}
+void city_obj_placer_t::connect_power_to_buildings(vector<road_plot_t> const &plots) {
+	if (plots.empty() || ppoles.empty() || !have_buildings()) return;
+	cube_t all_plots_bcube(plots.front());
+	for (auto p = plots.begin()+1; p != plots.end(); ++p) {all_plots_bcube.union_with_cube(*p);} // query all buildings in the entire city rather than per-plot
+	vector<point> ppts;
+	get_building_power_points(all_plots_bcube, ppts);
+	for (auto p = ppts.begin(); p != ppts.end(); ++p) {connect_power_to_point(*p, 1);} // near_power_pole=1
+}
+
+void city_obj_placer_t::move_to_not_intersect_driveway(point &pos, float radius, bool dim) const {
+	cube_t test_cube;
+	test_cube.set_from_sphere(pos, radius);
+
+	// Note: this could be accelerated by iterating by plot, but this seems to already be fast enough (< 1ms)
+	for (auto d = driveways.begin(); d != driveways.end(); ++d) {
+		if (!d->intersects_xy(test_cube)) continue;
+		bool const dir((d->d[dim][1] - pos[dim]) < (pos[dim] - d->d[dim][0]));
+		pos[dim] = d->d[dim][dir] + (dir ? 1.0 : -1.0)*0.1*city_params.road_width;
+		break; // maybe we should check for an adjacent driveway, but that would be rare and moving could result in oscillation
+	}
+}
+void city_obj_placer_t::move_and_connect_streetlights(streetlights_t &sl) {
+	for (auto s = sl.streetlights.begin(); s != sl.streetlights.end(); ++s) {
+		if (!driveways.empty()) { // move to avoid driveways
+			bool const dim(s->dir.y == 0.0); // direction to move in
+			move_to_not_intersect_driveway(s->pos, 0.25*city_params.road_width, dim);
+		}
+		if (!ppoles.empty()) { // connect power
+			point top(s->get_lpos());
+			top.z += 1.05f*streetlight_ns::light_radius*city_params.road_width; // top of light
+			connect_power_to_point(top, 0); // near_power_pole=0 because it may be too far away
+		}
+	} // for s
+}
+
 void city_obj_placer_t::draw_detail_objects(draw_state_t &dstate, bool shadow_only) {
-	draw_objects(benches,       bench_groups,        dstate, 0.16, shadow_only, 0); // dist_scale=0.16
-	draw_objects(fire_hydrants, fire_hydrant_groups, dstate, 0.07, shadow_only, 1); // dist_scale=0.12, not_using_qbd=1
+	if (!dstate.check_cube_visible(all_objs_bcube, 1.0)) return; // check bcube, dist_scale=1.0
+	draw_objects(benches,   bench_groups,    dstate, 0.16, shadow_only, 0); // dist_scale=0.16
+	draw_objects(fhydrants, fhydrant_groups, dstate, 0.07, shadow_only, 1); // dist_scale=0.07, has_immediate_draw=1
+	draw_objects(sstations, sstation_groups, dstate, 0.15, shadow_only, 1); // dist_scale=0.15, has_immediate_draw=1
+	draw_objects(ppoles,    ppole_groups,    dstate, 0.20, shadow_only, 0); // dist_scale=0.20
 			
+	for (dstate.pass_ix = 0; dstate.pass_ix < 2; ++dstate.pass_ix) { // {cube/city, cylindre/residential}
+		bool const is_cylin(dstate.pass_ix > 0);
+		draw_objects(trashcans, trashcan_groups, dstate, (is_cylin ? 0.08 : 0.10), shadow_only, is_cylin); // has_immediate_draw=cylinder
+	}
 	if (!shadow_only) { // low profile, not drawn in shadow pass
 		for (dstate.pass_ix = 0; dstate.pass_ix < 2; ++dstate.pass_ix) { // {dirt, stone}
 			draw_objects(planters, planter_groups, dstate, 0.1, shadow_only, 0); // dist_scale=0.1
@@ -934,7 +1730,7 @@ void city_obj_placer_t::draw_detail_objects(draw_state_t &dstate, bool shadow_on
 	for (dstate.pass_ix = 0; dstate.pass_ix < 4; ++dstate.pass_ix) { // {in-ground walls, in-ground water, above ground sides, above ground water}
 		if (shadow_only && dstate.pass_ix <= 1) continue; // only above ground pools are drawn in the shadow pass; water surface is drawn to prevent light leaks, but maybe should extend z1 lower
 		float const dist_scales[4] = {0.1, 0.5, 0.3, 0.5};
-		draw_objects(pools, pool_groups, dstate, dist_scales[dstate.pass_ix], shadow_only, (dstate.pass_ix > 1)); // final 2 passes don't use qbd
+		draw_objects(pools, pool_groups, dstate, dist_scales[dstate.pass_ix], shadow_only, (dstate.pass_ix > 1)); // final 2 passes use immediate draw rather than qbd
 	}
 	// Note: not the most efficient solution, as it required processing blocks and binding shadow maps multiple times
 	for (dstate.pass_ix = 0; dstate.pass_ix <= DIV_NUM_TYPES; ++dstate.pass_ix) { // {wall, fence, hedge, chainlink fence, chainlink fence posts}
@@ -944,55 +1740,82 @@ void city_obj_placer_t::draw_detail_objects(draw_state_t &dstate, bool shadow_on
 	dstate.pass_ix = 0; // reset back to 0
 }
 
-template<typename T> bool proc_vector_sphere_coll(vector<T> const &objs, point &pos, point const &p_last, float radius, vector3d const &xlate, vector3d *cnorm) {
-	for (auto i = objs.begin(); i != objs.end(); ++i) { // Note: could use bench_groups
-		if (i->proc_sphere_coll(pos, p_last, radius, xlate, cnorm)) return 1;
-	}
+template<typename T> bool proc_vector_sphere_coll(vector<T> const &objs, city_obj_groups_t const &groups, point &pos,
+	point const &p_last, float radius, vector3d const &xlate, vector3d *cnorm)
+{
+	point const pos_bs(pos - xlate);
+	unsigned start_ix(0);
+
+	for (auto g = groups.begin(); g != groups.end(); start_ix = g->ix, ++g) {
+		if (!sphere_cube_intersect(pos_bs, radius, *g)) continue;
+		assert(start_ix <= g->ix && g->ix <= objs.size());
+
+		for (auto i = objs.begin()+start_ix; i != objs.begin()+g->ix; ++i) {
+			if (i->proc_sphere_coll(pos, p_last, radius, xlate, cnorm)) return 1;
+		}
+	} // for g
 	return 0;
 }
-bool city_obj_placer_t::proc_sphere_coll(point &pos, point const &p_last, float radius, vector3d *cnorm) const {
-	vector3d const xlate(get_camera_coord_space_xlate());
-	if (proc_vector_sphere_coll(benches,       pos, p_last, radius, xlate, cnorm)) return 1;
-	if (proc_vector_sphere_coll(fire_hydrants, pos, p_last, radius, xlate, cnorm)) return 1;
-	if (proc_vector_sphere_coll(dividers,      pos, p_last, radius, xlate, cnorm)) return 1;
-	if (proc_vector_sphere_coll(pools,         pos, p_last, radius, xlate, cnorm)) return 1;
+bool city_obj_placer_t::proc_sphere_coll(point &pos, point const &p_last, vector3d const &xlate, float radius, vector3d *cnorm) const { // pos in in camera space
+	if (!sphere_cube_intersect(pos, (radius + p2p_dist(pos,p_last)), (all_objs_bcube + xlate))) return 0;
+	if (proc_vector_sphere_coll(benches,   bench_groups,    pos, p_last, radius, xlate, cnorm)) return 1;
+	if (proc_vector_sphere_coll(trashcans, trashcan_groups, pos, p_last, radius, xlate, cnorm)) return 1;
+	if (proc_vector_sphere_coll(fhydrants, fhydrant_groups, pos, p_last, radius, xlate, cnorm)) return 1;
+	if (proc_vector_sphere_coll(sstations, sstation_groups, pos, p_last, radius, xlate, cnorm)) return 1;
+	if (proc_vector_sphere_coll(dividers,  divider_groups,  pos, p_last, radius, xlate, cnorm)) return 1;
+	if (proc_vector_sphere_coll(pools,     pool_groups,     pos, p_last, radius, xlate, cnorm)) return 1;
+	if (proc_vector_sphere_coll(ppoles,    ppole_groups,    pos, p_last, radius, xlate, cnorm)) return 1;
 	// Note: no coll with tree_planters because the tree coll should take care of it
 	return 0;
 }
 
-template<typename T> void check_vector_line_intersect(vector<T> const &objs, point const &p1, point const &p2, float &t, bool &ret) {
-	for (auto i = objs.begin(); i != objs.end(); ++i) {ret |= check_line_clip_update_t(p1, p2, t, i->bcube);} // check bounding cube
+template<typename T> void check_vector_line_intersect(vector<T> const &objs, city_obj_groups_t const &groups, point const &p1, point const &p2, float &t, bool &ret) {
+	unsigned start_ix(0);
+
+	for (auto g = groups.begin(); g != groups.end(); start_ix = g->ix, ++g) {
+		if (!check_line_clip(p1, p2, g->d)) continue;
+		assert(start_ix <= g->ix && g->ix <= objs.size());
+		for (auto i = objs.begin()+start_ix; i != objs.begin()+g->ix; ++i) {ret |= check_line_clip_update_t(p1, p2, t, i->bcube);}
+	}
 }
-bool city_obj_placer_t::line_intersect(point const &p1, point const &p2, float &t) const { // Note: nothing to do for parking lots or tree_planters
+bool city_obj_placer_t::line_intersect(point const &p1, point const &p2, float &t) const { // Note: nothing to do for parking lots or tree_planters; p1/p2 in world space
+	if (!all_objs_bcube.line_intersects(p1, p2)) return 0;
 	bool ret(0);
-	check_vector_line_intersect(benches,       p1, p2, t, ret);
-	check_vector_line_intersect(fire_hydrants, p1, p2, t, ret); // check bounding cube; cylinder intersection may be more accurate, but likely doesn't matter much
-	check_vector_line_intersect(dividers,      p1, p2, t, ret);
-	check_vector_line_intersect(pools,         p1, p2, t, ret);
+	check_vector_line_intersect(benches,   bench_groups,    p1, p2, t, ret);
+	check_vector_line_intersect(trashcans, trashcan_groups, p1, p2, t, ret);
+	check_vector_line_intersect(fhydrants, fhydrant_groups, p1, p2, t, ret); // check bounding cube; cylinder intersection may be more accurate, but likely doesn't matter much
+	check_vector_line_intersect(sstations, sstation_groups, p1, p2, t, ret);
+	check_vector_line_intersect(dividers,  divider_groups,  p1, p2, t, ret);
+	check_vector_line_intersect(pools,     pool_groups,     p1, p2, t, ret);
+	check_vector_line_intersect(ppoles,    ppole_groups,    p1, p2, t, ret); // inaccurate, could be customized if needed
 	return ret;
 }
 
-bool city_obj_placer_t::get_color_at_xy(point const &pos, colorRGBA &color, bool skip_in_road) const {
+template<typename T> bool check_city_obj_bcube_pt_xy_contain(city_obj_groups_t const &groups, vector<T> const &objs, point const &pos, unsigned &obj_ix) {
 	unsigned start_ix(0);
 
-	for (auto i = bench_groups.begin(); i != bench_groups.end(); start_ix = i->ix, ++i) {
+	for (auto i = groups.begin(); i != groups.end(); start_ix = i->ix, ++i) {
 		if (!i->contains_pt_xy(pos)) continue;
-		assert(start_ix <= i->ix && i->ix <= benches.size());
-					
-		for (auto b = benches.begin()+start_ix; b != benches.begin()+i->ix; ++b) {
-			if (pos.x < b->bcube.x1()) break; // benches are sorted by x1, no bench after this can match
-			if (b->bcube.contains_pt_xy(pos)) {color = texture_color(FENCE_TEX); return 1;}
+		assert(start_ix <= i->ix && i->ix <= objs.size());
+
+		for (auto b = objs.begin()+start_ix; b != objs.begin()+i->ix; ++b) {
+			if (pos.x < b->bcube.x1()) break; // objects are sorted by x1, none after this can match
+			if (b->bcube.contains_pt_xy(pos)) {obj_ix = (b - objs.begin()); return 1;}
 		}
 	} // for i
+	return 0;
+}
+bool city_obj_placer_t::get_color_at_xy(point const &pos, colorRGBA &color, bool skip_in_road) const {
+	unsigned start_ix(0), obj_ix(0);
+	if (check_city_obj_bcube_pt_xy_contain(bench_groups, benches, pos, obj_ix)) {color = texture_color(FENCE_TEX); return 1;}
 	float const expand(0.15*city_params.road_width), x_test(pos.x + expand); // expand to approx tree diameter
-	start_ix = 0;
 
 	for (auto i = planter_groups.begin(); i != planter_groups.end(); start_ix = i->ix, ++i) {
 		if (!i->contains_pt_xy_exp(pos, expand)) continue;
 		assert(start_ix <= i->ix && i->ix <= planters.size());
 
 		for (auto p = planters.begin()+start_ix; p != planters.begin()+i->ix; ++p) {
-			if (x_test < p->bcube.x1()) break; // planters are sorted by x1, no planter after this can match
+			if (x_test < p->bcube.x1()) break; // planters are sorted by x1, none after this can match
 			if (!p->bcube.contains_pt_xy_exp(pos, expand)) continue;
 			// treat this as a tree rather than a planter by testing against a circle, since trees aren't otherwise included
 			if (dist_xy_less_than(pos, p->pos, (p->radius + expand))) {color = DK_GREEN; return 1;}
@@ -1001,44 +1824,38 @@ bool city_obj_placer_t::get_color_at_xy(point const &pos, colorRGBA &color, bool
 	start_ix = 0;
 
 	if (!skip_in_road) { // fire hydrants are now placed on the edges of the road, so they're not inside plots and are skipped here
-		for (auto i = fire_hydrant_groups.begin(); i != fire_hydrant_groups.end(); start_ix = i->ix, ++i) {
+		for (auto i = fhydrant_groups.begin(); i != fhydrant_groups.end(); start_ix = i->ix, ++i) {
 			if (!i->contains_pt_xy(pos)) continue;
-			assert(start_ix <= i->ix && i->ix <= fire_hydrants.size());
+			assert(start_ix <= i->ix && i->ix <= fhydrants.size());
 
-			for (auto b = fire_hydrants.begin()+start_ix; b != fire_hydrants.begin()+i->ix; ++b) {
-				if (pos.x < b->bcube.x1()) break; // fire_hydrants are sorted by x1, no fire_hydrant after this can match
+			for (auto b = fhydrants.begin()+start_ix; b != fhydrants.begin()+i->ix; ++b) {
+				if (pos.x < b->bcube.x1()) break; // fire_hydrants are sorted by x1, none after this can match
 				if (dist_xy_less_than(pos, b->pos, b->radius)) {color = colorRGBA(1.0, 0.75, 0.0); return 1;} // orange/yellow color
 			}
 		} // for i
 		start_ix = 0;
 	}
-	for (auto i = divider_groups.begin(); i != divider_groups.end(); start_ix = i->ix, ++i) {
-		if (!i->contains_pt_xy(pos)) continue;
-		assert(start_ix <= i->ix && i->ix <= dividers.size());
-
-		for (auto b = dividers.begin()+start_ix; b != dividers.begin()+i->ix; ++b) {
-			if (pos.x < b->bcube.x1()) break; // dividers are sorted by x1, no divider after this can match
-			
-			if (b->bcube.contains_pt_xy(pos)) {
-				assert(b->type < DIV_NUM_TYPES);
-				color = plot_divider_types[b->type].get_avg_color(); return 1;
-			}
-		}
-	} // for i
-	start_ix = 0;
-
+	if (check_city_obj_bcube_pt_xy_contain(divider_groups, dividers, pos, obj_ix)) {
+		assert(obj_ix < dividers.size());
+		color = plot_divider_types[dividers[obj_ix].type].get_avg_color();
+		return 1;
+	}
 	for (auto i = pool_groups.begin(); i != pool_groups.end(); start_ix = i->ix, ++i) {
 		if (!i->contains_pt_xy(pos)) continue;
 		assert(start_ix <= i->ix && i->ix <= pools.size());
 
 		for (auto b = pools.begin()+start_ix; b != pools.begin()+i->ix; ++b) {
-			if (pos.x < b->bcube.x1()) break; // pools are sorted by x1, no divider after this can match
+			if (pos.x < b->bcube.x1()) break; // pools are sorted by x1, none after this can match
 			if (!b->bcube.contains_pt_xy(pos)) continue;
 			if (b->above_ground && !dist_xy_less_than(pos, point(b->bcube.xc(), b->bcube.yc(), b->bcube.z1()), b->get_radius())) continue; // circular in-ground pool
 			color = b->wcolor; // return water color
 			return 1;
 		}
 	} // for i
+	start_ix = 0;
+	if (check_city_obj_bcube_pt_xy_contain(sstation_groups, sstations, pos, obj_ix)) {color = colorRGBA(0.6, 0.8, 0.4, 1.0); return 1;} // light olive
+	if (check_city_obj_bcube_pt_xy_contain(trashcan_groups, trashcans, pos, obj_ix)) {color = colorRGBA(0.8, 0.6, 0.3, 1.0); return 1;} // tan
+	// Note: ppoles are skipped for now
 	return 0;
 }
 

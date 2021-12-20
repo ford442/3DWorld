@@ -34,7 +34,7 @@ float const CR_SCALE           = 0.1;
 float const FOG_COLOR_ATTEN    = 0.75;
 
 
-bool mesh_invalidated(1), fog_enabled(0), tt_fire_button_down(0), in_loading_screen(0);
+bool mesh_invalidated(1), fog_enabled(0), tt_fire_button_down(0), in_loading_screen(0), no_tt_footsteps(0);
 int iticks(0), time0(0), scrolling(0), dx_scroll(0), dy_scroll(0), timer_a(0);
 unsigned enabled_lights(0), cur_display_iter(0); // 8 bit flags for enabled_lights
 float fticks(0.0), tstep(0.0), camera_shake(0.0), cur_fog_end(1.0), far_clip_ratio(1.0);
@@ -46,6 +46,7 @@ string lighting_update_text;
 
 extern bool combined_gu, have_sun, clear_landscape_vbo, show_lightning, spraypaint_mode, enable_depth_clamp, enable_multisample, water_is_lava;
 extern bool user_action_key, flashlight_on, enable_clip_plane_z, begin_motion, config_unlimited_weapons, start_maximized, show_bldg_pickup_crosshair;
+extern bool can_do_building_action, enable_tt_model_indir;
 extern unsigned inf_terrain_fire_mode, reflection_tid;
 extern int auto_time_adv, camera_flight, reset_timing, run_forward, window_width, window_height, voxel_editing, UNLIMITED_WEAPONS;
 extern int advanced, b2down, dynamic_mesh_scroll, spectate, animate2, used_objs, disable_inf_terrain, DISABLE_WATER, can_pickup_bldg_obj;
@@ -74,10 +75,12 @@ void play_camera_footstep_sound();
 void draw_voxel_edit_volume();
 void play_switch_weapon_sound();
 void toggle_fullscreen();
+void calc_cur_ambient_diffuse();
 
 vector3d calc_camera_direction();
 void draw_player_model(point const &pos, vector3d const &dir, int time);
 void building_gameplay_next_frame(); // from building_interact.cc
+void follow_city_actor();
 
 
 void glClearColor_rgba(const colorRGBA &color) {
@@ -139,7 +142,7 @@ void do_look_at() {
 }
 
 
-void apply_camera_offsets(point const &camera) {
+void apply_camera_offsets(point const &camera) { // for TT mode
 
 	int const dx(int(camera.x*DX_VAL_INV) - xoff);
 	int const dy(int(camera.y*DY_VAL_INV) - yoff);
@@ -721,14 +724,17 @@ void flashlight_next_frame() {
 
 void maybe_update_loading_screen(const char *str) {
 	if (!in_loading_screen) return;
+	static string suffix;
 	check_gl_error(566);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 	fgPushMatrix();
 	fgLoadIdentity();
-	draw_text(PURPLE, -0.01, 0.0, -0.02, (string("Loading: ") + str), 1.0);
+	draw_text(PURPLE, -0.01, 0.0, -0.02, (string("Loading: ") + str + suffix), 1.0);
 	fgPopMatrix();
 	glutSwapBuffers();
-	check_gl_error(567);
+	bool const had_error(check_gl_error(567));
+	if (had_error) {in_loading_screen = 0;}
+	suffix.push_back('.');
 }
 
 void begin_loading_screen() {
@@ -745,7 +751,15 @@ void begin_loading_screen() {
 void display() {
 
 	check_gl_error(0);
+	static unsigned counter(0);
 
+	// hack to avoid slow frames when starting OpenMP threads; for some reason, threads started during the first 100 frames slow those frames down
+	if (counter++ < 100) {
+		glutSwapBuffers();
+		post_window_redisplay();
+		check_gl_error(11);
+		return;
+	}
 	if (start_maximized) {
 		toggle_fullscreen();
 		begin_loading_screen();
@@ -831,7 +845,7 @@ void display() {
 #ifdef USE_GPU_TIMER
 	gpu_timer_t gpu_timer;
 #endif
-
+	
 	if (world_mode == WMODE_UNIVERSE) {
 		in_loading_screen = 0; // if we got here, loading is done
 		display_universe(); // infinite universe
@@ -1022,9 +1036,9 @@ void display() {
 		final_draw(framerate);
 		purge_coll_freed(0); // optional
 		camera_flight = 0;
+		if (game_mode) {update_game_frame();} // even in TT mode
 
 		if (game_mode && world_mode == WMODE_GROUND) {
-			update_game_frame();
 			show_user_stats();
 			show_blood_on_camera();
 			show_crosshair(WHITE, do_zoom);
@@ -1034,7 +1048,7 @@ void display() {
 			show_crosshair(get_inf_terrain_mod_color(), do_zoom);
 		}
 		else if (world_mode == WMODE_INF_TERRAIN && show_bldg_pickup_crosshair) {
-			show_crosshair((can_pickup_bldg_obj ? ((can_pickup_bldg_obj == 2) ? RED : GREEN) : WHITE), can_pickup_bldg_obj);
+			show_crosshair((can_pickup_bldg_obj ? ((can_pickup_bldg_obj == 2) ? RED : GREEN) : (can_do_building_action ? CYAN : WHITE)), can_pickup_bldg_obj);
 		}
 		else if (world_mode == WMODE_GROUND && voxel_editing) {
 			show_crosshair(((voxel_editing == 2) ? RED : GREEN), do_zoom);
@@ -1212,6 +1226,7 @@ void display_inf_terrain() { // infinite terrain mode (Note: uses light params f
 	}
 	camera_view = 0;
 	if (camera_surf_collide) {check_player_tiled_terrain_collision();}
+	follow_city_actor(); // after collision detection so that it doesn't apply to the actor we're following
 	update_temperature(0);
 	point const camera(get_camera_pos());
 	apply_camera_offsets(camera);
@@ -1233,6 +1248,10 @@ void display_inf_terrain() { // infinite terrain mode (Note: uses light params f
 	if (draw_water && !underwater) {tt_reflection_tid = create_tt_reflection(terrain_zmin);}
 	far_clip_ratio = 1.0; // reset to default, may be overwritten below
 
+	if (enable_tt_model_indir) {
+		calc_cur_ambient_diffuse(); // required to handle lighting updates
+		upload_smoke_indir_texture();
+	}
 	if (combined_gu) {
 		draw_universe_bkg(0); // infinite universe as background
 		check_gl_error(4);
@@ -1267,7 +1286,7 @@ void display_inf_terrain() { // infinite terrain mode (Note: uses light params f
 	// threads: 0=draw tiled terrain (2.5ms) + transparent (0.3), 1=update roads and cars (2.3ms), 2=pedestrians (3.8ms) + building AI (0.85ms)
 	// Note: it's questionable to update (move) cars between the opaque and transparent pass because the parts will be out of sync;
 	// however, only the headlight flares are drawn in the transparent pass, and it doesn't seem to be a problem, so we allow it
-	if (have_city_models() && frame_counter > 100) { // same frame_counter hack to avoid perf problem as in water color calculation
+	if (have_city_models()) {
 		//timer_t timer("City Update MT"); // 4.65ms
 #pragma omp parallel num_threads(3)
 		if (omp_get_thread_num_3dw() == 0) {draw_tiled_terrain_and_transparent_geom(terrain_zmin, tt_reflection_tid, draw_water, camera_above_clouds);} // drawing must be on thread 0
@@ -1281,7 +1300,7 @@ void display_inf_terrain() { // infinite terrain mode (Note: uses light params f
 	run_tt_gameplay(); // enable limited gameplay elements in tiled terrain mode
 	draw_game_elements(timer1);
 	draw_teleporters();
-	if (camera_surf_collide) {play_camera_footstep_sound();}
+	if (camera_surf_collide && !no_tt_footsteps) {play_camera_footstep_sound();}
 	if (change_near_far_clip) {check_zoom();} // reset perspective (may be unnecessary since will be reset on the next frame)
 	check_xy_offsets();
 	init_x = 0;

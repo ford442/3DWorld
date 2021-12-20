@@ -63,8 +63,13 @@ tex_range_t parking_lot_t::get_tex_range(float ar) const { // ar is unused
 
 tex_range_t driveway_t::get_tex_range(float ar) const { // ar is unused
 	float txy[2] = {2.0, 2.0};
-	txy[dim] *= get_sz_dim(dim)/get_sz_dim(!dim); // ensure 1:1 texture scale
+	txy[dim] *= get_length()/get_width(); // ensure 1:1 texture scale
 	return tex_range_t(0.0, 0.0, txy[0], txy[1], 0, 0); // since the asphalt driveway texture isn't directional, we don't need to worry about swap_xy
+}
+cube_t driveway_t::extend_across_road() const {
+	cube_t dw_ext(*this); // includes driveway and the road adjacent to it
+	dw_ext.d[dim][dir] += (dir ? 1.0 : -1.0)*city_params.road_width;
+	return dw_ext;
 }
 
 namespace stoplight_ns {
@@ -103,7 +108,7 @@ namespace stoplight_ns {
 
 		while (1) {
 			// cycle through all directions and find one where a car is waiting to go; this allows the traffic light to skip some green lights that aren't needed;
-			// however, it can lead to a light transitioning from green => yellow => green without going through red; this is difficult to fix with the current architecture
+			// TODO: however, it can lead to a light transitioning from green => yellow => green without going through red; this is difficult to fix with the current architecture
 			advance_state();
 			if (any_blocked()) break; // if some car is blocking the intersection in some dir, force all states (no skipped lights) to guarantee we can make progress
 			if (is_any_car_waiting_at_this_state()) break; // car is waiting at this state
@@ -244,7 +249,7 @@ namespace streetlight_ns {
 
 		if (shadow_only) {dist_val = (is_local_shadow ? 0.12 : 0.06);}
 		else {
-			dist_val = p2p_dist(camera_pdu.pos, center)/get_draw_tile_dist();
+			dist_val = p2p_dist(camera_pdu.pos, center)/dstate.draw_tile_dist;
 			if (dist_val > 0.2) return; // too far
 		}
 		float const pradius(get_streetlight_pole_radius()), lradius(light_radius*city_params.road_width);
@@ -360,6 +365,7 @@ road_isec_t::road_isec_t(cube_t const &c, int rx, int ry, unsigned char conn_, b
 	else if (conn == 5 || conn == 6  || conn == 9  || conn == 10) {num_conn = 2;} // 2-way
 	else {assert(0);}
 	stoplight.init(num_conn, conn);
+	z2() += stoplight_ns::stoplight_max_height(); // include stoplights in Z-range
 }
 
 tex_range_t road_isec_t::get_tex_range(float ar) const {
@@ -459,7 +465,7 @@ bool road_isec_t::check_sphere_coll(point const &pos, float radius) const { // u
 
 bool road_isec_t::proc_sphere_coll(point &pos, point const &p_last, float radius, vector3d const &xlate, float dist, vector3d *cnorm) const {
 	if (num_conn == 2) return 0; // no stoplights
-	if (!sphere_cube_intersect_xy(pos, (radius + dist), (*this + xlate))) return 0;
+	if (!sphere_cube_intersect(pos, (radius + dist), (*this + xlate))) return 0;
 
 	for (unsigned n = 0; n < 4; ++n) {
 		if (!(conn & (1<<n))) continue; // no road in this dir
@@ -476,9 +482,7 @@ bool check_line_clip_update_t(point const &p1, point const &p2, float &t, cube_t
 
 bool road_isec_t::line_intersect(point const &p1, point const &p2, float &t) const {
 	if (num_conn == 2) return 0; // no stoplights
-	cube_t c(*this); // deep copy
-	c.z2() += stoplight_ns::stoplight_max_height();
-	if (!c.line_intersects(p1, p2)) return 0;
+	if (!line_intersects(p1, p2)) return 0;
 	bool ret(0);
 
 	for (unsigned n = 0; n < 4; ++n) {
@@ -504,11 +508,9 @@ void road_isec_t::draw_sl_block(quad_batch_draw &qbd, draw_state_t &dstate, poin
 
 void road_isec_t::draw_stoplights(quad_batch_draw &qbd, draw_state_t &dstate, bool shadow_only) const {
 	if (num_conn == 2) return; // no stoplights
-	cube_t sl_bcube(*this);
-	sl_bcube.z2() += 0.276*city_params.road_width; // add max stoplight height
-	if (!dstate.check_cube_visible(sl_bcube, 0.16, shadow_only)) return; // dist_scale=0.16
+	if (!dstate.check_cube_visible(*this, 0.16)) return; // dist_scale=0.16
 	point const center(get_cube_center() + dstate.xlate);
-	float const dist_val(shadow_only ? 0.0 : p2p_dist(camera_pdu.pos, center)/get_draw_tile_dist());
+	float const dist_val(shadow_only ? 0.0 : p2p_dist(camera_pdu.pos, center)/dstate.draw_tile_dist);
 	vector3d const cview_dir(camera_pdu.pos - center);
 	float const sz(0.03*city_params.road_width), h(1.0*sz);
 	color_wrapper cw(BLACK);
@@ -804,7 +806,7 @@ void road_draw_state_t::draw_bridge(bridge_t const &bridge, bool shadow_only) { 
 	bcube.d[!d][0] -= w_expand; bcube.d[!d][1] += w_expand;
 	max_eq(bcube.d[d][0], bridge.src_road.d[d][0]); // clamp to orig road segment length
 	min_eq(bcube.d[d][1], bridge.src_road.d[d][1]);
-	if (!check_cube_visible(bcube, 1.0, shadow_only)) return; // VFC/too far
+	if (!check_cube_visible(bcube, 1.0)) return; // VFC/too far
 	point const cpos(camera_pdu.pos - xlate);
 	float const center(bcube.get_center_dim(!d)), len(bcube.get_sz_dim(d));
 	point p1, p2; // centerline end points
@@ -818,7 +820,7 @@ void road_draw_state_t::draw_bridge(bridge_t const &bridge, bool shadow_only) { 
 	color_wrapper const cw_main(main_color), cw_cables(cables_color), cw_concrete(concrete_color);
 	float const thickness(0.2*scale), conn_thick(0.25*thickness), cable_thick(0.1*thickness), wall_width(0.25*thickness), wall_height(0.5*thickness);
 	point const closest_pt((bridge + xlate).closest_pt(camera_pdu.pos));
-	float const dist_val(shadow_only ? 1.0 : p2p_dist(camera_pdu.pos, closest_pt)/get_draw_tile_dist());
+	float const dist_val(shadow_only ? 1.0 : p2p_dist(camera_pdu.pos, closest_pt)/draw_tile_dist);
 	int const cable_ndiv(min(24, max(4, int(0.4/dist_val))));
 	unsigned const num_segs(max(16U, min(48U, unsigned(ceil(2.5*len/scale))))); // scale to fit the gap, with reasonable ranges
 	float const step_sz(1.0/num_segs), delta_d(step_sz*delta[d]), delta_z(step_sz*delta.z);
@@ -963,7 +965,7 @@ void road_draw_state_t::add_bridge_quad(point const pts[4], color_wrapper const 
 
 void road_draw_state_t::draw_tunnel(tunnel_t const &tunnel, bool shadow_only) { // Note: called rarely, so doesn't need to be efficient
 	cube_t const bcube(tunnel.get_tunnel_bcube());
-	if (!check_cube_visible(bcube, 1.0, shadow_only)) return; // VFC/too far
+	if (!check_cube_visible(bcube, 1.0)) return; // VFC/too far
 	ensure_shader_active(); // needed for use_smap=0 case
 	quad_batch_draw &qbd(qbd_bridge); // use same qbd as bridges
 	color_wrapper cw_concrete(LT_GRAY);
@@ -1029,5 +1031,93 @@ void road_draw_state_t::draw_tunnel(tunnel_t const &tunnel, bool shadow_only) { 
 
 void road_draw_state_t::draw_stoplights(vector<road_isec_t> const &isecs, range_pair_t const &rp, bool shadow_only) {
 	for (unsigned i = rp.s; i < rp.e; ++i) {isecs[i].draw_stoplights(qbd_sl, *this, shadow_only);}
+}
+
+// not really related to roads, but I guess this goes here
+void road_draw_state_t::draw_transmission_line_wires(point const &p1, point const &p2, point const wire_pts1[3], point const wire_pts2[3], float radius) {
+	if (shadow_only) return; // not shadow casters
+	if (p1 == p2)    return; // zero length wire segment?
+	point const pts[6] = {p1+wire_pts1[0], p2+wire_pts2[0], p1+wire_pts1[1], p2+wire_pts2[1], p1+wire_pts1[2], p2+wire_pts2[2]};
+	cube_t wires_bcube(pts, 6);
+	if (!check_cube_visible(wires_bcube, 0.2)) return; // VFC/too far
+	s.set_cur_color(BLACK);
+	unsigned const ndiv = 4;
+	for (unsigned n = 0; n < 3; ++n) {draw_fast_cylinder(pts[2*n], pts[2*n+1], radius, radius, ndiv, 0);} // no ends
+}
+void road_draw_state_t::draw_transmission_line(transmission_line_t const &tline) {
+	float const wire_radius(0.0024*city_params.road_width), tower_radius(0.035*city_params.road_width);
+	float const tower_bar_len(0.25*city_params.road_width), tower_bar_radius(0.4*tower_radius), end_rscale(0.5), bar_extend(1.04);
+	float const standoff_radius(0.12*tower_radius), standoff_height(1.2*tower_radius), standoff_dmax(0.05*draw_tile_dist);
+	float const standoff_len(standoff_height - bar_extend*end_rscale*tower_bar_radius); // actual height
+	point const camera_bs(camera_pdu.pos - xlate);
+	vector3d const wire_sep_dir(cross_product((tline.p2 - tline.p1), plus_z).get_norm()); // should be a straight line through all towers
+	point wire_pts[3]; // relative to the top of the tower; this is the bottom of the standoffs
+
+	for (unsigned n = 0; n < 3; ++n) {
+		wire_pts[n].z = -((n + 1)*0.07*tline.tower_height); // shifted down
+		wire_pts[n]  += (((n&1) ? -1.0 : 1.0)*tower_bar_len)*wire_sep_dir; // shift away from the tower
+	}
+	ensure_shader_active(); // is this necessary?
+	point cur_pt; // starts as zero offset
+	uint64_t last_tile_id(0);
+
+	for (auto const &p : tline.tower_pts) {
+		point bot_pt(p - vector3d(0.0, 0.0, 1.25*tline.tower_height)); // extend 25% further into the ground in case it's on a steep slope
+		cube_t tower_bcube(p, bot_pt);
+		tower_bcube.expand_by_xy(bar_extend*tower_bar_len);
+
+		if (check_cube_visible(tower_bcube, 0.5)) {
+			if (!shadow_only && use_smap) {
+				uint64_t const tile_id(get_tile_id_containing_point_no_xyoff(p));
+
+				if (last_tile_id == 0 || tile_id != last_tile_id) { // moved to a new tile
+					try_bind_tile_smap_at_point((p + xlate), s);
+					last_tile_id = tile_id;
+				}
+			}
+			if (!shadow_only) {s.set_cur_color(GRAY);}
+			bool const draw_top(camera_bs.z > tower_bcube.z2());
+			draw_fast_cylinder(bot_pt, p, tower_radius, end_rscale*tower_radius, 20, 0, (draw_top ? 4 : 0)); // draw sides and maybe top
+			tower_bcube.z1() = p.z + wire_pts[2].z - tower_bar_radius; // bottom of lowest bar
+
+			if (check_cube_visible(tower_bcube, 0.3)) {
+				for (unsigned n = 0; n < 3; ++n) { // draw 3 horizontal bars to support each wire, top to bottom
+					point const bar_start(p + vector3d(0.0, 0.0, wire_pts[n].z+standoff_height)); // top of standoffs
+					point const bar_end  (bar_start + bar_extend*vector3d(wire_pts[n].x, wire_pts[n].y, 0.0)); // extend a bit further out
+					draw_fast_cylinder(bar_start, bar_end, tower_bar_radius, end_rscale*tower_bar_radius, 12, 0, 4); // draw sides and end
+				}
+				if (!shadow_only && tower_bcube.closest_dist_less_than(camera_bs, standoff_dmax)) {
+					s.set_cur_color(LT_GRAY);
+
+					for (unsigned n = 0; n < 3; ++n) { // draw 3 standoffs
+						point const bot(p + wire_pts[n]);
+
+						if (tower_bcube.closest_dist_less_than(camera_bs, 0.4*standoff_dmax)) { // draw as a stack of cones
+							unsigned const num_segs = 8;
+							float const len_per_seg(standoff_len/num_segs), hlen_per_seg(0.5*len_per_seg);
+							float const r1(1.25*standoff_radius), r2(0.2*standoff_radius);
+
+							for (unsigned n = 0; n < num_segs; ++n) {
+								point pb(bot), pm(bot), pt(bot); // bottom, middle, top
+								pb.z += n*len_per_seg;
+								pm.z  = pb.z + hlen_per_seg;
+								pt.z  = pm.z + hlen_per_seg;
+								draw_fast_cylinder(pm, pb, r1, r2, 16, 0, 0); // truncated cone with no end
+								draw_fast_cylinder(pm, pt, r1, r2, 16, 0, 0);
+							} // for n
+						}
+						else { // draw as a single cylinder
+							point const top(bot + vector3d(0.0, 0.0, standoff_len));
+							bool const draw_top(camera_bs.z > 0.5f*(bot.z + top.z));
+							draw_fast_cylinder(bot, top, standoff_radius, standoff_radius, 16, 0, (draw_top ? 4 : 3)); // draw sides and one end
+						}
+					}
+				}
+			}
+		}
+		draw_transmission_line_wires(cur_pt, p, ((cur_pt == all_zeros) ? tline.p1_wire_pts : wire_pts), wire_pts, wire_radius);
+		cur_pt = p;
+	} // for p
+	draw_transmission_line_wires(cur_pt, all_zeros, wire_pts, tline.p2_wire_pts, wire_radius); // final segment
 }
 

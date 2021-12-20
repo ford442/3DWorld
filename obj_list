@@ -111,8 +111,10 @@ building_room_item_draw.o
 building_reflections.o
 building_pictures.o
 building_interact.o
+building_query.o
 simplifier.o
 city_model.o
 city_building_params.o
 city_objects.o
 city_terrain.o
+city_interact.o

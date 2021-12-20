@@ -16,7 +16,8 @@ float const TERM_VELOCITY  = 1.0;
 float const OBJ_ELASTICITY = 0.8;
 float const ALERT_THRESH   = 0.08; // min sound alert level for AIs
 
-bool do_room_obj_pickup(0), use_last_pickup_object(0), show_bldg_pickup_crosshair(0), player_near_toilet(0), player_in_elevator(0), city_action_key(0);
+bool do_room_obj_pickup(0), use_last_pickup_object(0), show_bldg_pickup_crosshair(0), player_near_toilet(0), player_in_elevator(0);
+bool city_action_key(0), can_do_building_action(0);
 int can_pickup_bldg_obj(0);
 float office_chair_rot_rate(0.0), cur_building_sound_level(0.0);
 carried_item_t player_held_object;
@@ -39,6 +40,8 @@ bool player_can_open_door(door_t const &door);
 void show_key_icon();
 bool player_has_room_key();
 void register_broken_object(room_object_t const &obj);
+bool is_shirt_model(room_object_t const &obj);
+bool is_pants_model(room_object_t const &obj);
 
 bool in_building_gameplay_mode() {return (game_mode == 2);} // replaces dodgeball mode
 
@@ -202,14 +205,20 @@ bool building_t::get_building_door_pos_closest_to(point const &target_pos, point
 
 void building_t::register_open_ext_door_state(int door_ix) {
 	bool const is_open(door_ix >= 0), was_open(open_door_ix >= 0);
-	if (is_open == was_open) return; // no state change
+	bool const ring_doorbell(is_open && is_house && door_ix == 0 && city_action_key); // action key when front door of a house is open
+	if (is_open == was_open && !ring_doorbell) return; // no state change
 	unsigned const dix(is_open ? (unsigned)door_ix : (unsigned)open_door_ix);
 	assert(dix < doors.size());
 	auto const &door(doors[dix]);
+	point const door_center(door.get_bcube().get_cube_center()), sound_pos(local_to_camera_space(door_center)); // convert to camera space
+
+	if (ring_doorbell) {
+		gen_sound_thread_safe(SOUND_DOORBELL, sound_pos);
+		return;
+	}
+	gen_sound_thread_safe((is_open ? (unsigned)SOUND_DOOR_OPEN : (unsigned)SOUND_DOOR_CLOSE), sound_pos);
 	vector3d const normal(door.get_norm());
 	bool const dim(fabs(normal.x) < fabs(normal.y)), dir(normal[dim] < 0.0);
-	point const door_center(door.get_bcube().get_cube_center()), sound_pos(local_to_camera_space(door_center)); // convert to camera space
-	gen_sound_thread_safe((is_open ? (unsigned)SOUND_DOOR_OPEN : (unsigned)SOUND_DOOR_CLOSE), sound_pos);
 	point pos_interior(door_center);
 	pos_interior[dim] += (dir ? 1.0 : -1.0)*CAMERA_RADIUS; // move point to the building interior so that it's a valid AI position
 	register_building_sound(pos_interior, 0.4); // slightly quieter than interior doors because the user has no control over this
@@ -233,9 +242,10 @@ bool can_open_bathroom_stall(room_object_t const &stall, point const &pos, vecto
 	return (dot_product_ptv(dir, door_center, pos) > 0.0); // facing the stall door
 }
 
-bool building_t::apply_player_action_key(point const &closest_to_in, vector3d const &in_dir_in, int mode) { // called for the player
+// called for the player; mode: 0=normal, 1=pull
+bool building_t::apply_player_action_key(point const &closest_to_in, vector3d const &in_dir_in, int mode, bool check_only) {
 	if (!interior) return 0; // error?
-	float const dmax(4.0*CAMERA_RADIUS), floor_spacing(get_window_vspace()), wall_thickness(get_wall_thickness());
+	float const dmax(4.0*CAMERA_RADIUS), floor_spacing(get_window_vspace());
 	float closest_dist_sq(0.0), t(0.0); // t is unused
 	unsigned door_ix(0), obj_ix(0);
 	bool found_item(0), is_obj(0);
@@ -251,12 +261,11 @@ bool building_t::apply_player_action_key(point const &closest_to_in, vector3d co
 			float const dist_sq(p2p_dist_sq(closest_to, center));
 			if (found_item && dist_sq >= closest_dist_sq) continue; // not the closest
 			if (!check_obj_dir_dist(closest_to, in_dir, *i, center, dmax)) continue; // door is not in the correct direction or too far away, skip
-			cube_t door_bcube(*i);
-			door_bcube.expand_in_dim(i->dim, 0.5*wall_thickness); // expand to nonzero area
+			cube_t const door_bcube(i->get_true_bcube()); // expand to nonzero area
 
 			if (!door_bcube.line_intersects(closest_to, query_ray_end)) { // if camera ray doesn't intersect the door frame, check for ray intersection with opened door
 				if (!i->open || (closest_to[i->dim] < i->d[i->dim][i->open_dir]) == i->open_dir) continue; // closed, or player not on the side the door opens to
-				tquad_with_ix_t const door(set_door_from_cube(*i, i->dim, i->open_dir, tquad_with_ix_t::TYPE_IDOOR, 0.0, 0, i->open, 0, 0, i->hinge_side));
+				tquad_with_ix_t const door(set_interior_door_from_cube(*i));
 				if (!line_poly_intersect(closest_to, query_ray_end, door.pts, door.npts, door.get_norm(), t)) continue; // test camera ray intersection with door plane
 			}
 			closest_dist_sq = dist_sq;
@@ -332,11 +341,16 @@ bool building_t::apply_player_action_key(point const &closest_to_in, vector3d co
 		} // for vect_id
 		if (!player_in_closet && mode == 0) {
 			float const drawer_dist(found_item ? sqrt(closest_dist_sq) : 2.5*CAMERA_RADIUS);
-			if (interior->room_geom->open_nearest_drawer(*this, closest_to, in_dir, drawer_dist, 0)) return 0; // drawer is closer - open or close it
+			
+			if (interior->room_geom->open_nearest_drawer(*this, closest_to, in_dir, drawer_dist, 0, check_only)) { // drawer is closer - open or close it
+				return (check_only ? 1 : 0); // check_only returns 1 here because this counts as interactive
+			}
 		}
-		if (!found_item && !player_in_closet) {move_nearest_object(closest_to, in_dir, 3.0*CAMERA_RADIUS, mode);} // try to move an object instead
+		if (!found_item && !check_only && !player_in_closet) {move_nearest_object(closest_to, in_dir, 3.0*CAMERA_RADIUS, mode);} // try to move an object instead
 		if (!found_item) return 0; // no door or object found
 	}
+	if (check_only) return 1;
+
 	if (is_obj) { // interactive object
 		if (!interact_with_object(obj_ix, closest_to, in_dir)) return 0; // generate sound from the player height
 	}
@@ -566,8 +580,9 @@ void building_t::update_player_interact_objects(point const &player_pos, unsigne
 	if (first_ped_ix >= 0) {get_ped_bcubes_for_building(first_ped_ix, building_ix, ped_bcubes);}
 	bool const player_is_moving(player_pos != last_player_pos);
 	last_player_pos = player_pos;
+	auto &objs(interior->room_geom->objs), &expanded_objs(interior->room_geom->expanded_objs);
 
-	for (auto c = interior->room_geom->objs.begin(); c != interior->room_geom->objs.end(); ++c) { // check for other objects to collide with (including stairs)
+	for (auto c = objs.begin(); c != objs.end(); ++c) { // check for other objects to collide with (including stairs)
 		if (c->no_coll() || !c->has_dstate()) continue; // Note: no test of player_coll flag
 		assert(c->type == TYPE_LG_BALL); // currently, only large balls have has_dstate()
 		assert(c->obj_id < interior->room_geom->obj_dstate.size());
@@ -685,10 +700,30 @@ void building_t::update_player_interact_objects(point const &player_pos, unsigne
 			c->translate(new_center - center);
 		}
 	} // for c
+	if (player_in_closet) { // check for collisions with expanded objects in closets
+		bool updated_rot(0);
+
+		for (auto c = expanded_objs.begin(); c != expanded_objs.end(); ++c) {
+			if (c->type == TYPE_CLOTHES && sphere_cube_intersect(player_pos, player_radius, *c)) { // shirt in a closet with the player
+				assert(c != objs.begin());
+				room_object_t &hanger(*(c-1)); // hanger is the previous object
+				assert(hanger.type == TYPE_HANGER);
+				bool const rot_dir(dot_product(c->get_dir(), (player_pos - c->get_cube_center())) < 0);
+				unsigned const orig_flags(c->flags), add_flag(rot_dir ? RO_FLAG_ADJ_LO : RO_FLAG_ADJ_HI), rem_flag(rot_dir ? RO_FLAG_ADJ_HI : RO_FLAG_ADJ_LO);
+				c->flags     |= ((c->type == TYPE_CLOTHES) ? RO_FLAG_ROTATING : 0) | add_flag;
+				c->flags     &= ~rem_flag;
+				hanger.flags |= RO_FLAG_ROTATING | add_flag;
+				hanger.flags &= ~rem_flag;
+				updated_rot  |= (c->flags != orig_flags);
+			}
+		} // for c
+		if (updated_rot) {interior->room_geom->create_small_static_vbos(*this);} // play a sound as well?
+	}
 	if (use_last_pickup_object || (tt_fire_button_down && !flashlight_on)) { // use object not active, and not using fire key without flashlight (space bar)
 		maybe_use_last_pickup_room_object(player_pos);
 		use_last_pickup_object = 0; // reset for next frame
 	}
+	maybe_update_tape(player_pos, 0); // end_of_tape=0
 }
 
 bool building_interior_t::update_elevators(building_t const &building, point const &player_pos) { // Note: player_pos is in building space
@@ -841,13 +876,9 @@ bool trace_ray_through_cubes(vect_cube_t const &cubes, point const &p1, point co
 	return 0; // ray has exited the cubes
 }
 bool building_t::check_line_intersect_doors(point const &p1, point const &p2) const {
-	float const wall_thickness(get_wall_thickness());
-
 	for (auto i = interior->doors.begin(); i != interior->doors.end(); ++i) {
 		if (i->open) continue; // check only closed doors
-		cube_t door(*i);
-		door.expand_in_dim(i->dim, 0.5*wall_thickness); // increase door thickness
-		if (door.line_intersects(p1, p2)) return 1;
+		if (i->get_true_bcube().line_intersects(p1, p2)) return 1;
 	}
 	return 0;
 }
@@ -966,6 +997,7 @@ void setup_bldg_obj_types() {
 	bldg_obj_types[TYPE_FPLACE    ] = bldg_obj_type_t(1, 1, 0, 1, 0, 1, 0.0,   2000.0,"fireplace");
 	bldg_obj_types[TYPE_LBASKET   ] = bldg_obj_type_t(1, 1, 1, 0, 0, 2, 12.0,  2.0,   "laundry basket");
 	bldg_obj_types[TYPE_WHEATER   ] = bldg_obj_type_t(1, 1, 0, 1, 0, 2, 300.0, 500.0, "water heater");
+	bldg_obj_types[TYPE_TAPE      ] = bldg_obj_type_t(0, 0, 1, 0, 0, 2, 2.0,   0.4,   "duct tape", 1000);
 	// player_coll, ai_coll, pickup, attached, is_model, lg_sm, value, weight, name [capacity]
 	// 3D models
 	bldg_obj_types[TYPE_TOILET    ] = bldg_obj_type_t(1, 1, 1, 1, 1, 0, 120.0, 88.0,  "toilet");
@@ -984,6 +1016,7 @@ void setup_bldg_obj_types() {
 	// keys are special because they're potentially either a small object or an object model (in a drawer)
 	bldg_obj_types[TYPE_KEY       ] = bldg_obj_type_t(0, 0, 1, 0, 0, 2, 0.0,   0.05,  "room key"); // drawn as an object, not a model
 	bldg_obj_types[TYPE_HANGER    ] = bldg_obj_type_t(0, 0, 1, 0, 1, 2, 0.25,  0.05,  "clothes hanger");
+	bldg_obj_types[TYPE_CLOTHES   ] = bldg_obj_type_t(0, 0, 1, 0, 1, 2, 10.0,  0.25,  "clothes"); // teeshirt, shirt, pants, etc.
 	//                                                pc ac pu at im ls value  weight  name [capacity]
 }
 
@@ -1016,11 +1049,6 @@ bldg_obj_type_t get_taken_obj_type(room_object_t const &obj) {
 	if (obj.type == TYPE_TV       && (obj.flags & RO_FLAG_BROKEN )) {return bldg_obj_type_t(1, 1, 1, 0, 1, 1,  20.0, 70.0, "broken TV"   );}
 	if (obj.type == TYPE_MONITOR  && (obj.flags & RO_FLAG_BROKEN )) {return bldg_obj_type_t(1, 1, 1, 0, 1, 1,  10.0, 15.0, "broken computer monitor");}
 
-	if (obj.type == TYPE_LG_BALL) {
-		bldg_obj_type_t type(get_room_obj_type(obj));
-		type.name = ((obj.item_flags & 1) ? "basketball" : "soccer ball"); // use a more specific type name; all other fields are shared across balls
-		return type;
-	}
 	if (obj.type == TYPE_BOTTLE) {
 		bottle_params_t const &bparams(bottle_params[obj.get_bottle_type()]);
 		bldg_obj_type_t type(0, 0, 1, 0, 0, 2,  bparams.value, 1.0, bparams.name);
@@ -1032,7 +1060,17 @@ bldg_obj_type_t get_taken_obj_type(room_object_t const &obj) {
 		}
 		return type;
 	}
-	return get_room_obj_type(obj); // default value
+	// default value, name may be modified below
+	bldg_obj_type_t type(get_room_obj_type(obj));
+
+	if (obj.type == TYPE_LG_BALL) {
+		type.name = ((obj.item_flags & 1) ? "basketball" : "soccer ball"); // use a more specific type name; all other fields are shared across balls
+	}
+	else if (obj.type == TYPE_CLOTHES) {
+		if      (is_shirt_model(obj)) {type.name = "shirt";}
+		else if (is_pants_model(obj)) {type.name = "pants";}
+	}
+	return type;
 }
 rand_gen_t rgen_from_obj(room_object_t const &obj) {
 	rand_gen_t rgen;
@@ -1084,7 +1122,7 @@ public:
 		else if (is_ringing) {
 			if (tfticks > stop_ring_time) {is_ringing = 0; schedule_next_ring();} // stop automatically
 			else if (tfticks > next_cycle_time) { // start a new ring cycle
-				gen_sound_thread_safe_at_player(SOUND_PHONE_RING, 1.0);
+				gen_sound_thread_safe_at_player(get_sound_id_for_file("phone_ring.wav"), 1.0);
 				register_building_sound_at_player(1.0);
 				next_cycle_time += 4.2*TICKS_PER_SECOND; // 4.2s between rings
 			}
@@ -1126,6 +1164,33 @@ public:
 
 phone_manager_t phone_manager;
 
+struct tape_manager_t {
+	bool in_use;
+	float last_toggle_time;
+	vector<point> points;
+	point last_pos;
+	room_object_t tape;
+	building_t *cur_building;
+
+	tape_manager_t() : in_use(0), last_toggle_time(0.0), cur_building(nullptr) {}
+
+	void toggle_use(room_object_t const &tape_, building_t *building) {
+		if ((tfticks - last_toggle_time) < 0.5*TICKS_PER_SECOND) return; // don't toggle too many times per frame
+		last_toggle_time = tfticks;
+		if (in_use) {clear();} // end use
+		else {tape = tape_;	cur_building = building; in_use = 1;} // begin use
+	}
+	void clear() {
+		if (cur_building != nullptr) {cur_building->maybe_update_tape(last_pos, 1);} // end_of_tape=1
+		cur_building = nullptr;
+		points.clear();
+		tape = room_object_t();
+		in_use = 0;
+	}
+};
+
+tape_manager_t tape_manager;
+
 class player_inventory_t { // manages player inventory, health, and other stats
 	vector<carried_item_t> carried; // interactive items the player is currently carrying
 	float cur_value, cur_weight, tot_value, tot_weight, damage_done, best_value, player_health, drunkenness, bladder, bladder_time, prev_player_zval;
@@ -1149,6 +1214,7 @@ public:
 		prev_in_building = has_key = 0;
 		phone_manager.disable();
 		carried.clear();
+		tape_manager.clear();
 	}
 	void clear_all() { // called on game mode init
 		tot_value = best_value = 0.0;
@@ -1183,6 +1249,7 @@ public:
 		if (dir) {std::rotate(carried.begin(), carried.begin()+1, carried.end());}
 		else     {std::rotate(carried.begin(), carried.end  ()-1, carried.end());}
 		gen_sound_thread_safe_at_player(SOUND_CLICK, 0.5);
+		tape_manager.clear();
 	}
 	void add_item(room_object_t const &obj) {
 		float health(0.0), drunk(0.0); // add these fields to bldg_obj_type_t?
@@ -1249,6 +1316,7 @@ public:
 					co.dim = co.dir = 0; // clear dim and dir
 					phone_manager.enable();
 				}
+				tape_manager.clear();
 			}
 			oss << ": value $";
 			if (value < 1.0 && value > 0.0) {oss << ((value < 0.1) ? "0.0" : "0.") << round_fp(100.0*value);} // make sure to print the leading/trailing zero for cents
@@ -1288,16 +1356,22 @@ public:
 		remove_last_item(); // drop the item - remove it from our inventory
 		return 1;
 	}
-	void mark_last_item_used() {
+	bool update_last_item_use_count(int val) { // val can be positive or negative
+		if (val == 0) return 1; // no change
 		assert(!carried.empty());
 		carried_item_t &obj(carried.back());
 		obj.flags |= RO_FLAG_USED;
 		unsigned const capacity(get_room_obj_type(obj).capacity);
 
 		if (capacity > 0) {
-			++obj.use_count;
-			if (obj.use_count >= capacity) {remove_last_item();} // remove after too many uses
+			max_eq(val, -int(obj.use_count)); // can't go negative
+			obj.use_count += val;
+			if (obj.use_count >= capacity) {remove_last_item(); return 0;} // remove after too many uses
 		}
+		return 1;
+	}
+	bool mark_last_item_used() {
+		return update_last_item_use_count(1);
 	}
 	void remove_last_item() {
 		assert(!carried.empty());
@@ -1310,10 +1384,12 @@ public:
 		max_eq(cur_value,  0.0f); // handle FP rounding error
 		max_eq(cur_weight, 0.0f);
 		carried.pop_back(); // Note: invalidates obj
+		tape_manager.clear();
 	}
 	void collect_items(bool keep_interactive) {
 		if (!keep_interactive) {has_key = 0;} // key only good for current building
 		phone_manager.disable(); // phones won't ring when taken out of their building, since the player can't switch to them anyway
+		tape_manager.clear();
 		if (carried.empty() && cur_weight == 0.0 && cur_value == 0.0) return; // nothing to add
 		float keep_value(0.0), keep_weight(0.0);
 
@@ -1465,7 +1541,7 @@ bool building_room_geom_t::player_pickup_object(building_t &building, point cons
 	float drawer_range(drawer_range_max), obj_dist(0.0);
 	int const obj_id(find_nearest_pickup_object(building, at_pos_rot, in_dir_rot, range, obj_dist));
 	if (obj_id >= 0) {min_eq(drawer_range, obj_dist);} // only include drawers that are closer than the pickup object
-	if (open_nearest_drawer(building, at_pos_rot, in_dir_rot, drawer_range_max, 1)) return 1; // try objects in drawers; pickup_item=1
+	if (open_nearest_drawer(building, at_pos_rot, in_dir_rot, drawer_range_max, 1, 0)) return 1; // try objects in drawers; pickup_item=1
 	if (obj_id < 0) return 0; // no object to pick up
 	room_object_t &obj(get_room_object_by_index(obj_id));
 
@@ -1607,6 +1683,16 @@ int building_room_geom_t::find_nearest_pickup_object(building_t const &building,
 				for (unsigned n = 0; n < 3 && !intersects; ++n) {intersects |= cubes[n].line_intersects(p1c, p2c);}
 				if (!intersects) continue;
 			}
+			if (i->type == TYPE_HANGER_ROD && i->item_flags > 0) { // nonempty hanger rod
+				// search for hangers and don't allow hanger rod to be taken until the hangers are all taken
+				bool has_hanger(0);
+
+				for (auto j = i+1; j != (i + i->item_flags); ++j) { // iterate over all objects hanging on the hanger rod and look for untaken hangers
+					if (j->type == TYPE_HANGER) {has_hanger = 1; break;}
+				}
+				if (has_hanger) continue;
+			}
+			if (i->type == TYPE_HANGER  && (i->flags & RO_FLAG_HANGING) && (i+1) != objs_end && (i+1)->type == TYPE_CLOTHES) continue; // hanger with clothes - must take clothes first
 			if (i->type == TYPE_MIRROR  && !i->is_house())                continue; // can only pick up mirrors from houses, not office buildings
 			if (i->type == TYPE_TABLE   && i->shape == SHAPE_CUBE)        continue; // can only pick up short (TV) tables and cylindrical tables
 			if (i->type == TYPE_BED     && (i->flags & RO_FLAG_TAKEN3))   continue; // can only take pillow, sheets, and mattress - not the frame
@@ -1625,7 +1711,7 @@ int building_room_geom_t::find_nearest_pickup_object(building_t const &building,
 
 bool is_counter(room_object_t const &obj) {return (obj.type == TYPE_COUNTER || obj.type == TYPE_KSINK);}
 
-bool building_room_geom_t::open_nearest_drawer(building_t &building, point const &at_pos, vector3d const &in_dir, float range, bool pickup_item) {
+bool building_room_geom_t::open_nearest_drawer(building_t &building, point const &at_pos, vector3d const &in_dir, float range, bool pickup_item, bool check_only) {
 	int closest_obj_id(-1);
 	float dmin_sq(0.0);
 	point const p2(at_pos + in_dir*range);
@@ -1667,7 +1753,7 @@ bool building_room_geom_t::open_nearest_drawer(building_t &building, point const
 			drawers_part = get_dresser_middle(obj);
 			drawers_part.expand_in_dim(!obj.dim, -0.5*get_tc_leg_width(obj, 0.10));
 		}
-		drawer_extend = get_drawer_cubes(drawers_part, drawers, 0); // front_only=0
+		drawer_extend = get_drawer_cubes(drawers_part, drawers, 0, 1); // front_only=0, inside_only=1
 	}
 	dmin_sq        = 0.0;
 	closest_obj_id = -1;
@@ -1679,23 +1765,24 @@ bool building_room_geom_t::open_nearest_drawer(building_t &building, point const
 		if (dmin_sq == 0.0 || dsq < dmin_sq) {closest_obj_id = (i - drawers.begin()); dmin_sq = dsq;} // update if closest
 	}
 	if (closest_obj_id < 0) return 0; // no drawer
+	cube_t const &drawer(drawers[closest_obj_id]); // Note: drawer cube is the interior part
 	
 	if (pickup_item && !has_doors) { // pick up item in drawer rather than opening drawer; no pickup items behind doors yet
 		if (!(obj.drawer_flags & (1U << closest_obj_id))) return 0; // drawer is not open
-		// Note: drawer cube passed in is not shrunk to the interior part, but that should be okay because we're not doing a line test against that object
-		room_object_t const item(get_item_in_drawer(obj, drawers[closest_obj_id], closest_obj_id));
+		room_object_t const item(get_item_in_drawer(obj, drawer, closest_obj_id));
 		if (item.type == TYPE_NONE) return 0; // no item
+		if (check_only) return 1;
 		if (!register_player_object_pickup(item, at_pos)) return 0;
 		obj.item_flags |= (1U << closest_obj_id); // flag item as taken
 		player_inventory.add_item(item);
 		update_draw_state_for_room_object(item, building, 1);
 	}
 	else { // open or close the drawer/door
-		cube_t const &drawer(drawers[closest_obj_id]);
 		cube_t c_test(drawer);
 		if (has_doors) {c_test.d[obj.dim][obj.dir] += (obj.dir ? 1.0 : -1.0)*drawer.get_sz_dim(!obj.dim);} // expand outward by the width of the door
 		else {c_test.d[obj.dim][obj.dir] += drawer_extend;} // drawer
 		if (cube_intersects_moved_obj(c_test, closest_obj_id)) return 0; // blocked, can't open; ignore this object
+		if (check_only) return 1;
 		obj.drawer_flags ^= (1U << (unsigned)closest_obj_id); // toggle flag bit for selected drawer
 		point const drawer_center(drawer.get_cube_center());
 		if (has_doors) {building.play_door_open_close_sound(drawer_center, obj.is_open(), 0.5, 1.5);}
@@ -1826,7 +1913,7 @@ bool is_movable(room_object_t const &obj) {
 	bldg_obj_type_t const &bot(get_room_obj_type(obj));
 	return (bot.weight >= 40.0 && !bot.attached); // heavy non-attached objects, including tables
 }
-bool building_t::move_nearest_object(point const &at_pos, vector3d const &in_dir, float range, int mode) {
+bool building_t::move_nearest_object(point const &at_pos, vector3d const &in_dir, float range, int mode) { // mode: 0=normal, 1=pull
 	assert(has_room_geom());
 	int closest_obj_id(-1);
 	float dmin_sq(0.0);
@@ -1885,7 +1972,6 @@ bool building_t::move_nearest_object(point const &at_pos, vector3d const &in_dir
 				if (i->type == TYPE_CLOSET && i->is_open() && i->is_small_closet()) { // check open closet door collision
 					cube_t cubes[5];
 					get_closet_cubes(*i, cubes, 1); // get cubes for walls and door; for_collision=1
-					cubes[4] = get_open_closet_door(*i, cubes[4]); // include open door
 					for (unsigned n = 0; n < 5; ++n) {bad_placement |= cubes[n].intersects(moved_obj);}
 				}
 				else {bad_placement = i->intersects(moved_obj);}
@@ -1998,6 +2084,9 @@ bool building_t::maybe_use_last_pickup_room_object(point const &player_pos) {
 			if (!apply_paint(player_pos, cview_dir, obj.color, obj.type)) return 0;
 			player_inventory.mark_last_item_used();
 		}
+		else if (obj.type == TYPE_TAPE) {
+			tape_manager.toggle_use(obj, this);
+		}
 		else if (obj.type == TYPE_BOOK) {
 			float const half_width(0.5*max(max(obj.dx(), obj.dy()), obj.dz()));
 			point dest(player_pos + (1.2f*(get_scaled_player_radius() + half_width))*cview_dir);
@@ -2025,6 +2114,64 @@ bool building_t::maybe_use_last_pickup_room_object(point const &player_pos) {
 	}
 	else {assert(0);}
 	last_use_time = tfticks;
+	return 1;
+}
+
+void add_tape_quad(point const &p1, point const &p2, float height, colorRGBA const &color, quad_batch_draw &qbd) {
+	vector3d const dir(p2 - p1), zoff(0.5*height*plus_z);
+	vector3d normal(cross_product(dir, plus_z).get_norm());
+	point pts[4] = {(p1 - zoff), (p1 + zoff), (p2 + zoff), (p2 - zoff)};
+	qbd.add_quad_pts(pts, color,  normal);
+	swap(pts[1], pts[3]); // swap winding order and draw with reversed normal for two sided lighting
+	qbd.add_quad_pts(pts, color, -normal);
+}
+
+bool building_t::maybe_update_tape(point const &player_pos, bool end_of_tape) {
+	if (!tape_manager.in_use) return 0;
+	assert(has_room_geom());
+	auto &decal_mgr(interior->room_geom->decal_manager);
+	room_object_t const &obj(tape_manager.tape);
+	float const thickness(obj.dz()), pad_dist(0.1*thickness);
+	point const pos(player_pos + (1.5f*get_scaled_player_radius())*cview_dir);
+	point sound_pos;
+	float sound_gain(0.0);
+
+	if (end_of_tape) { // add final tape
+		if (tape_manager.points.empty()) return 0; // no tape
+		decal_mgr.pend_tape_qbd.clear();
+		point const end_pos(interior->find_closest_pt_on_obj_to_pos(*this, pos, pad_dist, 1)); // no_ceil_floor=1
+		add_tape_quad(tape_manager.points.back(), end_pos, thickness, obj.color, decal_mgr.tape_qbd); // add final segment
+		sound_pos = end_pos; sound_gain = 1.0;
+	}
+	else if (tape_manager.points.empty()) { // first point
+		point const start_pos(interior->find_closest_pt_on_obj_to_pos(*this, pos, pad_dist, 1)); // starting position for tape; no_ceil_floor=1
+		tape_manager.points.push_back(start_pos);
+		decal_mgr.commit_pend_tape_qbd(); // commit any previous tape
+		interior->room_geom->modified_by_player = 1; // make sure tape stays in this building
+		sound_pos = start_pos; sound_gain = 1.0;
+	}
+	else {
+		point last_pt(tape_manager.points.back()), p_int;
+
+		if (!dist_less_than(last_pt, pos, thickness) && interior->line_coll(*this, last_pt, pos, p_int)) { // no short segments
+			p_int += 0.5*thickness*(pos - last_pt).get_norm(); // move past the object to avoid an intersection at the starting point on the next call
+			tape_manager.points.push_back(p_int);
+			add_tape_quad(last_pt, p_int, thickness, obj.color, decal_mgr.tape_qbd);
+			last_pt = p_int;
+			//sound_pos = p_int; sound_gain = 0.1; // too noisy?
+		}
+		decal_mgr.pend_tape_qbd.clear();
+		add_tape_quad(last_pt, pos, thickness, obj.color, decal_mgr.pend_tape_qbd);
+		// update use count based on length change
+		float const prev_dist(p2p_dist(last_pt, tape_manager.last_pos)), cur_dist(p2p_dist(last_pt, pos)), delta(cur_dist - prev_dist);
+		int const delta_use_count(round_fp(0.5f*delta/thickness));
+		if (!player_inventory.update_last_item_use_count(delta_use_count)) {tape_manager.clear();} // check if we ran out of tape
+	}
+	if (sound_gain > 0.0) { // play a tape sound
+		gen_sound_thread_safe(get_sound_id_for_file("tape.wav"), local_to_camera_space(sound_pos), sound_gain);
+		register_building_sound(sound_pos, 0.35*sound_gain);
+	}
+	tape_manager.last_pos = pos;
 	return 1;
 }
 
@@ -2219,6 +2366,9 @@ bool building_t::apply_paint(point const &pos, vector3d const &dir, colorRGBA co
 	return 1;
 }
 
+bool room_object_t::can_use() const { // excludes dynamic objects
+	return (type == TYPE_SPRAYCAN || type == TYPE_MARKER || type == TYPE_TPROLL || type == TYPE_BOOK || type == TYPE_PHONE || type == TYPE_TAPE);
+}
 bool room_object_t::can_place_onto() const {
 	return (type == TYPE_TABLE || type == TYPE_DESK || type == TYPE_DRESSER || type == TYPE_NIGHTSTAND || type == TYPE_COUNTER || type == TYPE_KSINK ||
 		type == TYPE_BRSINK || type == TYPE_BED || type == TYPE_BOX || type == TYPE_CRATE || type == TYPE_KEYBOARD || type == TYPE_BOOK);
@@ -2410,11 +2560,16 @@ void building_gameplay_action_key(int mode, bool mouse_wheel) {
 	}
 }
 
-void building_gameplay_next_frame() {
-	if (office_chair_rot_rate != 0.0) { // update office chair rotation
-		office_chair_rot_rate *= exp(-0.05*fticks); // exponential slowdown
-		if (office_chair_rot_rate < 0.001) {office_chair_rot_rate = 0.0;} // stop rotating
+void attenuate_rate(float &v, float rate) {
+	if (v != 0.0) {
+		v *= exp(-rate*fticks); // exponential slowdown
+		if (fabs(v) < 0.001) {v = 0.0;} // stop moving
 	}
+}
+
+void building_gameplay_next_frame() {
+	attenuate_rate(office_chair_rot_rate, 0.05); // update office chair rotation
+
 	if (in_building_gameplay_mode()) { // run gameplay update logic
 		show_bldg_pickup_crosshair = 1;
 		// update sounds used by AI
@@ -2431,7 +2586,7 @@ void building_gameplay_next_frame() {
 	// reset state for next frame
 	cur_building_sound_level = min(1.2f, max(0.0f, (cur_building_sound_level - 0.01f*fticks))); // gradual decrease
 	can_pickup_bldg_obj = 0;
-	do_room_obj_pickup  = city_action_key = 0;
+	do_room_obj_pickup  = city_action_key = can_do_building_action = 0;
 }
 
 void enter_building_gameplay_mode() {player_inventory.clear_all();}

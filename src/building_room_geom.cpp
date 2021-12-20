@@ -33,12 +33,15 @@ int get_paneling_nm_tid() {return get_texture_by_name("normal_maps/paneling_NRM.
 int get_blinds_tid     () {return get_texture_by_name("interiors/blinds.jpg", 1, 0, 1, 8.0);} // use high aniso
 int get_money_tid      () {return get_texture_by_name("interiors/dollar20.jpg");}
 int get_crack_tid(room_object_t const &obj) {return get_texture_by_name(((5*obj.obj_id + 7*obj.room_id) & 1) ? "interiors/cracked_glass2.jpg" : "interiors/cracked_glass.jpg");}
+int get_box_tid() {return get_texture_by_name("interiors/box.jpg");}
+int get_crate_tid(room_object_t const &c) {return get_texture_by_name((c.obj_id & 1) ? "interiors/crate2.jpg" : "interiors/crate.jpg");}
 
 colorRGBA get_textured_wood_color() {return WOOD_COLOR.modulate_with(texture_color(WOOD2_TEX));} // Note: uses default WOOD_COLOR, not the per-building random variant
 colorRGBA get_counter_color      () {return (get_textured_wood_color()*0.75 + texture_color(get_counter_tid())*0.25);}
 
 rgeom_mat_t &building_room_geom_t::get_wood_material(float tscale, bool inc_shadows, bool dynamic, bool small) {
-	return get_material(get_tex_auto_nm(WOOD2_TEX, tscale, inc_shadows), inc_shadows, dynamic, small); // hard-coded for common material
+	return get_material(tid_nm_pair_t(WOOD2_TEX, get_texture_by_name("normal_maps/wood_NRM.jpg", 1),
+		3.0*tscale, 3.0*tscale, 0.0, 0.0, inc_shadows), inc_shadows, dynamic, small); // hard-coded for common material
 }
 
 void get_tc_leg_cubes_abs_width(cube_t const &c, float leg_width, cube_t cubes[4]) {
@@ -142,7 +145,8 @@ void building_room_geom_t::add_dresser(room_object_t const &c, float tscale, boo
 	}
 }
 
-float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_only) {
+float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_only, bool inside_only) {
+	assert(!(front_only && inside_only)); // these options only apply to open drawers
 	drawers.clear();
 	rand_gen_t rgen;
 	c.set_rand_gen_state(rgen);
@@ -150,11 +154,11 @@ float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_
 	float const width(c.get_sz_dim(!c.dim)), depth(c.get_sz_dim(c.dim)), height(c.dz());
 	bool is_lg(width > 2.0*height);
 	unsigned const num_rows(2 + (rgen.rand() & 1)); // 2-3
-	float const row_spacing(height/num_rows), door_thick(0.05*height), border(0.1*row_spacing), dir_sign(c.dir ? 1.0 : -1.0);
+	float const row_spacing(height/num_rows), drawer_thick(0.05*height), border(0.1*row_spacing), dir_sign(c.dir ? 1.0 : -1.0), sd_thick(dir_sign*drawer_thick);
 	float const drawer_extend(((c.type == TYPE_DESK) ? 0.5 : 0.8)*dir_sign*depth);
 	cube_t d_row(c);
-	d_row.d[ c.dim][!c.dir]  = c.d[c.dim][c.dir];
-	d_row.d[ c.dim][ c.dir] += dir_sign*door_thick; // expand out a bit
+	d_row.d[c.dim][!c.dir]  = c.d[c.dim][c.dir];
+	d_row.d[c.dim][ c.dir] += sd_thick; // expand out a bit
 	unsigned num_cols(1); // 1 for nightstand
 	float vpos(c.z1());
 
@@ -172,6 +176,12 @@ float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_
 			if (c.drawer_flags & (1 << drawers.size())) { // make a drawer open
 				drawer.d[c.dim][c.dir] += drawer_extend;
 				if (front_only) {drawer.d[c.dim][!c.dir] += drawer_extend;} // translate the other side as well
+				else if (inside_only) { // adjust to return interior part of the door for interaction
+					drawer.d[c.dim][ c.dir] -= sd_thick; // flush with object
+					drawer.d[c.dim][!c.dir] += 0.25f*sd_thick;
+					drawer.expand_in_dim(!c.dim, -0.08*drawer.get_sz_dim(!c.dim)); // subtract off width of sides
+					drawer.z1() += 0.2*drawer.dz();
+				}
 			}
 			drawers.push_back(drawer);
 			hpos += col_spacing;
@@ -183,11 +193,11 @@ float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_
 
 void building_room_geom_t::add_dresser_drawers(room_object_t const &c, float tscale) { // or nightstand
 	vect_cube_t &drawers(get_temp_cubes());
-	get_drawer_cubes(c, drawers, 1); // front_only=1
+	get_drawer_cubes(c, drawers, 1, 0); // front_only=1, inside_only=0
 	assert(drawers.size() <= 16); // we only have 16 bits to store drawer flags
 	float const height(c.dz()), drawer_thick(0.05*height), handle_thick(0.75*drawer_thick), dir_sign(c.dir ? 1.0 : -1.0), handle_width(0.07*height);
 	get_metal_material(0, 0, 1); // ensure material exists so that door_mat reference is not invalidated
-	rgeom_mat_t &drawer_mat(get_material(get_tex_auto_nm(WOOD2_TEX, 2.0*tscale), 1, 0, 1)); // shadowed, small=1
+	rgeom_mat_t &drawer_mat(get_wood_material(1.5*tscale, 1, 0, 1)); // shadowed, small=1
 	rgeom_mat_t &handle_mat(get_metal_material(0, 0, 1)); // untextured, unshadowed, small=1
 	colorRGBA const drawer_color(apply_light_color(c, WHITE)); // lighter color than dresser
 	colorRGBA const handle_color(apply_light_color(c, GRAY_BLACK));
@@ -210,7 +220,7 @@ void building_room_geom_t::add_dresser_drawers(room_object_t const &c, float tsc
 			left.z2() = right.z2() = drawer_body.z2() - 0.1*dheight; // sides slightly shorter than the front and back
 			left .d[!c.dim][1]    -= 0.87*dwidth; // set width of left  side
 			right.d[!c.dim][0]    += 0.87*dwidth; // set width of right side
-			back.d[c.dim][ c.dir]  = c.d[c.dim][c.dir] + 0.25f*dir_sign*drawer_thick; // flush with front face and narrow
+			back.d[c.dim][c.dir]   = c.d[c.dim][c.dir] + 0.25f*dir_sign*drawer_thick; // flush with front face and narrow
 			unsigned const skip_mask_front_back(get_skip_mask_for_xy(c.dim));
 			colorRGBA const blr_color(drawer_color*0.4 + apply_wood_light_color(c)*0.4); // halfway between base and drawer colors, but slightly darker
 			// swap the texture orientation of drawers to make them stand out more
@@ -276,7 +286,8 @@ void get_closet_cubes(room_object_t const &c, cube_t cubes[5], bool for_collisio
 	} // for d
 	doors.d[c.dim][ c.dir] -= (c.dir ? 1.0 : -1.0)*0.2*wall_thick; // shift in slightly
 	doors.d[c.dim][!c.dir] += (c.dir ? 1.0 : -1.0)*(depth - 0.8*wall_thick); // make it narrow
-	cubes[4] = doors; // Note: this is for closed door; caller must handle open door
+	if (for_collision && c.is_open() && use_small_door) {cubes[4] = get_open_closet_door(c, doors);} // include open doors for small closets
+	else {cubes[4] = doors;} // return closed door cube; caller must handle open door
 }
 
 void add_quad_to_mat(rgeom_mat_t &mat, point const pts[4], float const ts[4], float const tt[4], color_wrapper const &cw) {
@@ -488,25 +499,28 @@ void add_tproll_to_material(room_object_t const &c, rgeom_mat_t &mat) {
 	square.d[c.dim][c.dir] = square.d[c.dim][!c.dir]; // shrink to zero thickness at outer edge
 	mat.add_cube_to_verts(square, tp_color, zero_vector, ~get_skip_mask_for_xy(c.dim)); // only draw front/back faces
 }
-void building_room_geom_t::add_vert_tproll_to_material(room_object_t const &c, rgeom_mat_t &mat, float sz_ratio) {
+void building_room_geom_t::add_vert_roll_to_material(room_object_t const &c, rgeom_mat_t &mat, float sz_ratio, bool player_held) { // TP and tape
+	bool const is_tape(c.type == TYPE_TAPE);
+	float const hole_shrink(is_tape ? 0.24 : 0.3);
 	cube_t hole(c);
-	hole.expand_by_xy(-0.3*c.dx());
+	hole.expand_by_xy(-hole_shrink*c.dx());
 	cube_t tube(hole);
 	mat.add_vcylin_to_verts(tube, apply_light_color(c, LT_BROWN), 0, 0, 1); // tube, sides only, two sided (only need inside)
 	if (sz_ratio == 0.0) return; // empty, tube only, don't need to draw the rest of the roll
 	cube_t roll(c);
-	if (sz_ratio < 1.0) {roll.expand_by_xy(-0.3*(1.0 - sz_ratio)*c.dx());} // partially used
+	if (sz_ratio < 1.0) {roll.expand_by_xy(-hole_shrink*(1.0 - sz_ratio)*c.dx());} // partially used
 	hole.expand_in_dim(2, 0.0025*c.dz()); // expand slightly to avoid z-fighting
-	mat.add_vcylin_to_verts(hole, ALPHA0, 1, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // hole - top/bottom surface only to mask off the outer part of the roll
-	mat.add_vcylin_to_verts(roll, apply_light_color(c),  1, 1); // paper roll
+	// draw top/bottom surface only to mask off the outer part of the roll when held by the player; when resting on an object, draw the top surface only
+	mat.add_vcylin_to_verts(hole, ALPHA0, player_held, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // hole
+	mat.add_vcylin_to_verts(roll, apply_light_color(c), 1, 1); // paper/plastic roll
 }
 void building_room_geom_t::add_tproll(room_object_t const &c) { // is_small=1
 	if (c.flags & RO_FLAG_WAS_EXP) { // bare TP roll from a box
-		add_vert_tproll_to_material(c, get_untextured_material(1, 0, 1)); // shadowed, small
+		add_vert_roll_to_material(c, get_untextured_material(1, 0, 1)); // shadowed, small
 		return;
 	}
-	float const radius(0.5*c.dz()), rod_shrink(-0.7*radius), length(c.get_sz_dim(!c.dim));
 	if (!(c.flags & RO_FLAG_TAKEN1)) {add_tproll_to_material(c, get_untextured_material(1, 0, 1));} // draw the roll if not taken
+	float const radius(0.5*c.dz()), rod_shrink(-0.7*radius), length(c.get_sz_dim(!c.dim));
 	// draw the holder attached to the wall
 	rgeom_mat_t &holder_mat(get_metal_material(1, 0, 1)); // untextured, shadowed, small=1
 	colorRGBA const holder_color(apply_light_color(c, GRAY));
@@ -521,6 +535,20 @@ void building_room_geom_t::add_tproll(room_object_t const &c) { // is_small=1
 	plate.d[!c.dim][1] = rod_end;
 	holder_mat.add_ortho_cylin_to_verts(rod, holder_color, !c.dim, 0, 1);
 	holder_mat.add_cube_to_verts(plate, holder_color, zero_vector, ~get_face_mask(c.dim, c.dir)); // skip the face against the wall
+}
+void building_room_geom_t::add_tape(room_object_t const &c) { // is_small=1
+	rgeom_mat_t &mat(get_untextured_material(1, 0, 1));
+	
+	if ((c.flags & RO_FLAG_WAS_EXP) && !(c.flags & RO_FLAG_IN_CLOSET)) {
+		// if tape was in a drawer, then the hole won't properly blend with the wood under it, making the floor visible;
+		// draw a wood colored circle under the hole before drawing the roll to sort of cover this up (though it's not textured);
+		// this isn't necessary or corect for tape in boxes, whic are usually in closets, so skip that case
+		cube_t bot_fill(c);
+		bot_fill.expand_by_xy(-0.1*c.dx());
+		bot_fill.z2() -= 0.95*c.dz();
+		mat.add_vcylin_to_verts(bot_fill, apply_light_color(c, texture_color(get_box_tid())), 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // top side only
+	}
+	add_vert_roll_to_material(c, mat); // shadowed, small
 }
 
 void building_room_geom_t::add_spraycan_to_material(room_object_t const &c, rgeom_mat_t &mat) {
@@ -554,9 +582,6 @@ void building_room_geom_t::add_button(room_object_t const &c) {
 		get_untextured_material(0, 0, 1).add_cube_to_verts(frame, apply_light_color(c, DK_GRAY), all_zeros, ~get_face_mask(c.dim, !c.dir)); // small
 	}
 }
-
-int get_box_tid() {return get_texture_by_name("interiors/box.jpg");}
-int get_crate_tid(room_object_t const &c) {return get_texture_by_name((c.obj_id & 1) ? "interiors/crate2.jpg" : "interiors/crate.jpg");}
 
 void building_room_geom_t::add_crate(room_object_t const &c) { // is_small=1
 	// Note: draw as "small", not because crates are small, but because they're only added to windowless rooms and can't be easily seen from outside a building
@@ -1099,8 +1124,8 @@ cube_t get_elevator_car_panel(room_object_t const &c) {
 	float const width(c.get_sz_dim(!c.dim)), frame_width(0.2*width), panel_width(min(0.9f*frame_width, 0.25f*dz)), front_face(c.d[c.dim][c.dir] - signed_thickness);
 	cube_t panel(c);
 	panel.d[c.dim][ c.dir] = front_face; // flush front inner wall
-	panel.d[c.dim][!c.dir] = front_face - 0.1*signed_thickness; // set panel thickness
-	panel.d[!c.dim][0] = c.d[!c.dim][0] + 0.5*(frame_width - panel_width) + thickness; // edge near the wall
+	panel.d[c.dim][!c.dir] = front_face - 0.1f*signed_thickness; // set panel thickness
+	panel.d[!c.dim][0] = c.d[!c.dim][0] + 0.5f*(frame_width - panel_width) + thickness; // edge near the wall
 	panel.d[!c.dim][1] = panel.d[!c.dim][0] + panel_width - thickness; // edge near door
 	panel.z1() += 0.28*dz; panel.z2() -= 0.28*dz;
 	return panel;
@@ -1259,7 +1284,7 @@ void building_room_geom_t::add_picture(room_object_t const &c) { // also whitebo
 		get_untextured_material(1).add_cube_to_verts_untextured(ledge, GRAY, (1 << (2*(2-c.dim) + !c.dir))); // shadowed
 	}
 	else if (c.flags & RO_FLAG_RAND_ROT) { // apply a random rotation
-		float const angle(0.2*(fract(PI*c.obj_id + 1.61803*c.item_flags) - 0.5)); // random rotation based on obj_id and item flags
+		float const angle(0.2f*(fract(PI*c.obj_id + 1.61803f*c.item_flags) - 0.5f)); // random rotation based on obj_id and item flags
 		point rotate_pt(c.get_cube_center());
 		rotate_pt.z += 0.45*c.dz(); // rotate about a point near the top of the picture
 		vector3d normal(zero_vector);
@@ -1719,7 +1744,7 @@ void building_room_geom_t::add_bed(room_object_t const &c, bool inc_lg, bool inc
 		if (no_mattress) { // mattress is gone, draw the slats on the bottom of the bed
 			unsigned const num_slats = 12;
 			unsigned const slat_skip_faces(get_skip_mask_for_xy(!c.dim));
-			float const side_width(0.08*width), slat_spacing(length/num_slats), slat_width(0.45*slat_spacing), slat_gap(0.5*(slat_spacing - slat_width));
+			float const side_width(0.08*width), slat_spacing(length/num_slats), slat_width(0.45*slat_spacing), slat_gap(0.5f*(slat_spacing - slat_width));
 			cube_t sides[2] = {frame, frame}, slat(frame);
 			sides[0].d[!c.dim][1] -= (width - side_width);
 			sides[1].d[!c.dim][0] += (width - side_width);
@@ -1880,6 +1905,7 @@ void building_room_geom_t::add_water_heater(room_object_t const &c) {
 void building_room_geom_t::add_laundry_basket(room_object_t const &c) {
 	// Note: no alpha test is enabled in the shader when drawing this, so the holes in the material may not be drawn correctly against objects such as exterior walls
 	rgeom_mat_t &tex_mat(get_material(tid_nm_pair_t(get_texture_by_name("interiors/plastic_mesh.png")), 1, 0, 1)); // inc_shadows=1, dynamic=0, small=1
+	//rgeom_mat_t &tex_mat(mats_amask.get_material(tid_nm_pair_t(get_texture_by_name("interiors/plastic_mesh.png")), 1)); // shadowed with alpha mask - doesn't look as good, need min_alpha=0.0
 	cube_t bot(c), mid(c), top(c);
 	bot.z2() = mid.z1() = c.z1() + 0.12*c.dz();
 	mid.z2() = top.z1() = c.z2() - 0.12*c.dz();
@@ -2252,7 +2278,7 @@ void building_room_geom_t::add_cabinet(room_object_t const &c, float tscale) { /
 	// add cabinet doors; maybe these should be small objects, but there are at most a few cabinets per house and none in office buildings
 	if (doors.empty()) return; // no doors
 	get_metal_material(0); // ensure material exists so that door_mat reference is not invalidated
-	rgeom_mat_t &door_mat(get_material(get_tex_auto_nm(WOOD2_TEX, 2.0*tscale, any_doors_open), any_doors_open)); // only shadowed if a door is open
+	rgeom_mat_t &door_mat(get_wood_material(1.5*tscale, any_doors_open)); // only shadowed if a door is open
 	rgeom_mat_t &handle_mat(get_metal_material(0)); // untextured, unshadowed
 	colorRGBA const door_color(apply_light_color(c, WHITE)); // lighter color than cabinet
 	colorRGBA const handle_color(apply_light_color(c, GRAY_BLACK));
@@ -2266,7 +2292,7 @@ void building_room_geom_t::add_cabinet(room_object_t const &c, float tscale) { /
 
 		if (is_open) { // make this door open
 			door.d[ c.dim][c.dir] += dir_sign*(door_width - door_thick); // expand out to full width
-			door.d[!c.dim][!handle_side] -= (handle_side ? -1.0 : 1.0)*(door_width - door_thick); // shrink to correct thickness
+			door.d[!c.dim][!handle_side] -= (handle_side ? -1.0f : 1.0f)*(door_width - door_thick); // shrink to correct thickness
 		}
 		door_mat.add_cube_to_verts(door, door_color, tex_origin, door_skip_faces);
 		// add door handle
@@ -2391,13 +2417,13 @@ void building_room_geom_t::add_potted_plant(room_object_t const &c, bool inc_pot
 		static vector<vert_norm_comp> points;
 		points.clear();
 		plant.create_leaf_points(points, 10.0, 1.5, 4); // plant_scale=10.0 seems to work well; more levels and rings
-		auto &leaf_verts(mats_plants.get_material(tid_nm_pair_t(plant.get_leaf_tid()), 1).quad_verts);
+		auto &leaf_verts(mats_amask.get_material(tid_nm_pair_t(plant.get_leaf_tid()), 1).quad_verts);
 		color_wrapper const leaf_cw(apply_light_color(c, plant.get_leaf_color()));
 		float const ts[4] = {0,1,1,0}, tt[4] = {0,0,1,1};
 		for (unsigned i = 0; i < points.size(); ++i) {leaf_verts.emplace_back(vert_norm_comp_tc(points[i], ts[i&3], tt[i&3]), leaf_cw);}
 		// draw plant stem
 		colorRGBA const stem_color(plant.get_stem_color());
-		mats_plants.get_material(get_tex_auto_nm(WOOD2_TEX), 1).add_cylin_to_verts(point(cx, cy, base_pos.z), point(cx, cy, c.z2()), stem_radius, 0.0f, stem_color, 0, 0); // stem
+		mats_amask.get_material(get_tex_auto_nm(WOOD2_TEX), 1).add_cylin_to_verts(point(cx, cy, base_pos.z), point(cx, cy, c.z2()), stem_radius, 0.0f, stem_color, 0, 0); // stem
 	}
 }
 
@@ -2422,7 +2448,8 @@ void building_room_geom_t::add_lg_ball(room_object_t const &c) { // is_small=1
 	static rgeom_mat_t mat = rgeom_mat_t(tid_nm_pair_t()); // allocated memory is reused across frames; VBO/IBO are recreated every time
 	mat.tex = tid_nm_pair_t(get_lg_ball_tid(c), get_lg_ball_nm_tid(c), 0.0, 0.0);
 	mat.add_sphere_to_verts(c, apply_light_color(c), 0, zero_vector, &rot_matrix); // low_detail=0
-	mat.upload_draw_and_clear(s);
+	tid_nm_pair_dstate_t state(s);
+	mat.upload_draw_and_clear(state);
 }
 
 colorRGBA room_object_t::get_color() const {

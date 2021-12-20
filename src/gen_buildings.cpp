@@ -11,6 +11,7 @@
 #include "subdiv.h" // for sd_sphere_d
 #include "tree_3dw.h" // for tree_placer_t
 #include "profiler.h"
+#include "shadow_map.h" // for get_empty_smap_tid
 
 using std::string;
 
@@ -27,7 +28,7 @@ building_params_t global_building_params;
 building_t const *player_building(nullptr);
 
 extern bool start_in_inf_terrain, draw_building_interiors, flashlight_on, enable_use_temp_vbo, toggle_room_light;
-extern bool teleport_to_screenshot, enable_dlight_bcubes, player_in_elevator;
+extern bool teleport_to_screenshot, enable_dlight_bcubes, player_in_elevator, can_do_building_action;
 extern unsigned room_mirror_ref_tid;
 extern int rand_gen_index, display_mode, window_width, window_height, camera_surf_collide, animate2, building_action_key;
 extern float CAMERA_RADIUS, city_dlight_pcf_offset_scale, fticks, FAR_CLIP;
@@ -41,26 +42,37 @@ void get_all_model_bcubes(vector<cube_t> &bcubes); // from model3d.h
 
 float get_door_open_dist() {return 3.5*CAMERA_RADIUS;}
 
+void tid_nm_pair_dstate_t::set_for_shader(float new_bump_map_mag) {
+	if (new_bump_map_mag == bump_map_mag) return; // no change
+	bump_map_mag = new_bump_map_mag;
+	if (bmm_loc == -1) {bmm_loc = s.get_uniform_loc("bump_map_mag");} // set on the first call
+	s.set_uniform_float(bmm_loc, bump_map_mag);
+}
+tid_nm_pair_dstate_t::~tid_nm_pair_dstate_t() { // restore to default if needed
+	if (bmm_loc && bump_map_mag != 1.0) {s.set_uniform_float(bmm_loc, 1.0);} // bmm_loc should have been set
+}
+
 tid_nm_pair_t tid_nm_pair_t::get_scaled_version(float scale) const {
 	tid_nm_pair_t tex(*this);
 	tex.tscale_x *= scale;
 	tex.tscale_y *= scale;
 	return tex;
 }
-void tid_nm_pair_t::set_gl(shader_t &s) const {
+void tid_nm_pair_t::set_gl(tid_nm_pair_dstate_t &state) const {
 	if (tid == FONT_TEXTURE_ID) {text_drawer::bind_font_texture();}
 	else if (tid == REFLECTION_TEXTURE_ID) {
 		if (bind_reflection_shader()) return;
 	} else {select_texture(tid);}
-	select_multitex(get_nm_tid(), 5);
-	s.add_uniform_float("bump_map_mag", ((get_nm_tid() == FLAT_NMAP_TEX) ? 0.0 : 1.0)); // enable or disable normal map (only ~25% of calls have a normal map)
-	if (emissive > 0.0) {s.add_uniform_float("emissive_scale", emissive);} // enable emissive
-	if (spec_mag > 0  ) {s.set_specular(spec_mag/255.0, shininess);}
+	bool const has_normal_map(get_nm_tid() != FLAT_NMAP_TEX);
+	if (has_normal_map) {select_multitex(get_nm_tid(), 5);} // else we set bump_map_mag=0.0
+	state.set_for_shader(has_normal_map ? 1.0 : 0.0); // enable or disable normal map (only ~25% of calls have a normal map)
+	if (emissive > 0.0) {state.s.add_uniform_float("emissive_scale", emissive);} // enable emissive
+	if (spec_mag > 0  ) {state.s.set_specular(spec_mag/255.0, shininess);}
 }
-void tid_nm_pair_t::unset_gl(shader_t &s) const {
-	if (tid == REFLECTION_TEXTURE_ID && room_mirror_ref_tid != 0) {s.make_current(); return;}
-	if (emissive > 0.0) {s.add_uniform_float("emissive_scale", 0.0);} // disable emissive
-	if (spec_mag > 0  ) {s.clear_specular();}
+void tid_nm_pair_t::unset_gl(tid_nm_pair_dstate_t &state) const {
+	if (tid == REFLECTION_TEXTURE_ID && room_mirror_ref_tid != 0) {state.s.make_current(); return;}
+	if (emissive > 0.0) {state.s.add_uniform_float("emissive_scale", 0.0);} // disable emissive
+	if (spec_mag > 0  ) {state.s.clear_specular();}
 }
 void tid_nm_pair_t::toggle_transparent_windows_mode() { // hack
 	if      (tid == BLDG_WINDOW_TEX    ) {tid = BLDG_WIND_TRANS_TEX;}
@@ -99,7 +111,7 @@ void building_geom_t::do_xy_rotate_normal_inv(point &n) const {::do_xy_rotate_no
 
 
 class building_texture_mgr_t {
-	int window_tid, hdoor_tid, bdoor_tid, gdoor_tid, ac_unit_tid1, ac_unit_tid2, bath_wind_tid, helipad_tex, solarp_tex;
+	int window_tid, hdoor_tid, odoor_tid, bdoor_tid, bdoor2_tid, gdoor_tid, ac_unit_tid1, ac_unit_tid2, bath_wind_tid, helipad_tex, solarp_tex;
 
 	int ensure_tid(int &tid, const char *name) {
 		if (tid < 0) {tid = get_texture_by_name(name);}
@@ -107,10 +119,13 @@ class building_texture_mgr_t {
 		return tid;
 	}
 public:
-	building_texture_mgr_t() : window_tid(-1), hdoor_tid(-1), bdoor_tid(-1), gdoor_tid(-1), ac_unit_tid1(-1), ac_unit_tid2(-1), bath_wind_tid(-1), helipad_tex(-1), solarp_tex(-1) {}
+	building_texture_mgr_t() : window_tid(-1), hdoor_tid(-1), odoor_tid(-1), bdoor_tid(-1), bdoor2_tid(-1), gdoor_tid(-1),
+		ac_unit_tid1(-1), ac_unit_tid2(-1), bath_wind_tid(-1), helipad_tex(-1), solarp_tex(-1) {}
 	int get_window_tid   () const {return window_tid;}
 	int get_hdoor_tid    () {return ensure_tid(hdoor_tid,     "white_door.jpg");} // house door
-	int get_bdoor_tid    () {return ensure_tid(bdoor_tid,     "buildings/building_door.jpg");} // building door
+	int get_odoor_tid    () {return ensure_tid(odoor_tid,     "buildings/office_door.jpg");} // office door (low resolution); unused
+	int get_bdoor_tid    () {return ensure_tid(bdoor_tid,     "buildings/building_door.jpg");} // metal + glass building door
+	int get_bdoor2_tid   () {return ensure_tid(bdoor2_tid,    "buildings/metal_door.jpg");} // metal building door; unused
 	int get_gdoor_tid    () {return ensure_tid(gdoor_tid,     "buildings/garage_door.jpg");} // garage door
 	int get_ac_unit_tid1 () {return ensure_tid(ac_unit_tid1,  "buildings/AC_unit1.jpg");} // AC unit (should this be a <d> loop?)
 	int get_ac_unit_tid2 () {return ensure_tid(ac_unit_tid2,  "buildings/AC_unit2.jpg");} // AC unit
@@ -125,7 +140,7 @@ public:
 		window_tid = BLDG_WINDOW_TEX;
 		return 1;
 	}
-	bool is_door_tid(int tid) const {return (tid >= 0 && (tid == hdoor_tid || tid == bdoor_tid || tid == gdoor_tid));}
+	bool is_door_tid(int tid) const {return (tid >= 0 && (tid == hdoor_tid || tid == odoor_tid || tid == bdoor_tid || tid == bdoor2_tid || tid == gdoor_tid));}
 };
 building_texture_mgr_t building_texture_mgr;
 
@@ -164,7 +179,9 @@ public:
 		tid_to_slot_ix.push_back(0); // untextured case
 		register_tid(building_texture_mgr.get_window_tid());
 		register_tid(building_texture_mgr.get_hdoor_tid());
+		//register_tid(building_texture_mgr.get_odoor_tid()); // enable when this door type is used
 		register_tid(building_texture_mgr.get_bdoor_tid());
+		register_tid(building_texture_mgr.get_bdoor2_tid());
 		register_tid(building_texture_mgr.get_gdoor_tid());
 		register_tid(building_texture_mgr.get_ac_unit_tid1());
 		register_tid(building_texture_mgr.get_ac_unit_tid2());
@@ -288,13 +305,13 @@ void reset_interior_lighting_and_end_shader(shader_t &s) {
 	reset_interior_lighting(s);
 	s.end_shader();
 }
-void setup_building_draw_shader(shader_t &s, float min_alpha, bool enable_indir, bool force_tsl, bool use_texgen) {
+void setup_building_draw_shader(shader_t &s, float min_alpha, bool enable_indir, bool force_tsl, bool use_texgen) { // for building interiors
 	float const pcf_scale = 0.2;
 	bool const have_indir(enable_indir && indir_tex_mgr.enabled() && !(player_in_closet && !(player_in_closet & RO_FLAG_OPEN))); // disable indir if the player is in a closed closet
 	int const use_bmap(global_building_params.has_normal_map), interior_use_smaps((ADD_ROOM_SHADOWS && ADD_ROOM_LIGHTS) ? 2 : 1); // dynamic light smaps only
 	cube_t const lights_bcube(building_lights_manager.get_lights_bcube());
 	s.set_prefix("#define LINEAR_DLIGHT_ATTEN", 1); // FS; improves room lighting (better light distribution vs. framerate trade-off)
-	city_shader_setup(s, lights_bcube, ADD_ROOM_LIGHTS, interior_use_smaps, use_bmap, min_alpha, force_tsl, pcf_scale, use_texgen, have_indir);
+	city_shader_setup(s, lights_bcube, ADD_ROOM_LIGHTS, interior_use_smaps, use_bmap, min_alpha, force_tsl, pcf_scale, use_texgen, have_indir, 0); // is_outside=0
 	set_interior_lighting(s, have_indir);
 	if (have_indir) {indir_tex_mgr.setup_for_building(s);}
 }
@@ -356,7 +373,7 @@ void add_tquad_to_verts(building_geom_t const &bg, tquad_with_ix_t const &tquad,
 		dim = (tquad.pts[0].x == tquad.pts[1].x);
 		if (world_mode != WMODE_INF_TERRAIN) {tex_off = (dim ? yoff2*DY_VAL : xoff2*DX_VAL);}
 	}
-	else if (tquad.type == tquad_with_ix_t::TYPE_ROOF || tquad.type == tquad_with_ix_t::TYPE_ROOF_ACC || tquad.type == tquad_with_ix_t::TYPE_CCAP) { // roof or chimney cap
+	else if (tquad.type == tquad_with_ix_t::TYPE_ROOF || tquad.type == tquad_with_ix_t::TYPE_ROOF_ACC) { // roof cap
 		float const denom(0.5f*(bcube.dx() + bcube.dy()));
 		tsx = tex.tscale_x/denom; tsy = tex.tscale_y/denom;
 	}
@@ -364,7 +381,7 @@ void add_tquad_to_verts(building_geom_t const &bg, tquad_with_ix_t const &tquad,
 	vector3d normal(tquad.get_norm());
 	if (do_rotate) {bg.do_xy_rotate_normal(normal);}
 	vert.set_norm(normal);
-	invert_tc_x ^= (tquad.type == tquad_with_ix_t::TYPE_IDOOR2); // interior door, back face
+	invert_tc_x ^= (tquad.type == tquad_with_ix_t::TYPE_IDOOR2 || tquad.type == tquad_with_ix_t::TYPE_ODOOR2); // interior/office door, back face
 
 	for (unsigned i = 0; i < tquad.npts; ++i) {
 		vert.v = tquad.pts[i];
@@ -376,7 +393,7 @@ void add_tquad_to_verts(building_geom_t const &bg, tquad_with_ix_t const &tquad,
 			vert.t[0] = (vert.v[dim] + tex_off)*tsx; // use nonzero width dim
 			vert.t[1] = (vert.v.z - bcube.z1())*tsy;
 		}
-		else if (tquad.type == tquad_with_ix_t::TYPE_ROOF || tquad.type == tquad_with_ix_t::TYPE_CCAP) { // roof or chimney cap
+		else if (tquad.type == tquad_with_ix_t::TYPE_ROOF) { // roof cap
 			vert.t[0] = (vert.v.x - bcube.x1())*tsx; // varies from 0.0 and bcube x1 to 1.0 and bcube x2
 			vert.t[1] = (vert.v.y - bcube.y1())*tsy; // varies from 0.0 and bcube y1 to 1.0 and bcube y2
 		}
@@ -441,10 +458,10 @@ class building_draw_t {
 		draw_block_t() : tri_vbo_off(0), no_shadows(0) {}
 		void record_num_verts() {start_num_verts[0] = num_quad_verts(); start_num_verts[1] = num_tri_verts();}
 
-		void draw_geom_range(shader_t &s, bool shadow_only, vert_ix_pair const &vstart, vert_ix_pair const &vend) { // use VBO rendering
+		void draw_geom_range(tid_nm_pair_dstate_t &state, bool shadow_only, vert_ix_pair const &vstart, vert_ix_pair const &vend) { // use VBO rendering
 			if (vstart == vend) return; // empty range - no verts for this tile
 			if (shadow_only && no_shadows) return; // no shadows on this material
-			if (!shadow_only) {tex.set_gl(s);}
+			if (!shadow_only) {tex.set_gl(state);}
 			assert(vbo.vbo_valid());
 			(shadow_only ? svao : vao).create_from_vbo<vert_norm_comp_tc_color>(vbo, 1, 1); // setup_pointers=1, always_bind=1
 
@@ -456,38 +473,38 @@ class building_draw_t {
 				assert(vstart.tix < vend.tix);
 				glDrawArrays(GL_TRIANGLES, (vstart.tix + tri_vbo_off), (vend.tix - vstart.tix));
 			}
-			if (!shadow_only) {tex.unset_gl(s);}
+			if (!shadow_only) {tex.unset_gl(state);}
 			vao_manager_t::post_render();
 		}
-		void draw_all_geom(shader_t &s, bool shadow_only, bool direct_draw_no_vbo, vertex_range_t const *const exclude=nullptr) {
+		void draw_all_geom(tid_nm_pair_dstate_t &state, bool shadow_only, bool direct_draw_no_vbo, vertex_range_t const *const exclude=nullptr) {
 			if (shadow_only && no_shadows) return; // no shadows on this material
 
 			if (direct_draw_no_vbo) {
 				enable_use_temp_vbo = 1; // hack to fix missing wall artifacts when not using a core context
 				assert(!exclude); // not supported in this mode
 				bool const use_texture(!shadow_only && (!quad_verts.empty() || !tri_verts.empty()));
-				if (use_texture) {tex.set_gl(s);} // Note: colors are not disabled here
+				if (use_texture) {tex.set_gl(state);} // Note: colors are not disabled here
 				if (!quad_verts.empty()) {draw_quad_verts_as_tris(quad_verts, 0, 1, 1);}
 				if (!tri_verts .empty()) {draw_verts(tri_verts, GL_TRIANGLES, 0, 1);}
-				if (use_texture) {tex.unset_gl(s);}
+				if (use_texture) {tex.unset_gl(state);}
 				enable_use_temp_vbo = 0;
 			}
 			else {
 				if (pos_by_tile.empty()) return; // nothing to draw for this block/texture
 				vert_ix_pair const &start(pos_by_tile.front()), end(pos_by_tile.back());
-				if (!exclude) {draw_geom_range(s, shadow_only, start, end); return;} // non-exclude case
+				if (!exclude) {draw_geom_range(state, shadow_only, start, end); return;} // non-exclude case
 				assert(exclude->start >= start.qix && exclude->start < exclude->end && exclude->end <= end.qix); // exclude (start, end) must be a subset of (start.qix, end.qix)
-				draw_geom_range(s, shadow_only, start, vert_ix_pair(exclude->start, end.tix)); // first block of quads and all tris
-				draw_geom_range(s, shadow_only, vert_ix_pair(exclude->end, end.tix), end); // second block of quads and no tris
+				draw_geom_range(state, shadow_only, start, vert_ix_pair(exclude->start, end.tix)); // first block of quads and all tris
+				draw_geom_range(state, shadow_only, vert_ix_pair(exclude->end, end.tix), end); // second block of quads and no tris
 			}
 		}
-		void draw_quad_geom_range(shader_t &s, vertex_range_t const &range, bool shadow_only=0) { // no tris; empty range is legal
-			draw_geom_range(s, shadow_only, vert_ix_pair(range.start, 0), vert_ix_pair(range.end, 0));
+		void draw_quad_geom_range(tid_nm_pair_dstate_t &state, vertex_range_t const &range, bool shadow_only=0) { // no tris; empty range is legal
+			draw_geom_range(state, shadow_only, vert_ix_pair(range.start, 0), vert_ix_pair(range.end, 0));
 		}
-		void draw_geom_tile(shader_t &s, unsigned tile_id, bool shadow_only) {
+		void draw_geom_tile(tid_nm_pair_dstate_t &state, unsigned tile_id, bool shadow_only) {
 			if (pos_by_tile.empty()) return; // nothing to draw for this block/texture
 			assert(tile_id+1 < pos_by_tile.size()); // tile and next tile must be valid indices
-			draw_geom_range(s, shadow_only, pos_by_tile[tile_id], pos_by_tile[tile_id+1]); // shadow_only=0
+			draw_geom_range(state, shadow_only, pos_by_tile[tile_id], pos_by_tile[tile_id+1]); // shadow_only=0
 		}
 		void upload_to_vbos() {
 			assert((quad_verts.size()%4) == 0);
@@ -807,7 +824,7 @@ public:
 				else {
 					segs.push_back(wall_seg_t()); // single seg
 				}
-				if (clip_windows && bg.has_chimney) { // remove windows blocked by the chimney; there can be at most one segment
+				if (clip_windows && bg.has_chimney == 2) { // remove windows blocked by the chimney; there can be at most one segment
 					cube_t block(bg.get_chimney());
 					block.union_with_cube(bg.get_fireplace()); // merge with fireplace
 
@@ -951,7 +968,7 @@ public:
 		unsigned skip_ix(num_posts); // start at an invalid value
 
 		if (mult_sections && dim == 0) { // skip end post on the corner in dim=0 because it's duplicated with the corner post in the other dim
-			float const dmin(post_width + (bg.has_chimney ? bg.get_chimney().get_sz_dim(!dim) : 0.0)); // include chimney width, which can increase the house bcube beyond the fence
+			float const dmin(post_width + ((bg.has_chimney == 2) ? bg.get_chimney().get_sz_dim(!dim) : 0.0)); // include chimney width, can increase the house bcube beyond the fence
 			if      (fabs(bg.bcube.d[!dim][1] - fence.d[!dim][1]) < dmin) {beam.d[!dim][1] += post_hwidth; skip_ix = num_posts-1;} // skip last post
 			else if (fabs(bg.bcube.d[!dim][0] - fence.d[!dim][0]) < dmin) {beam.d[!dim][0] -= post_hwidth; skip_ix = 0;} // skip first post
 		}
@@ -1004,37 +1021,46 @@ public:
 	
 	// tex_filt_mode: 0=draw everything, 1=draw exterior walls only, 2=draw everything but exterior walls, 3=draw everything but exterior walls and doors
 	void draw(shader_t &s, bool shadow_only, bool direct_draw_no_vbo=0, int tex_filt_mode=0, vertex_range_t const *const exclude=nullptr) {
+		tid_nm_pair_dstate_t state(s);
+
 		for (auto i = to_draw.begin(); i != to_draw.end(); ++i) {
 			if (tex_filt_mode && (tid_mapper.is_ext_wall_tid(i->tex.tid) != (tex_filt_mode == 1))) continue; // not an ext wall texture, skip
 			if (tex_filt_mode == 3 && building_texture_mgr.is_door_tid(i->tex.tid)) continue; // door texture, skip
 			bool const use_exclude(exclude && exclude->draw_ix == int(i - to_draw.begin()));
-			i->draw_all_geom(s, shadow_only, direct_draw_no_vbo, (use_exclude ? exclude : nullptr));
+			i->draw_all_geom(state, shadow_only, direct_draw_no_vbo, (use_exclude ? exclude : nullptr));
 		}
 	}
 	void draw_tile(shader_t &s, unsigned tile_id, bool shadow_only=0) {
-		for (auto i = to_draw.begin(); i != to_draw.end(); ++i) {i->draw_geom_tile(s, tile_id, shadow_only);}
+		tid_nm_pair_dstate_t state(s);
+		for (auto i = to_draw.begin(); i != to_draw.end(); ++i) {i->draw_geom_tile(state, tile_id, shadow_only);}
 	}
 	void draw_block(shader_t &s, unsigned ix, bool shadow_only, vertex_range_t const *const exclude=nullptr) {
-		if (ix < to_draw.size()) {to_draw[ix].draw_all_geom(s, shadow_only, 0, exclude);}
+		if (ix >= to_draw.size()) return;
+		tid_nm_pair_dstate_t state(s);
+		to_draw[ix].draw_all_geom(state, shadow_only, 0, exclude);
 	}
-	void draw_quad_geom_range(shader_t &s, vertex_range_t const &range, bool shadow_only=0) {
+	void draw_quad_geom_range(tid_nm_pair_dstate_t &state, vertex_range_t const &range, bool shadow_only=0) {
 		if (range.draw_ix < 0 || (unsigned)range.draw_ix >= to_draw.size()) return; // invalid range, skip
-		to_draw[range.draw_ix].draw_quad_geom_range(s, range, shadow_only);
+		to_draw[range.draw_ix].draw_quad_geom_range(state, range, shadow_only);
 	}
 	void draw_quads_for_draw_range(shader_t &s, draw_range_t const &draw_range, bool shadow_only=0) {
-		for (unsigned i = 0; i < MAX_DRAW_BLOCKS; ++i) {draw_quad_geom_range(s, draw_range.vr[i], shadow_only);}
+		tid_nm_pair_dstate_t state(s);
+		for (unsigned i = 0; i < MAX_DRAW_BLOCKS; ++i) {draw_quad_geom_range(state, draw_range.vr[i], shadow_only);}
 	}
 }; // end building_draw_t
 
 
 // *** Drawing ***
 
-int get_building_ext_door_tid(unsigned type) {
+int get_building_door_tid(unsigned type) { // exterior doors, and interior doors of limited types
 	switch(type) {
-	case tquad_with_ix_t::TYPE_HDOOR: return building_texture_mgr.get_hdoor_tid();
-	case tquad_with_ix_t::TYPE_RDOOR: return building_texture_mgr.get_hdoor_tid();
-	case tquad_with_ix_t::TYPE_BDOOR: return building_texture_mgr.get_bdoor_tid();
-	case tquad_with_ix_t::TYPE_GDOOR: return building_texture_mgr.get_gdoor_tid();
+	case tquad_with_ix_t::TYPE_HDOOR : return building_texture_mgr.get_hdoor_tid ();
+	//case tquad_with_ix_t::TYPE_ODOOR : return building_texture_mgr.get_odoor_tid (); // enable when this texture is ready
+	case tquad_with_ix_t::TYPE_ODOOR : return building_texture_mgr.get_hdoor_tid ();
+	case tquad_with_ix_t::TYPE_RDOOR : return building_texture_mgr.get_hdoor_tid ();
+	case tquad_with_ix_t::TYPE_BDOOR : return building_texture_mgr.get_bdoor_tid ();
+	case tquad_with_ix_t::TYPE_BDOOR2: return building_texture_mgr.get_bdoor2_tid();
+	case tquad_with_ix_t::TYPE_GDOOR : return building_texture_mgr.get_gdoor_tid ();
 	default: assert(0);
 	}
 	return -1; // never gets here
@@ -1058,15 +1084,31 @@ void building_t::get_all_drawn_verts(building_draw_t &bdraw, bool get_exterior, 
 		
 		for (auto i = parts.begin(); i != parts.end(); ++i) { // multiple cubes/parts/levels - no AO for houses
 			if (is_basement(i)) continue; // don't need to draw the basement exterior walls since they should be underground
-			unsigned dim_mask(3); // disable faces: 8=x1, 16=x2, 32=y1, 64=y2
 			
-			if (has_chimney && (i+2 == parts.end())) { // skip inside face of fireplace (optimization); needs to be draw as part of the interior instead
+			if (has_chimney == 2 && (i+2 == parts.end())) { // fireplace; skip inside face (optimization); needs to be draw as part of the interior instead
+				unsigned dim_mask(3); // disable faces: 8=x1, 16=x2, 32=y1, 64=y2
 				if      (i->x1() <= bcube.x1()) {dim_mask |= 16;} // Note: may not work on rotated buildings
 				else if (i->x2() >= bcube.x2()) {dim_mask |=  8;}
 				else if (i->y1() <= bcube.y1()) {dim_mask |= 64;}
 				else if (i->y2() >= bcube.y2()) {dim_mask |= 32;}
+				tid_nm_pair_t const tp(mat.side_tex.get_scaled_version(2.0)); // smaller bricks
+				bdraw.add_section(*this, 0, *i, tp, side_color, dim_mask, 0, 0, is_house, 0); // XY exterior walls
+				bdraw.add_section(*this, 0, *i, tp, side_color, 4, 1, 0, 1, 0); // draw top of fireplace exterior, even if not wider than the chimney - should it be sloped?
+				continue;
 			}
-			bdraw.add_section(*this, 1, *i, mat.side_tex, side_color, dim_mask, 0, 0, is_house, 0); // XY exterior walls
+			else if (has_chimney && (i+1 == parts.end())) { // chimney
+				tid_nm_pair_t const tp(mat.side_tex.get_scaled_version(2.0)); // smaller bricks
+				bdraw.add_section(*this, 0, *i, tp, side_color, 3, 0, 0, is_house, 0); // XY exterior walls
+				float const wall_width(0.25*min(i->dx(), i->dy()));
+				cube_t hole(*i);
+				hole.expand_by_xy(-wall_width);
+				cube_t sides[4]; // {-y, +y, -x, +x}
+				subtract_cube_xy(*i, hole, sides);
+				unsigned const face_masks[4] = {127-64, 127-32, 127-16, 127-8}; // enable XYZ but skip all but {+y, -y, +x, -x} in XY
+				for (unsigned n = 0; n < 4; ++n) {bdraw.add_section(*this, 0, sides[n], tp, side_color, face_masks[n], 1, 0, 1, 0);} // skip bottom
+				continue;
+			}
+			bdraw.add_section(*this, 1, *i, mat.side_tex, side_color, 3, 0, 0, is_house, 0); // XY exterior walls
 			bool skip_top((!need_top_roof && (is_house || i+1 == parts.end())) || is_basement(i)); // don't add the flat roof for the top part in this case
 			// skip the bottom of stacked cubes (not using ground_floor_z1); need to draw the porch roof, so test i->dz()
 			bool const is_stacked(num_sides == 4 && i->z1() > bcube.z1() && i->dz() > 0.5f*get_window_vspace());
@@ -1127,7 +1169,7 @@ void building_t::get_all_drawn_verts(building_draw_t &bdraw, bool get_exterior, 
 		}
 		for (auto i = doors.begin(); i != doors.end(); ++i) { // these are the exterior doors
 			colorRGBA const &dcolor((i->type == tquad_with_ix_t::TYPE_GDOOR) ? WHITE : door_color); // garage doors are always white
-			bdraw.add_tquad(*this, *i, bcube, tid_nm_pair_t(get_building_ext_door_tid(i->type), -1, 1.0, 1.0), dcolor);
+			bdraw.add_tquad(*this, *i, bcube, tid_nm_pair_t(get_building_door_tid(i->type), -1, 1.0, 1.0), dcolor);
 		}
 		for (auto i = fences.begin(); i != fences.end(); ++i) {
 			bdraw.add_fence(*this, *i, tid_nm_pair_t(WOOD_TEX, 0.4f/min(i->dx(), i->dy())), WHITE, (fences.size() > 1));
@@ -1240,11 +1282,12 @@ template<typename T> void building_t::add_door_verts(cube_t const &D, T &drawer,
 	float const ty((exterior || SPLIT_DOOR_PER_FLOOR) ? 1.0 : D.dz()/get_window_vspace()); // tile door texture across floors for unsplit interior doors
 	int const type(tquad_with_ix_t::TYPE_IDOOR); // always use interior door type, even for exterior door, because we're drawing it in 3D inside the building
 	bool const opens_up(door_type == tquad_with_ix_t::TYPE_GDOOR);
-	bool const exclude_frame(door_type == tquad_with_ix_t::TYPE_HDOOR && !exterior && opened); // exclude the frame on open interior doors
+	// exclude the frame on open interior doors
+	bool const exclude_frame((door_type == tquad_with_ix_t::TYPE_HDOOR || door_type == tquad_with_ix_t::TYPE_ODOOR) && !exterior && opened);
 	unsigned const num_edges(opens_up ? 4 : 2);
-	int const tid(get_building_ext_door_tid(door_type));
-	float const thickness(opens_up ? 0.01*D.dz() : 0.02*D.get_sz_dim(!dim));
-	unsigned const num_sides((door_type == tquad_with_ix_t::TYPE_BDOOR) ? 2 : 1); // double doors for office building exterior door
+	int const tid(get_building_door_tid(door_type));
+	float const half_thickness(opens_up ? 0.01*D.dz() : 0.5*DOOR_THICK_TO_WIDTH*D.get_sz_dim(!dim));
+	unsigned const num_sides((door_type == tquad_with_ix_t::TYPE_BDOOR || door_type == tquad_with_ix_t::TYPE_BDOOR2) ? 2 : 1); // double doors for office building exterior
 	tid_nm_pair_t const tp(tid, -1, 1.0f/num_sides, ty);
 	colorRGBA const &color((exterior && !opens_up) ? door_color : WHITE); // garage doors are always white
 
@@ -1261,7 +1304,7 @@ template<typename T> void building_t::add_door_verts(cube_t const &D, T &drawer,
 
 		for (unsigned d = 0; d < 2; ++d) {
 			tquad_with_ix_t door_side(door);
-			vector3d const offset((d ? -1.0 : 1.0)*thickness*normal);
+			vector3d const offset((d ? -1.0 : 1.0)*half_thickness*normal);
 			for (unsigned n = 0; n < 4; ++n) {door_side.pts[n] += offset;}
 
 			for (unsigned e = 0; e < num_edges; ++e) {
@@ -1272,7 +1315,7 @@ template<typename T> void building_t::add_door_verts(cube_t const &D, T &drawer,
 			if (d == 1) { // back face
 				swap(door_side.pts[0], door_side.pts[1]);
 				swap(door_side.pts[2], door_side.pts[3]);
-				door_side.type = tquad_with_ix_t::TYPE_IDOOR2;
+				door_side.type = (is_house ? (unsigned)tquad_with_ix_t::TYPE_IDOOR2 : (unsigned)tquad_with_ix_t::TYPE_ODOOR2); // back side of house/office door
 			}
 			drawer.add_tquad(*this, door_side, bcube, tp, color, (int_other_side && !opened), exclude_frame, 0); // invert_tc_x=xxx, no_tc=0
 		} // for d
@@ -1435,7 +1478,7 @@ void building_t::cut_holes_for_ext_doors(building_draw_t &bdraw, point const &co
 	} // for d
 }
 
-bool building_t::get_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, point const &pos, float dist, unsigned &door_type) { // for exterior doors
+bool building_t::get_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, point const &pos, float dist) { // for exterior doors
 	tquad_with_ix_t door;
 	int const door_ix(find_ext_door_close_to_point(door, pos, dist));
 	register_open_ext_door_state(door_ix);
@@ -1443,7 +1486,6 @@ bool building_t::get_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, 
 	move_door_to_other_side_of_wall(door, -1.01, 0); // move a bit further away from the outside of the building to make it in front of the orig door
 	clip_door_to_interior(door, 1); // clip to floor
 	bdraw.add_tquad(*this, door, bcube, tid_nm_pair_t(WHITE_TEX), WHITE);
-	door_type = door.type;
 	// draw the opened door
 	building_draw_t open_door_draw;
 	vector3d const normal(door.get_norm());
@@ -1460,6 +1502,12 @@ bool building_t::get_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, 
 	}
 	open_door_draw.draw(s, 0, 1); // direct_draw_no_vbo=1
 	return 1;
+}
+void building_t::get_all_nearby_ext_door_verts(building_draw_t &bdraw, shader_t &s, vector<point> const &pts, float dist) {
+	for (auto const &p : pts) {
+		// we currently only support drawing one open door, so stop when we find one; future work is to use a bit mask to keep track of which doors are open
+		if (get_nearby_ext_door_verts(bdraw, s, p, dist)) return;
+	}
 }
 
 void building_t::get_split_int_window_wall_verts(building_draw_t &bdraw_front, building_draw_t &bdraw_back, point const &only_cont_pt_in, bool make_all_front) const {
@@ -1711,6 +1759,7 @@ class building_creator_t {
 		{
 			return 0;
 		}
+		else if (non_city_only && check_city_tline_cube_intersect_xy(test_bc)) {return 0;} // check transmission lines
 		else {
 			float const extra_spacing(non_city_only ? params.sec_extra_spacing : 0.0); // absolute value of expand
 			test_bc.expand_by_xy(extra_spacing);
@@ -2168,6 +2217,7 @@ public:
 		glEnable(GL_CULL_FACE); // slightly faster for interior shadow maps
 		vector<point> points; // reused temporary
 		building_draw_t ext_parts_draw; // roof and exterior walls
+		bool has_garage(0);
 
 		for (auto i = bcs.begin(); i != bcs.end(); ++i) {
 			if (interior_shadow_maps) { // draw interior shadow maps
@@ -2181,9 +2231,11 @@ public:
 					for (auto bi = g->bc_ixs.begin(); bi != g->bc_ixs.end(); ++bi) {
 						building_t &b((*i)->get_building(bi->ix));
 						if (!b.interior || !b.bcube.contains_pt(lpos)) continue; // no interior or wrong building
+						has_garage |= b.has_a_garage();
 						(*i)->building_draw_interior.draw_quads_for_draw_range(s, b.interior->draw_range, 1); // shadow_only=1
 						b.add_split_roof_shadow_quads(ext_parts_draw);
-						b.draw_room_geom(s, oc, xlate, bi->ix, 1, 0, 1, 1); // shadow_only=1, inc_small=1, player_in_building=1 (draw everything, since shadow may be cached)
+						// no batch draw for shadow pass since textures aren't used; draw everything, since shadow may be cached
+						b.draw_room_geom(nullptr, s, oc, xlate, bi->ix, 1, 0, 1, 1); // shadow_only=1, inc_small=1, player_in_building=1
 						bool const player_close(dist_less_than(lpos, pre_smap_player_pos, camera_pdu.far_)); // Note: pre_smap_player_pos already in building space
 						b.get_ext_wall_verts_no_sec(ext_parts_draw); // add exterior walls to prevent light leaking between adjacent parts
 						bool const add_player_shadow(camera_surf_collide ? player_close : 0);
@@ -2224,6 +2276,7 @@ public:
 		if (!interior_shadow_maps) {glDisable(GL_CULL_FACE);}
 		s.end_shader();
 		fgPopMatrix();
+		if (has_garage) {draw_cars_in_garages(xlate, 1);} // only for building interior shadows, not city shadows
 	}
 	static bool check_tile_smap(bool shadow_only) {
 		return (!shadow_only && world_mode == WMODE_INF_TERRAIN && shadow_map_enabled());
@@ -2264,9 +2317,14 @@ public:
 
 		if (shadow_only) {
 			assert(!reflection_pass);
-			draw_cars_in_garages(xlate, 1);
 			multi_draw_shadow(xlate, bcs);
 			return;
+		}
+		// ensure shadow map TU_IDs are valid in case we try to use them without binding to a tile;
+		// maybe this fixes the occasional shader undefined behavior warning we get with the debug callback?
+		for (unsigned l = 0; l < NUM_LIGHT_SRC; ++l) {
+			if (!light_valid_and_enabled(l)) continue;
+			bind_texture_tu(get_empty_smap_tid(), GLOBAL_SMAP_START_TU_ID+l); // bind empty shadow map
 		}
 		building_t const *const prev_player_building(player_building);
 
@@ -2287,7 +2345,7 @@ public:
 		// check for sun or moon; also need the smap pass for drawing with dynamic lights at night, so basically it's always enabled
 		bool const use_tt_smap(check_tile_smap(0)); // && (night || light_valid_and_enabled(0) || light_valid_and_enabled(1)));
 		bool have_windows(0), have_wind_lights(0), have_interior(0), this_frame_camera_in_building(0), this_frame_player_in_basement(0);
-		unsigned max_draw_ix(0), door_type(0);
+		unsigned max_draw_ix(0);
 		shader_t s;
 
 		for (auto i = bcs.begin(); i != bcs.end(); ++i) {
@@ -2304,9 +2362,9 @@ public:
 		}
 		bool const draw_interior(DRAW_WINDOWS_AS_HOLES && (have_windows || global_building_params.add_city_interiors) && draw_building_interiors);
 		bool const v(world_mode == WMODE_GROUND), indir(v), dlights(v), use_smap(v);
-		float const min_alpha = 0.0; // 0.0 to avoid alpha test
-		city_dlight_pcf_offset_scale = 0.67; // reduced for building interiors
-		enable_dlight_bcubes = 1; // using light bcubes is both faster and more correct when shadow maps are not enabled
+		float const min_alpha        = 0.0; // 0.0 to avoid alpha test
+		city_dlight_pcf_offset_scale = 0.6; // reduced for building interiors; below 0.6 and shadow edges are blocky, but above 0.6 clothes hangers have double shadows
+		enable_dlight_bcubes         = 1; // using light bcubes is both faster and more correct when shadow maps are not enabled
 		fgPushMatrix();
 		translate_to(xlate);
 		building_draw_t interior_wind_draw, ext_door_draw;
@@ -2351,6 +2409,7 @@ public:
 			if (reflection_pass) {draw_player_model(s, xlate, 0);} // shadow_only=0
 			vector<point> points; // reused temporary
 			vect_cube_t ped_bcubes; // reused temporary
+			static brg_batch_draw_t bbd; // allocated memory is reused across calls
 			int indir_bcs_ix(-1), indir_bix(-1);
 
 			if (draw_interior) {
@@ -2389,20 +2448,21 @@ public:
 						if (reflection_pass && !b.bcube.contains_pt_xy(camera_xlated)) continue; // not the correct building
 						if (!b.bcube.closest_dist_less_than(camera_xlated, ddist_scale*room_geom_draw_dist)) continue; // too far away
 						if (!camera_pdu.cube_visible(b.bcube + xlate)) continue; // VFC
+						b.maybe_gen_chimney_smoke();
 						bool const camera_near_building(b.bcube.contains_pt_xy_exp(camera_xlated, door_open_dist));
 						if (!camera_near_building && !b.has_windows()) continue; // player is outside a windowless building (city office building)
 						bool const player_in_building_bcube(b.bcube.contains_pt_xy(camera_xlated)); // player is within the building's bcube
 						if ((display_mode & 0x08) && !player_in_building_bcube && b.is_entire_building_occluded(camera_xlated, oc)) continue; // check occlusion
 						int const ped_ix((*i)->get_ped_ix_for_bix(bi->ix)); // Note: assumes only one building_draw has people
 						bool const inc_small(b.bcube.closest_dist_less_than(camera_xlated, ddist_scale*room_geom_sm_draw_dist));
-						b.gen_and_draw_room_geom(s, oc, xlate, ped_bcubes, bi->ix, ped_ix, 0, reflection_pass, inc_small, player_in_building_bcube); // shadow_only=0
+						b.gen_and_draw_room_geom(&bbd, s, oc, xlate, ped_bcubes, bi->ix, ped_ix, 0, reflection_pass, inc_small, player_in_building_bcube); // shadow_only=0
 						g->has_room_geom = 1;
 						if (!draw_interior) continue;
 						if (ped_ix >= 0) {draw_peds_in_building(ped_ix, ped_draw_vars_t(b, oc, s, xlate, bi->ix, 0, reflection_pass));} // draw people in this building
 						// check the bcube rather than check_point_or_cylin_contained() so that it works with roof doors that are outside any part?
 						if (!camera_near_building) {b.player_not_near_building(); continue;} // camera not near building
 						if (reflection_pass == 2) continue; // interior room, don't need to draw windows and exterior doors
-						b.get_nearby_ext_door_verts(ext_door_draw, s, camera_xlated, door_open_dist, door_type); // and draw opened door
+						b.get_nearby_ext_door_verts(ext_door_draw, s, camera_xlated, door_open_dist); // and draw opened door
 						bool const camera_in_building(b.check_point_or_cylin_contained(camera_xlated, 0.0, points));
 						if (!reflection_pass) {b.update_grass_exclude_at_pos(camera_xlated, xlate, camera_in_building);} // disable any grass inside the building part(s) containing the player
 						// Note: if we skip this check and treat all walls/windows as front/containing part, this almost works, but will skip front faces of other buildings
@@ -2421,28 +2481,18 @@ public:
 						this_frame_camera_in_building  = 1;
 						this_frame_player_in_basement |= b.is_pos_in_basement(camera_xlated - vector3d(0.0, 0.0, BASEMENT_ENTRANCE_SCALE*b.get_floor_thickness()));
 						player_building = &b;
-
-						if (display_mode & 0x10) { // compute indirect lighting
-#if 0
-							point cpos;
-							colorRGBA ccolor;
-							if (b.ray_cast_camera_dir(camera_xlated, cpos, ccolor)) { // for debugging
-								tid_nm_pair_t tex; tex.emissive = 1; tex.set_gl(s); // untextured emissive
-								s.set_cur_color(ccolor);
-								draw_subdiv_sphere(cpos, 0.1*CAMERA_RADIUS, N_SPHERE_DIV, 0, 1);
-							}
-#endif
-							indir_bcs_ix = bcs_ix; indir_bix = bi->ix;
-						}
+						if (display_mode & 0x10) {indir_bcs_ix = bcs_ix; indir_bix = bi->ix;} // compute indirect lighting for this building
 						// run any player interaction logic here
 						if (toggle_room_light  ) {b.toggle_room_light(camera_xlated);}
-						if (building_action_key) {b.apply_player_action_key(camera_xlated, cview_dir, (building_action_key-1));}
+						if (building_action_key) {b.apply_player_action_key(camera_xlated, cview_dir, (building_action_key-1), 0);} // check_only=0
+						else {can_do_building_action = b.apply_player_action_key(camera_xlated, cview_dir, 0, 1);} // mode=0, check_only=1
 						b.player_pickup_object(camera_xlated, cview_dir);
 						if (teleport_to_screenshot) {b.maybe_teleport_to_screenshot();}
 						if (animate2) {b.update_player_interact_objects(camera_xlated, bi->ix, ped_ix);} // update dynamic objects if the player is in the building
 					} // for bi
 				} // for g
 			} // for i
+			bbd.draw_and_clear(s);
 			if (ADD_ROOM_LIGHTS) {set_std_depth_func();} // restore
 			glDisable(GL_CULL_FACE);
 
@@ -2528,7 +2578,7 @@ public:
 			glDisable(GL_CULL_FACE);
 
 			if (reflection_pass != 2 && have_buildings_ext_paint()) { // draw spraypaint/markers on building exterior, if needed
-				setup_building_draw_shader(s, 0.01, 1, 1, 0); // alpha test, enable_indir=1, force_tsl=1, use_texgen=0
+				setup_building_draw_shader(s, DEF_CITY_MIN_ALPHA, 1, 1, 0); // alpha test, enable_indir=1, force_tsl=1, use_texgen=0
 				draw_buildings_ext_paint();
 				reset_interior_lighting_and_end_shader(s);
 			}
@@ -3045,6 +3095,25 @@ public:
 	void get_overlapping_bcubes      (cube_t const &xy_range, vect_cube_t &bcubes   ) const {return query_for_cube(xy_range, bcubes,    0);}
 	void add_house_driveways_for_plot(cube_t const &plot,     vect_cube_t &driveways) const {return query_for_cube(plot,     driveways, 1);}
 
+	void get_power_points(cube_t const &xy_range, vector<point> &ppts) const { // similar to above function, but returns points rather than cubes
+		if (empty()) return; // nothing to do
+		unsigned ixr[2][2];
+		get_grid_range(xy_range, ixr);
+
+		for (unsigned y = ixr[0][1]; y <= ixr[1][1]; ++y) {
+			for (unsigned x = ixr[0][0]; x <= ixr[1][0]; ++x) {
+				grid_elem_t const &ge(get_grid_elem(x, y));
+				if (ge.bc_ixs.empty() || !xy_range.intersects_xy(ge.bcube)) continue;
+
+				for (auto b = ge.bc_ixs.begin(); b != ge.bc_ixs.end(); ++b) {
+					if (!xy_range.intersects_xy(*b)) continue;
+					if (get_grid_ix(xy_range.get_llc().max(b->get_llc())) != (y*grid_sz + x)) continue; // add only if in home grid (to avoid duplicates)
+					get_building(b->ix).get_power_point(ppts);
+				}
+			} // for x
+		} // for y
+	}
+
 	void get_occluders(pos_dir_up const &pdu, building_occlusion_state_t &state) const {
 		state.init(pdu.pos, get_camera_coord_space_xlate());
 		
@@ -3078,6 +3147,31 @@ public:
 			if (occluded) return 1;
 		} // for b
 		return 0;
+	}
+	bool single_cube_visible_check(point const &pos, cube_t const &c) const {
+		if (empty()) return 1;
+		float const z(c.z2()); // top edge
+		point const pts[4] = {point(c.x1(), c.y1(), z), point(c.x2(), c.y1(), z), point(c.x2(), c.y2(), z), point(c.x1(), c.y2(), z)};
+		cube_t query_region(c);
+		query_region.union_with_pt(pos);
+		vector<point> temp_points; // could maybe reuse across calls if thread safe?
+
+		for (auto g = grid.begin(); g != grid.end(); ++g) {
+			if (g->bc_ixs.empty() || !g->bcube.intersects(query_region)) continue;
+
+			for (auto b = g->bc_ixs.begin(); b != g->bc_ixs.end(); ++b) {
+				if (!b->intersects(query_region)) continue;
+				building_t const &building(get_building(b->ix));
+				bool occluded(1);
+
+				for (unsigned i = 0; i < 4; ++i) {
+					float t(1.0); // start at end of line
+					if (!building.check_line_coll(pos, pts[i], t, temp_points, 1)) {occluded = 0; break;}
+				}
+				if (occluded) return 0;
+			} // for b
+		} // for g
+		return 1;
 	}
 }; // building_creator_t
 
@@ -3315,7 +3409,7 @@ void draw_building_lights(vector3d const &xlate) {
 	building_creator_city.draw_building_lights(xlate);
 	//building_creator.draw_building_lights(xlate); // only city buildings for now
 }
-bool proc_buildings_sphere_coll(point &pos, point const &p_int, float radius, bool xy_only, vector3d *cnorm, bool check_interior, bool exclude_city) {
+bool proc_buildings_sphere_coll(point &pos, point const &p_int, float radius, bool xy_only, vector3d *cnorm, bool check_interior, bool exclude_city) { // pos is in camera space
 	player_in_closet   = 0; // reset for this call
 	player_is_hiding   = 0;
 	player_in_elevator = 0;
@@ -3359,6 +3453,11 @@ bool check_city_building_line_coll_bs(point const &p1, point const &p2, point &p
 	p_int = p1 + t*(p2 - p1);
 	return 1;
 }
+bool check_city_building_line_coll_bs_any(point const &p1, point const &p2) {
+	float t(1.0); // unused
+	unsigned hit_bix(0); // unused
+	return building_creator_city.check_line_coll(p1, p2, t, hit_bix, 1, 1); // ret_any_pt=1, no_coll_pt=1
+}
 void update_buildings_zmax_for_line(point const &p1, point const &p2, float radius, float house_extra_zval, float &cur_zmax) {
 	building_creator_city.update_zmax_for_line(p1, p2, radius, house_extra_zval, cur_zmax);
 	building_creator     .update_zmax_for_line(p1, p2, radius, house_extra_zval, cur_zmax);
@@ -3371,6 +3470,8 @@ bool get_buildings_line_hit_color(point const &p1, point const &p2, colorRGBA &c
 	if (building_tiles.get_building_hit_color(p1x, p2x, color)) return 1;
 	return building_creator.get_building_hit_color(p1x, p2x, color);
 }
+bool have_city_buildings() {return !building_creator_city.empty();}
+bool have_secondary_buildings() {return (global_building_params.add_secondary_buildings && global_building_params.num_place > 0);}
 bool have_buildings() {return (!building_creator.empty() || !building_creator_city.empty() || !building_tiles.empty());} // for postproc effects
 bool no_grass_under_buildings() {return (world_mode == WMODE_INF_TERRAIN && !(building_creator.empty() && building_tiles.empty()) && global_building_params.flatten_mesh);}
 unsigned get_buildings_gpu_mem_usage() {return (building_creator.get_gpu_mem_usage() + building_creator_city.get_gpu_mem_usage() + building_tiles.get_gpu_mem_usage());}
@@ -3387,6 +3488,7 @@ void clear_building_vbos() {
 // city interface
 void set_buildings_pos_range(cube_t const &pos_range) {global_building_params.set_pos_range(pos_range);}
 void get_building_bcubes(cube_t const &xy_range, vect_cube_t &bcubes) {building_creator_city.get_overlapping_bcubes(xy_range, bcubes);} // Note: no xlate applied
+void get_building_power_points(cube_t const &xy_range, vector<point> &ppts) {building_creator_city.get_power_points(xy_range, ppts  );} // Note: no xlate applied
 void add_house_driveways_for_plot(cube_t const &plot, vect_cube_t &driveways) {building_creator_city.add_house_driveways_for_plot(plot, driveways);} // Note: no xlate applied
 void end_register_player_in_building();
 float get_max_house_size() {return global_building_params.get_max_house_size();}
@@ -3401,6 +3503,7 @@ void add_building_interior_lights(point const &xlate, cube_t &lights_bcube) {
 // cars + peds
 void get_city_building_occluders(pos_dir_up const &pdu, building_occlusion_state_t &state) {building_creator_city.get_occluders(pdu, state);}
 bool check_city_pts_occluded(point const *const pts, unsigned npts, building_occlusion_state_t &state) {return building_creator_city.check_pts_occluded(pts, npts, state);}
+bool city_single_cube_visible_check(point const &pos, cube_t const &c) {return building_creator_city.single_cube_visible_check(pos, c);}
 cube_t get_building_lights_bcube() {return building_lights_manager.get_lights_bcube();}
 // used for pedestrians in cities
 cube_t get_building_bcube(unsigned building_id) {return building_creator_city.get_building_bcube(building_id);}
@@ -3446,4 +3549,11 @@ void get_all_garages(vect_cube_t &garages) {
 	building_tiles.get_all_garages(garages); // not sure if this should be included
 }
 void get_all_city_helipads(vect_cube_t &helipads) {building_creator_city.get_all_helipads(helipads);} // city only for now
+
+bool is_pos_in_player_building(point const &pos) { // pos is in global space
+	if (!camera_in_building || player_building == nullptr) return 0;
+	//static vector<point> points; // reused across calls
+	//return player_building->check_point_or_cylin_contained(pos, 0.0, points);
+	return player_building->check_point_xy_in_part(pos); // don't need to draw if above the building either, since there are no skylights
+}
 

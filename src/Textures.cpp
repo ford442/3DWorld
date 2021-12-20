@@ -261,7 +261,7 @@ void set_landscape_texture_from_file() {
 void load_textures() {
 
 	timer_t timer("Texture Load");
-	cout << "loading textures"; cout.flush();
+	cout << "Loading " << textures.size() << " textures" << endl;
 	if (using_custom_landscape_texture()) {set_landscape_texture_from_file();} // must be done first
 	load_texture_names();
 
@@ -273,7 +273,6 @@ void load_textures() {
 	for (int i = 0; i < (int)textures.size(); ++i) {
 		if (!is_tex_disabled(i)) {textures[i].fix_word_alignment();}
 	}
-	cout << " done" << endl;
 	textures[BULLET_D_TEX].merge_in_alpha_channel(textures[BULLET_A_TEX]);
 	gen_smoke_texture();
 	gen_plasma_texture();
@@ -841,6 +840,12 @@ void texture_t::add_alpha_channel() {
 void texture_t::resize(int new_w, int new_h) { // Note: not thread safe
 
 	if (new_w == width && new_h == height) return; // already correct size
+	
+	if (omp_get_thread_num_3dw() != 0) {
+		std::cerr << "Error: Can't resize texture '" << name << "' on an OpenMP worker thread" << endl;
+		exit(1); // for now, this is fatal
+		return; // don't scale it?
+	}
 	assert(is_allocated());
 	assert(width > 0 && height > 0 && new_w > 0 && new_h > 0);
 	unsigned char *new_data(new unsigned char[new_w*new_h*ncolors]);

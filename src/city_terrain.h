@@ -36,7 +36,7 @@ public:
 	flatten_op_t last_flatten_op;
 
 	heightmap_query_t() : heightmap(nullptr), xsize(0), ysize(0) {}
-	heightmap_query_t(float *hmap, unsigned xsize_, unsigned ysize_) : heightmap(hmap), xsize(xsize_), ysize(ysize_) {}
+	heightmap_query_t(float *hmap, unsigned xsize_, unsigned ysize_) : heightmap(hmap), xsize(xsize_), ysize(ysize_) {assert(heightmap != nullptr);}
 	float get_x_value(int x) const {return get_xval(x - int(xsize)/2);} // convert from center to LLC
 	float get_y_value(int y) const {return get_yval(y - int(ysize)/2);}
 	int get_x_pos(float x) const {return (get_xpos(x) + int(xsize)/2);}
@@ -53,7 +53,8 @@ public:
 	cube_t get_cube_for_cell(int x, int y) const;
 	point  get_pos_for_cell (int x, int y) const {return point(get_x_value(x), get_y_value(y), get_height_clamped(x, y));}
 	float get_height_at(float xval, float yval) const {return get_height_clamped(get_x_pos(xval), get_y_pos(yval));}
-	float get_road_zval_at_pt(point const &pos) const {return get_height_at(pos.x, pos.y) + ROAD_HEIGHT;}
+	float get_height_at(point const &pos      ) const {return get_height_at(pos.x, pos.y);}
+	float get_road_zval_at_pt(point const &pos) const {return get_height_at(pos) + ROAD_HEIGHT;}
 	bool any_underwater(unsigned x1, unsigned y1, unsigned x2, unsigned y2, bool check_border=0) const;
 	void get_segment_end_pts(road_t const &r, unsigned six, unsigned eix, point &ps, point &pe) const;
 	void flatten_region_to(cube_t const c, unsigned slope_width, bool decrease_only=0);
@@ -95,10 +96,14 @@ struct city_road_connector_t {
 
 	city_road_connector_t(heightmap_query_t &hq_) : hq(hq_) {}
 	static bool get_closer_dir(cube_t const &A, cube_t const &B, bool dim);
+	// roads
 	float calc_road_cost(point const &p1, point const &p2);
 	float calc_road_path_cost(vector<point> &pts);
 	float find_route_between_points(point const &p1, point const &p2, vect_cube_t const &blockers, vector<point> &pts,
 		cube_t const &bcube1, cube_t const &bcube2, float road_hwidth, bool dim1, bool dir1, bool dim2, bool dir2);
 	bool segment_road(road_t const &road, bool check_only);
+	// transmission lines
+	bool is_tline_seg_valid(point const &p1, point const &p2, float max_ground_clearance) const;
+	bool route_transmission_line(transmission_line_t &tline, vect_cube_t &blockers, float road_width, float road_spacing) const;
 };
 

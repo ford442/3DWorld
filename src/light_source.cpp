@@ -418,7 +418,7 @@ public:
 				get_smap(free_list.back()).user_smap_id > 0) // caller requested an unbound smap, and the last free list element is used - try to find an unused smap
 			{
 				for (unsigned i = 0; i < free_list.size(); ++i) {
-					if (get_smap(free_list[i]).user_smap_id != user_smap_id) continue; // wrong ID
+					if (get_smap(free_list[i]).user_smap_id != user_smap_id) continue; // wrong ID; only one ID should match
 					swap(free_list[i], free_list.back());
 					break; // done
 				}
@@ -451,6 +451,13 @@ public:
 		assert(index > 0 && index <= smap_data.size());
 		assert(smap_data[index-1].used);
 		return smap_data[index-1];
+	}
+	void invalidate_cached_smap_id(unsigned smap_id) {
+		if (smap_id == 0) return; // invalid/unset smap_id
+		
+		for (auto &i : smap_data) { // there should be at most one match, but it shouldn't hurt to iterate until the end just in case
+			if (i.user_smap_id == smap_id) {i.user_smap_id = 0;} // invalidate if the ID matches
+		}
 	}
 	void free_gl_state() {
 		for (auto i = smap_data.begin(); i != smap_data.end(); ++i) {i->free_gl_state();}
@@ -581,6 +588,10 @@ bool light_source::setup_shadow_map(float falloff, bool dynamic_cobj, bool outdo
 
 void light_source::release_smap() {
 	if (smap_index > 0) {get_smap_mgr().free_smap(smap_index); smap_index = 0;}
+}
+
+void light_source::invalidate_cached_smap_id(unsigned smap_id) const {
+	get_smap_mgr().invalidate_cached_smap_id(smap_id);
 }
 
 

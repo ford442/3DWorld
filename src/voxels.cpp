@@ -307,7 +307,9 @@ void voxel_manager::create_procedural(float mag, float freq, vector3d const &off
 		free_texture(tid);
 		return;
 	}
-	#pragma omp parallel for schedule(static,1)
+	cout << "Voxel resolution: " << nx << "x" << ny << "x" << nz << endl;
+
+#pragma omp parallel for schedule(static,1)
 	for (int y = 0; y < (int)ny; ++y) { // generate voxel values
 		for (unsigned x = 0; x < nx; ++x) {
 			for (unsigned z = 0; z < nz; ++z) {
@@ -523,13 +525,13 @@ unsigned voxel_manager::add_triangles_for_voxel(tri_data_t::value_type &tri_vert
 	cube_t const cube(get_xv(x), get_xv(x2), get_yv(y), get_yv(y2), get_zv(z), get_zv(z2));
 	unsigned const edge_to_dim_map[12] = {0, 2, 0, 2, 0, 2, 0, 2, 1, 1, 1, 1};
 	point vlist[12];
-	int *vixs[12] = {0};
+	int *vixs[12] = {};
 
 	for (unsigned i = 0; i < 12; ++i) {
 		if (!(edge_val & (1 << i))) continue;
 		unsigned const *eix = voxel_detail::edge_to_vals[i];
 		unsigned xhv(1), yhv(1), zhv(1);
-		float vals[2];
+		float vals[2] = {};
 		point pts[2];
 
 		for (unsigned d = 0; d < 2; ++d) {
@@ -546,6 +548,7 @@ unsigned voxel_manager::add_triangles_for_voxel(tri_data_t::value_type &tri_vert
 		triangle const tri(vlist[tris[i]], vlist[tris[i+1]], vlist[tris[i+2]]);
 		vector3d const normal(tri.get_normal());
 		if (normal == zero_vector) continue; // invalid triangle
+		//float const area(triangle_area(tri.pts[0], tri.pts[1], tri.pts[2]));
 			
 		for (unsigned v = 0; v < 3; ++v) {
 			int *vix(vixs[tris[i+v]]);
@@ -555,7 +558,8 @@ unsigned voxel_manager::add_triangles_for_voxel(tri_data_t::value_type &tri_vert
 				tri_verts.emplace_back(tri.pts[v], zero_vector);
 			}
 			assert(*vix < (int)tri_verts.size());
-			tri_verts[*vix].n += normal; // average the triangle normals to get the vertex normal
+			tri_verts[*vix].n += normal; // compute the average of the triangle normals to get the vertex normal
+			//tri_verts[*vix].n += normal * area; // compute the weighted average of the triangle normals to get the vertex normal
 			tri_verts.add_index(*vix);
 			tri_verts.mark_need_normalize();
 		} // for v
@@ -776,7 +780,7 @@ void voxel_manager::remove_unconnected_outside_range(bool keep_at_edge, unsigned
 			for (unsigned x = x1; x < x2; ++x) {
 				unsigned ix(outside.get_ix(x, y, 0));
 
-				for (unsigned z = 0; z < nz; ++z, ++ix) {
+				for (unsigned ix_end = ix + nz; ix < ix_end; ++ix) {
 					if (outside[ix] != UNDER_MESH_BIT) continue; // outside or above mesh
 					work.push_back(ix); // inside, anchored to the mesh
 					outside[ix] |= ANCHORED_BIT; // mark as anchored
@@ -1212,7 +1216,7 @@ void voxel_model::calc_ao_lighting_for_block(unsigned block_ix, bool increase_on
 			for (int zi = nz-2; zi >= 0; zi -= zstep) { // skip top zval
 				unsigned const x(min(x_end-1, xi+xstep-1)), y(min(y_end-1, yi+ystep-1)), z(min(nz-1, zi+zstep-1));
 				unsigned char const outside_val(outside.get(x, y, z));
-				saw_inside |= (outside_val == 0 || (outside_val & end_ray_flags));
+				saw_inside |= ((outside_val == 0) || bool(outside_val & end_ray_flags));
 				if (!saw_inside) continue;
 				if (increase_only && ao_lighting.get(x, y, z) == 255) continue;
 				point const pos(ao_lighting.get_pt_at(x, y, z));
@@ -1286,7 +1290,7 @@ bool voxel_model::update_voxel_sphere_region(point const &center, float radius, 
 	bool const material_removed(val_at_center < 0.0);
 	if (params.invert) val_at_center *= -1.0; // is this correct?
 	unsigned const num[3] = {nx, ny, nz};
-	unsigned bounds[3][2]; // {x,y,z} x {lo,hi}
+	unsigned bounds[3][2] = {}; // {x,y,z} x {lo,hi}
 	std::set<unsigned> blocks_to_update;
 	float const dist_adjust(0.5*vsz.mag()); // single voxel diagonal half-width
 	bool saw_inside(0), saw_outside(0);

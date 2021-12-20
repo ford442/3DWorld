@@ -751,6 +751,7 @@ bool building_t::add_bed_to_room(rand_gen_t &rgen, room_t const &room, vect_cube
 
 // Note: modified blockers rather than using it; fireplace must be the first placed object
 bool building_t::maybe_add_fireplace_to_room(room_t const &room, vect_cube_t &blockers, float zval, unsigned room_id, float tot_light_amt) {
+	if (has_int_fplace) return 0; // already added an interior fireplace
 	// Note: the first part of the code below is run on every first floor room and will duplicate work, so it may be better to factor it out somehow
 	cube_t fireplace(get_fireplace()); // make a copy of the exterior fireplace that will be converted to an interior fireplace
 	bool dim(0), dir(0);
@@ -777,6 +778,7 @@ bool building_t::maybe_add_fireplace_to_room(room_t const &room, vect_cube_t &bl
 	blocker.d[dim][ dir] = fireplace.d[dim][!dir]; // flush with the front of the fireplace
 	objs.emplace_back(blocker, TYPE_BLOCKER, room_id, dim, dir, RO_FLAG_INVIS);
 	blockers.push_back(fireplace_ext); // add as a blocker if it's not already there
+	has_int_fplace = 1;
 	return 1;
 }
 
@@ -967,7 +969,8 @@ bool building_t::add_bathroom_objs(rand_gen_t rgen, room_t const &room, float &z
 			hdim ^= 1;
 		} // for ar
 	}
-	if (is_house) { // place a tub, but not in office buildings; placed before the sink because it's the largest and the most limited in valid locations
+	if (is_house && (!is_basement || rgen.rand_bool())) { // 50% of the time if in the basement
+		// place a tub, but not in office buildings; placed before the sink because it's the largest and the most limited in valid locations
 		cube_t place_area_tub(room_bounds);
 		place_area_tub.expand_by(-get_trim_thickness()); // just enough to prevent z-fighting and intersecting the wall trim
 		placed_obj |= place_model_along_wall(OBJ_MODEL_TUB, TYPE_TUB, room, 0.2, rgen, zval, room_id, tot_light_amt, place_area_tub, objs_start, 0.4);
@@ -1588,7 +1591,7 @@ bool building_t::add_laundry_objs(rand_gen_t rgen, room_t const &room, float zva
 			place_area.expand_by_xy(-radius); // leave a slight gap between laundry basket and wall
 			if (!place_area.is_strictly_normalized()) return 1; // no space for laundry basket (likely can't happen)
 			cube_t legal_area(get_part_for_room(room));
-			legal_area.expand_by_xy(-(1.0*floor_spacing + radius)); // keep away from part edge/exterior walls to avoid alpha mask drawing problems
+			legal_area.expand_by_xy(-(1.0*floor_spacing + radius)); // keep away from part edge/exterior walls to avoid alpha mask drawing problems (unless we use mats_amask)
 			point center;
 			center.z = zval + 0.002*floor_spacing; // slightly above the floor to avoid z-fighting
 
@@ -2124,7 +2127,7 @@ void building_t::gen_room_details(rand_gen_t &rgen, vect_cube_t const &ped_bcube
 
 			// find best bathroom with no hard size constraints
 			if (can_be_bedroom_or_bathroom(*r, (num_floors-1))) { // use the top floor for the test since it's less restrictive than the ground floor; will be checked per-floor later
-				if (has_chimney && num_floors == 1) { // can't be a bathroom if there's a fireplace
+				if (has_chimney == 2 && num_floors == 1) { // can't be a bathroom if there's a fireplace
 					cube_t test_cube(*r);
 					test_cube.expand_by_xy(floor_thickness);
 					if (r->intersects(get_fireplace())) continue;
@@ -2326,7 +2329,7 @@ void building_t::gen_room_details(rand_gen_t &rgen, vect_cube_t const &ped_bcube
 			bool is_office_bathroom(is_room_office_bathroom(*r, room_center.z, f)), has_fireplace(0);
 			blockers.clear(); // clear for this new room
 			
-			if (has_chimney && !is_basement && f == 0) { // handle fireplaces on the first floor
+			if (has_chimney == 2 && !is_basement && f == 0) { // handle fireplaces on the first floor
 				has_fireplace = maybe_add_fireplace_to_room(*r, blockers, room_center.z, room_id, tot_light_amt);
 			}
 			if (is_office_bathroom) { // bathroom is already assigned
@@ -2559,10 +2562,10 @@ void building_t::add_wall_and_door_trim() { // and window trim
 		set_cube_zvals(trim, door.z1()+fc_thick, door.z1()+fc_thick+2.0*trim_thickness); // floor height
 		objs.emplace_back(trim, TYPE_WALL_TRIM, 0, dim, dir, (ext_flags | RO_FLAG_ADJ_BOT), 1.0, SHAPE_SHORT, ext_trim_color);
 
-		if (d->type == tquad_with_ix_t::TYPE_HDOOR || d->type == tquad_with_ix_t::TYPE_BDOOR || garage_door) { // add trim at top of exterior door, houses and office buildings
+		if (d->type == tquad_with_ix_t::TYPE_HDOOR || d->is_building_door() || garage_door) { // add trim at top of exterior door, houses and office buildings
 			set_cube_zvals(trim, door.z2()-0.03*door.dz(), door.z2()); // ends at top of door texture; see logic in clip_door_to_interior()
 		}
-		if (d->type == tquad_with_ix_t::TYPE_BDOOR) { // different logic for building doors
+		if (d->is_building_door()) { // different logic for building doors
 			ext_flags = flags; // unlike hdoors, need to draw the back face to hide the gap betweeen ceiling and floor above
 			trim.d[dim][dir] += (dir ? -1.0 : 1.0)*0.005*window_vspacing; // minor shift back toward building to prevent z-fighting
 		}
@@ -3037,9 +3040,27 @@ void building_t::add_stairs_and_elevators(rand_gen_t &rgen) {
 	}
 }
 
+int building_t::get_ext_door_dir(cube_t const &door_bcube, bool dim) const { // erturn value of 2 means 'not found'
+	float const width(door_bcube.get_sz_dim(!dim));
+
+	for (auto p = parts.begin(); p != get_real_parts_end(); ++p) { // find part containing this door so that we can get the correct dir
+		if (is_basement(p)) continue; // skip the basement
+		if (p->z1() != ground_floor_z1) continue; // not ground floor
+		if (p->d[!dim][1] < door_bcube.d[!dim][1] || p->d[!dim][0] > door_bcube.d[!dim][0]) {continue;} // not contained in this dim
+		if      (fabs(p->d[dim][0] - door_bcube.d[dim][0]) < 0.1*width) return 0;
+		else if (fabs(p->d[dim][1] - door_bcube.d[dim][1]) < 0.1*width) return 1;
+	} // for p
+	cout << "Warning: Failed to find building exterior door: " << TXT(bcube.str()) << TXT(door_bcube.str()) << TXT(is_house) << endl; // debug printout
+	//assert(0); // never gets here (too strong?)
+	return 2; // not found
+}
+
 void building_t::add_sign_by_door(tquad_with_ix_t const &door, bool outside, std::string const &text, colorRGBA const &color, bool emissive) {
 	cube_t const door_bcube(door.get_bcube());
 	bool const dim(door_bcube.dy() < door_bcube.dx());
+	int const dir_ret(get_ext_door_dir(door_bcube, dim));
+	if (dir_ret > 1) return; // not found, skip sign
+	bool dir(dir_ret != 0);
 	float const width(door_bcube.get_sz_dim(!dim)), height(door_bcube.dz());
 	cube_t c(door_bcube);
 
@@ -3052,37 +3073,43 @@ void building_t::add_sign_by_door(tquad_with_ix_t const &door, bool outside, std
 	c.z1() = c.z2() - 0.05*height;
 	float const sign_width(0.8*text.size()*c.dz()), shrink(0.5f*(width - sign_width));
 	c.expand_in_dim(!dim, -shrink);
-	vector<room_object_t> &objs(interior->room_geom->objs);
+	if (!outside) {dir ^= 1; c.translate_dim(dim, (dir ? 1.0 : -1.0)*0.1*height);} // move inside the building
+	c.d[dim][dir] += (dir ? 1.0 : -1.0)*0.01*height;
 
-	for (auto p = parts.begin(); p != get_real_parts_end(); ++p) { // find part containing this door so that we can get the correct dir
-		if (is_basement(p)) continue; // skip the basement
-		if (p->z1() != ground_floor_z1) continue; // not ground floor
-		if (p->d[!dim][1] < door_bcube.d[!dim][1] || p->d[!dim][0] > door_bcube.d[!dim][0]) {continue;} // not contained in this dim
-		bool dir(0);
-		if      (fabs(p->d[dim][0] - door_bcube.d[dim][0]) < 0.1*width) {dir = 0;}
-		else if (fabs(p->d[dim][1] - door_bcube.d[dim][1]) < 0.1*width) {dir = 1;}
-		else {continue;} // wrong part
-		if (!outside) {dir ^= 1; c.translate_dim(dim, (dir ? 1.0 : -1.0)*0.1*height);} // move inside the building
-		c.d[dim][dir] += (dir ? 1.0 : -1.0)*0.01*height;
-
-		if (outside) {
-			bool skip(0);
-			for (auto p2 = get_real_parts_end_inc_sec(); p2 != parts.end(); ++p2) {skip |= p2->intersects(c);}
-			if (skip) return; // sign intersects porch roof, skip this building
+	if (outside) {
+		for (auto p2 = get_real_parts_end_inc_sec(); p2 != parts.end(); ++p2) {
+			if (p2->intersects(c)) return; // sign intersects porch roof, skip this building
 		}
-		unsigned flags(RO_FLAG_LIT | RO_FLAG_NOCOLL | (emissive ? RO_FLAG_EMISSIVE : 0) | (outside ? 0 : RO_FLAG_HANGING));
-		objs.emplace_back(c, TYPE_SIGN, 0, dim, dir, flags, 1.0, SHAPE_CUBE, color); // always lit; room_id is not valid
-		objs.back().obj_id = register_sign_text(text);
-		return; // done
-	} // for p
-	cout << "Warning: Failed to find building exterior door: " << TXT(bcube.str()) << TXT(door_bcube.str()) << TXT(is_house) << endl; // debug printout
-	//assert(0); // never gets here (too strong?)
+	}
+	unsigned flags(RO_FLAG_LIT | RO_FLAG_NOCOLL | (emissive ? RO_FLAG_EMISSIVE : 0) | (outside ? 0 : RO_FLAG_HANGING));
+	vector<room_object_t> &objs(interior->room_geom->objs);
+	objs.emplace_back(c, TYPE_SIGN, 0, dim, dir, flags, 1.0, SHAPE_CUBE, color); // always lit; room_id is not valid
+	objs.back().obj_id = register_sign_text(text);
+}
+
+void building_t::add_doorbell(tquad_with_ix_t const &door) {
+	cube_t const door_bcube(door.get_bcube());
+	bool const dim(door_bcube.dy() < door_bcube.dx());
+	int const dir_ret(get_ext_door_dir(door_bcube, dim));
+	if (dir_ret > 1) return; // not found, skip doorbell
+	bool dir(dir_ret != 0);
+	bool const side(dir ^ dim); // currently always to the right, which matches the door handle side
+	float const door_width(door_bcube.get_sz_dim(!dim)), half_width(0.016*door_width), half_height(1.8*half_width);
+	float const zval(door_bcube.z1() + 0.55*door_bcube.dz());
+	float const pos(door_bcube.d[!dim][side] + (side ? 1.0 : -1.0)*5.0*half_width);
+	cube_t c;
+	c.d[dim][0  ]  = c.d[dim][1] = door_bcube.d[dim][dir] - 0.02*(dir ? 1.0 : -1.0)*get_window_vspace(); // slightly in front of exterior wall
+	c.d[dim][dir] += (dir ? 1.0 : -1.0)*0.1*half_width;
+	set_cube_zvals(c, (zval - half_height), (zval + half_height));
+	set_wall_width(c, pos, half_width, !dim);
+	interior->room_geom->objs.emplace_back(c, TYPE_BUTTON, 0, dim, dir, (RO_FLAG_LIT | RO_FLAG_NOCOLL), 1.0, SHAPE_CYLIN); // always lit; room_id is not valid
 }
 
 void building_t::add_exterior_door_signs(rand_gen_t &rgen) {
-	if (is_house) { // maybe add welcome sign
-		if (rgen.rand() % 5) return; // only 20% of houses have a welcome sign
+	if (is_house) { // maybe add welcome sign and add doorbell
 		assert(!doors.empty());
+		add_doorbell(doors.front());
+		if (rgen.rand() & 3) return; // only 25% of houses have a welcome sign
 		add_sign_by_door(doors.front(), 1, "Welcome", DK_BROWN, 0); // front door only, outside
 	}
 	else { // add exit signs
@@ -3091,40 +3118,9 @@ void building_t::add_exterior_door_signs(rand_gen_t &rgen) {
 		
 		for (auto d = doors.begin(); d != doors.end(); ++d) {
 			if (has_courtyard && (d+1) == doors.end()) break; // courtyard door is not an exit
-			if (d->type == tquad_with_ix_t::TYPE_BDOOR) {add_sign_by_door(*d, 0, "Exit", exit_color, 1);} // inside, emissive
+			if (d->is_building_door()) {add_sign_by_door(*d, 0, "Exit", exit_color, 1);} // inside, emissive
 		}
 	}
-}
-
-void building_t::draw_room_geom(shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, unsigned building_ix,
-	bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building)
-{
-	if (!interior || !interior->room_geom) return;
-	if (ENABLE_MIRROR_REFLECTIONS && !shadow_only && !reflection_pass && player_in_building) {find_mirror_needing_reflection(xlate);}
-	interior->room_geom->draw(s, *this, oc, xlate, building_ix, shadow_only, reflection_pass, inc_small, player_in_building);
-}
-void building_t::gen_and_draw_room_geom(shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, vect_cube_t &ped_bcubes,
-	unsigned building_ix, int ped_ix, bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building)
-{
-	if (!interior) return;
-	if (!global_building_params.enable_rotated_room_geom && is_rotated()) return; // rotated buildings: need to fix texture coords, room object collision detection, mirrors, etc.
-	
-	if (!has_room_geom()) {
-		rand_gen_t rgen;
-		rgen.set_state(building_ix, parts.size()); // set to something canonical per building
-		ped_bcubes.clear();
-		if (ped_ix >= 0) {get_ped_bcubes_for_building(ped_ix, building_ix, ped_bcubes);}
-		gen_room_details(rgen, ped_bcubes, building_ix); // generate so that we can draw it
-		assert(has_room_geom());
-	}
-	draw_room_geom(s, oc, xlate, building_ix, shadow_only, reflection_pass, inc_small, player_in_building);
-}
-
-void building_t::clear_room_geom(bool force) {
-	if (!has_room_geom()) return;
-	if (interior->room_geom->modified_by_player) return; // keep the player's modifications and don't delete the room geom
-	interior->room_geom->clear(); // free VBO data before deleting the room_geom object
-	interior->room_geom.reset();
 }
 
 room_t::room_t(cube_t const &c, unsigned p, unsigned nl, bool is_hallway_, bool is_office_, bool is_sec_bldg_) :

@@ -9,6 +9,12 @@
 
 class tile_t;
 
+struct adj_tiles_t {
+	tile_t *adj[9] = {0};
+	bool valid = 0;
+	void ensure_valid(tile_t const *const tile);
+};
+
 struct tile_offset_t {
 	int dxoff, dyoff;
 
@@ -25,32 +31,33 @@ class animal_t : public sphere_t {
 
 public:
 	vector3d velocity;
-
 protected:
 	bool enabled;
 	vector3d dir;
 	colorRGBA color;
-	//tile_offset_t tile_off;
 
 	int get_ndiv(point const &pos_) const;
 	void gen_dir_vel(rand_gen_t &rgen, float speed);
+	float get_mesh_zval_at_pos(tile_t const *const tile) const;
 public:
-	animal_t() : enabled(0), dir(zero_vector), color(BLACK) {}
+	animal_t() : enabled(0), color(BLACK) {}
 	void apply_force(vector3d const &force) {velocity += force;}
 	void apply_force_xy(vector3d const &force) {velocity.x += force.x; velocity.y += force.y;}
 	bool is_enabled() const {return enabled;}
+	bool distance_check(point const &pos_, float vis_dist_scale) const;
 	bool is_visible(point const &pos_, float vis_dist_scale=1.0) const;
-	point get_draw_pos() const;
+	point get_camera_space_pos() const {return (pos + get_camera_coord_space_xlate());}
 };
 
 class fish_t : public animal_t {
 
-	float get_mesh_zval_at_pos(tile_t const *const tile) const;
 	float get_half_height() const {return 0.4*radius;} // approximate
 public:
+	static bool type_enabled();
+	static bool can_place_in_tile(tile_t const *const tile);
 	bool gen(rand_gen_t &rgen, cube_t const &range, tile_t const *const tile);
 	bool update(rand_gen_t &rgen, tile_t const *const tile);
-	void draw(shader_t &s) const;
+	void draw(shader_t &s, tile_t const *const tile, bool &first_draw) const;
 };
 
 class bird_t : public animal_t {
@@ -58,11 +65,37 @@ class bird_t : public animal_t {
 	bool flocking;
 	float time;
 public:
-	bird_t() : flocking(0), time(0) {}
+	bird_t() : flocking(0), time(0.0) {}
+	static bool type_enabled() {return 1;} // no model, always enabled
+	static bool can_place_in_tile(tile_t const *const tile) {return 1;} // always allowed
 	bool gen(rand_gen_t &rgen, cube_t const &range, tile_t const *const tile);
 	bool update(rand_gen_t &rgen, tile_t const *const tile);
 	void apply_force_xy_const_vel(vector3d const &force);
-	void draw(shader_t &s) const;
+	void draw(shader_t &s, tile_t const *const tile, bool &first_draw) const;
+};
+
+struct vect_butterfly_t;
+
+class butterfly_t : public animal_t {
+
+	bool dest_valid, is_mating, gender; // 0=male, 1=female
+	float time, rest_time, mate_time, explore_time, speed_factor, rot_rate, alt_change, fwd_accel, rot_accel, alt_accel, dest_alignment;
+	point cur_dest, prev_dest;
+	sphere_t dest_bsphere;
+	mutable vector<point> path;
+
+	void update_dest(rand_gen_t &rgen, tile_t const *const tile);
+public:
+	friend struct vect_butterfly_t;
+	butterfly_t() : dest_valid(0), is_mating(0), gender(0), time(0.0), rest_time(0.0), mate_time(0.0), explore_time(0.0), speed_factor(1.0),
+		rot_rate(0.0), alt_change(0.0), fwd_accel(0.0), rot_accel(0.0), alt_accel(0.0), dest_alignment(0.0) {}
+	static bool type_enabled();
+	static bool can_place_in_tile(tile_t const *const tile);
+	bool can_mate_with(butterfly_t const &b) const;
+	point get_camera_space_dest() const {return (cur_dest + get_camera_coord_space_xlate());}
+	bool gen(rand_gen_t &rgen, cube_t const &range, tile_t const *const tile);
+	bool update(rand_gen_t &rgen, tile_t const *const tile);
+	void draw(shader_t &s, tile_t const *const tile, bool &first_draw) const;
 };
 
 
@@ -82,22 +115,18 @@ public:
 	void gen(unsigned num, cube_t const &range, tile_t const *const tile);
 	void update(tile_t const *const tile);
 	void remove(unsigned ix);
-	void remove_disabled();
-	void draw_animals(shader_t &s) const;
+	void draw_animals(shader_t &s, tile_t const *const tile) const;
 	void clear() {vector<A>::clear(); generated = 0;}
 };
 
-struct vect_fish_t : public animal_group_t<fish_t> {
-	static void begin_draw(shader_t &s);
-	static void end_draw(shader_t &s);
-	void draw() const;
-};
+struct vect_fish_t : public animal_group_t<fish_t> {};
 
 struct vect_bird_t : public animal_group_t<bird_t> {
-	void flock(tile_t const *const tile);
-	static void begin_draw(shader_t &s);
-	static void end_draw(shader_t &s);
-	void draw() const;
+	void flock(tile_t const *const tile, adj_tiles_t &adj_tiles);
+};
+
+struct vect_butterfly_t : public animal_group_t<butterfly_t> {
+	void run_mating(tile_t const *const tile, adj_tiles_t &adj_tiles);
 };
 
 bool birds_active();

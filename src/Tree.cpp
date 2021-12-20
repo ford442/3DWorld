@@ -58,7 +58,6 @@ float tree_lod_scales[4] = {0, 0, 0, 0}; // branch_start, branch_end, leaf_start
 colorRGBA leaf_base_color(BLACK);
 tree_data_manager_t tree_data_manager;
 tree_cont_t t_trees(tree_data_manager);
-tree_cont_t *cur_tile_trees(nullptr);
 tree_placer_t tree_placer;
 
 
@@ -193,7 +192,7 @@ void tree_lod_render_t::render_billboards(shader_t &s, bool render_branches) con
 	tree_data_t const *last_td(nullptr);
 	s.add_uniform_vector3d("camera_pos", get_camera_pos());
 	s.add_uniform_vector3d("up_vector",  up_vector);
-	vector<vert_tc_color> pts;
+	static vector<vert_tc_color> pts; // reused across frames
 
 	for (vector<entry_t>::const_iterator i = data.begin(); i != data.end(); ++i) {
 		if (i->td != last_td) {
@@ -206,6 +205,7 @@ void tree_lod_render_t::render_billboards(shader_t &s, bool render_branches) con
 	} // for i
 	assert(!pts.empty());
 	draw_and_clear_verts(pts, GL_POINTS);
+	pts.clear();
 	bind_vbo(0);
 }
 
@@ -268,36 +268,30 @@ void tree::add_tree_collision_objects() {
 
 void tree::remove_collision_objects() {
 
-	for (unsigned i = 0; i < branch_cobjs.size(); i++) {
-		remove_reset_coll_obj(branch_cobjs[i]);
-	}
-	for (unsigned i = 0; i < leaf_cobjs.size(); i++) {
-		remove_reset_coll_obj(leaf_cobjs[i]);
-	}
+	for (unsigned i = 0; i < branch_cobjs.size(); i++) {remove_reset_coll_obj(branch_cobjs[i]);}
+	for (unsigned i = 0; i < leaf_cobjs  .size(); i++) {remove_reset_coll_obj(leaf_cobjs  [i]);}
 	branch_cobjs.clear();
-	leaf_cobjs.clear();
+	leaf_cobjs  .clear();
 }
-
 
 void tree_cont_t::remove_cobjs() {
-
-	for (iterator i = begin(); i != end(); ++i) {
-		i->remove_collision_objects();
-	}
+	for (iterator i = begin(); i != end(); ++i) {i->remove_collision_objects();}
 }
 
 
-bool tree::check_sphere_coll(point &center, float radius) const {
+bool tree::check_sphere_coll(point &center, float radius) const { // 10.7% of CPU time, 4.5x slower than scenery coll
 
-	float const trunk_radius(0.9*tdata().br_scale*tdata().base_radius);
-	float const trunk_height(max(tdata().sphere_radius, tdata().sphere_center_zoff)); // very approximate
+	tree_data_t const &td(tdata());
+	if (!td.branches_bcube.contains_pt_exp((center - tree_center), radius)) return 0; // optimization
+	float const trunk_radius(0.9*td.br_scale*td.base_radius);
+	float const trunk_height(max(td.sphere_radius, td.sphere_center_zoff)); // very approximate
 	cylinder_3dw const cylin(tree_center, tree_center+vector3d(0.0, 0.0, trunk_height), trunk_radius, trunk_radius);
 	return sphere_vert_cylin_intersect(center, radius, cylin);
 }
 
-
 bool tree_cont_t::check_sphere_coll(point &center, float radius) const {
 
+	if (!all_bcube.is_zero_area() && !sphere_cube_intersect(center, radius, all_bcube)) return 0;
 	bool coll(0);
 	for (const_iterator i = begin(); i != end(); ++i) {coll |= i->check_sphere_coll(center, radius);}
 	return coll;
@@ -308,7 +302,8 @@ void tree_cont_t::draw_branches_and_leaves(shader_t &s, tree_lod_render_t &lod_r
 	bool draw_branches, bool draw_leaves, bool shadow_only, bool reflection_pass, vector3d const &xlate)
 {
 	assert(draw_branches != draw_leaves); // must enable exactly one
-	int const wsoff_loc(s.get_uniform_loc("world_space_offset"));
+	if (!all_bcube.is_zero_area() && !camera_pdu.cube_visible(all_bcube + xlate)) return; // VFC
+	int const wsoff_loc(shadow_only ? -1 : s.get_uniform_loc("world_space_offset")); // not needed in shadow mode
 	bool const tt_shadow_mode(world_mode == WMODE_INF_TERRAIN && shadow_only);
 
 	if (draw_branches) {
@@ -321,29 +316,40 @@ void tree_cont_t::draw_branches_and_leaves(shader_t &s, tree_lod_render_t &lod_r
 		tree_data_t::post_branch_draw(shadow_only);
 	}
 	else { // draw_leaves
-		int const tex0_loc(s.get_uniform_loc("tex0"));
-		tree_data_t::pre_leaf_draw(s);
-		sorted.clear();
-		
-		for (unsigned i = 0; i < size(); ++i) {
-			tree const &t(operator[](i));
-			point const center(t.sphere_center() + xlate);
-			// still need VFC in tiled terrain mode since the shadow volume doesn't include the entire scene (especially for local city light shadows)
-			if (tt_shadow_mode && !dist_less_than(center, camera_pdu.pos, camera_pdu.far_))    continue; // Note: intentionally excludes tree radius
-			if (tt_shadow_mode && !camera_pdu.sphere_visible_test(center, 1.1*t.get_radius())) continue;
-			sorted.emplace_back(distance_to_camera_sq(center), i);
-		}
-		if (!tt_shadow_mode) {sort(sorted.begin(), sorted.end());} // sort front to back for better early z culling
 		to_update_leaves.clear();
+		tree_data_t::pre_leaf_draw(s);
 
-		for (auto i = sorted.begin(); i != sorted.end(); ++i) {
-			operator[](i->second).draw_leaves_top(s, lod_renderer, shadow_only, reflection_pass, xlate, wsoff_loc, tex0_loc, to_update_leaves);
+		if (tt_shadow_mode) {
+			for (tree &t : *this) {
+				point const center(t.sphere_center() + xlate);
+				// still need VFC in tiled terrain mode since the shadow volume doesn't include the entire scene (especially for local city light shadows)
+				if (!dist_less_than(center, camera_pdu.pos, camera_pdu.far_))    continue; // Note: intentionally excludes tree radius
+				if (!camera_pdu.sphere_visible_test(center, 1.1*t.get_radius())) continue;
+				t.draw_leaves_top(s, lod_renderer, shadow_only, reflection_pass, xlate, wsoff_loc, -1, to_update_leaves);
+			}
+			tree_data_t::post_leaf_draw();
 		}
-		tree_data_t::post_leaf_draw();
+		else {
+			int const tex0_loc(shadow_only ? -1 : s.get_uniform_loc("tex0")); // not needed in shadow mode
+			point const local_camera(get_camera_pos() - xlate);
+			
+			if (shadow_only || (world_mode == WMODE_INF_TERRAIN && !all_bcube.is_all_zeros() &&
+				!all_bcube.closest_dist_less_than(local_camera, 1.0*(X_SCENE_SIZE + Y_SCENE_SIZE))))
+			{ // direct draw
+				for (tree &t : *this) {t.draw_leaves_top(s, lod_renderer, shadow_only, reflection_pass, xlate, wsoff_loc, tex0_loc, to_update_leaves);}
+			}
+			else { // sorted draw - when close to the player
+				sorted.clear();
+				for (unsigned i = 0; i < size(); ++i) {sorted.emplace_back(p2p_dist_sq(operator[](i).sphere_center(), local_camera), i);}
+				sort(sorted.begin(), sorted.end()); // sort front to back for better early z culling
 
-		if (!tt_shadow_mode) {
+				for (auto i = sorted.begin(); i != sorted.end(); ++i) {
+					operator[](i->second).draw_leaves_top(s, lod_renderer, shadow_only, reflection_pass, xlate, wsoff_loc, tex0_loc, to_update_leaves);
+				}
+			}
+			tree_data_t::post_leaf_draw();
 			int const num_to_update(to_update_leaves.size());
-	#pragma omp parallel for num_threads(max(1, min(4, num_to_update))) schedule(static) if (num_to_update > 1)
+#pragma omp parallel for num_threads(max(1, min(4, num_to_update))) schedule(static) if (num_to_update > 1)
 			for (int i = 0; i < num_to_update; ++i) {to_update_leaves[i]->update_leaf_orients_wind();}
 		}
 	}
@@ -917,7 +923,7 @@ float tree::calc_size_scale(point const &draw_pos) const {
 		float const dmax(get_draw_tile_dist());
 		if (dist_sq > dmax*dmax) return 0.0; // too far away to draw
 	}
-	return (do_zoom ? ZOOM_FACTOR : 1.0f)*tdata().base_radius/(sqrt(dist_sq)*DIST_C_SCALE);
+	return (do_zoom ? ZOOM_FACTOR : 1.0f)*tdata().base_radius*InvSqrt(dist_sq)/DIST_C_SCALE;
 }
 
 float tree_data_t::get_size_scale_mult() const {return (has_4th_branches ? LEAF_4TH_SCALE : 1.0);}
@@ -974,7 +980,6 @@ void tree::draw_leaves_top(shader_t &s, tree_lod_render_t &lod_renderer, bool sh
 {
 	if (!created) return;
 	tree_data_t &td(tdata());
-	td.gen_leaf_color();
 	bool const ground_mode(world_mode == WMODE_GROUND), wind_enabled(ground_mode && (display_mode & 0x0100) != 0);
 	point const tree_xlate(tree_center + xlate);
 
@@ -1003,6 +1008,7 @@ void tree::draw_leaves_top(shader_t &s, tree_lod_render_t &lod_renderer, bool sh
 	float const size_scale(calc_size_scale(draw_pos));
 	last_size_scale = size_scale;
 	if (size_scale == 0.0) return;
+	td.gen_leaf_color();
 
 	if (lod_renderer.is_enabled()) {
 		float const lod_start(tree_lod_scales[2]), lod_end(tree_lod_scales[3]), lod_denom(lod_start - lod_end);
@@ -2075,7 +2081,7 @@ int tree_builder_t::generate_next_cylin(int cylin_num, int ncib, bool branch_jus
 	float const t_start(TWO_PI/rgen.rand_int(3,8)); //start in the first pi
 	float const t_end(((rgen.rand_int(1,3) == 1) ? 1.0f : 5.0f)*PI_TWO + rgen.rand_int(2,8)*PI_16); //either PI/2 to PI or 5*PI/2 to 3*PI - controls branch droopiness
 	int add_deg_rotate(int(0.01*cylin_num*sinf(t_start+(t_end-t_start)*cylin_num/ncib)*branch_curveness)); //how much wavy the branch will be --in degrees
-	int rg[2];
+	int rg[2] = {};
 
 	if (cylin_num < int(ncib/3)) { //how much to start the starting deg_scale
 		rg[0] = 5; rg[1] = 10;
@@ -2196,7 +2202,7 @@ void tree_cont_t::gen_trees_tt_within_radius(int x1, int y1, int x2, int y2, poi
 			} // for b
 		}
 	}
-	if (mod_num_trees == 0 || !(tree_mode & 1)) return; // no trees
+	if (mod_num_trees == 0 || !(tree_mode & 1)) {calc_bcube(); return;} // no generated trees
 	float const height_thresh(get_median_height(tree_density_thresh));
 	unsigned const smod(3.321*XY_MULT_SIZE+1), tree_prob(max(1U, XY_MULT_SIZE/mod_num_trees));
 	unsigned const skip_val(max(1, int(1.0/tree_scale))); // similar to deterministic gen in scenery.cpp
@@ -2260,6 +2266,7 @@ void tree_cont_t::gen_trees_tt_within_radius(int x1, int y1, int x2, int y2, poi
 			back().gen_tree(pos, 0, ttype, 0, 1, 0, rgen, 1.0, 1.0, 1.0, tree_4th_branches, 1); // allow bushes
 		} // for j
 	} // for i
+	calc_bcube();
 }
 
 
@@ -2290,11 +2297,6 @@ void regen_trees(bool keep_old) {
 	}
 	if (!scrolling) {PRINT_TIME(" Gen Trees");}
 }
-
-
-tree_type const &get_closest_tree_type(point const &pos) {return (cur_tile_trees ? *cur_tile_trees : t_trees).get_closest_tree_type(pos);}
-int       get_closest_tree_bark_tid   (point const &pos) {return get_closest_tree_type(pos).bark_tex;}
-colorRGBA get_closest_tree_bark_color (point const &pos) {return get_closest_tree_type(pos).barkc;}
 
 
 void tree::write_to_cobj_file(std::ostream &out) const {
@@ -2386,7 +2388,7 @@ float tree_cont_t::get_rmax() const {
 	return rmax;
 }
 
-tree_type const &tree_cont_t::get_closest_tree_type(point const &pos) const {
+unsigned tree_cont_t::get_closest_tree_type(point const &pos) const {
 	int closest_type(TREE_MAPLE); // default value for the no-trees-found case
 	float min_dist_sq(0.0);
 	
@@ -2402,7 +2404,7 @@ tree_type const &tree_cont_t::get_closest_tree_type(point const &pos) const {
 		}
 	} // for i
 	assert(closest_type >= 0 && closest_type < NUM_TREE_TYPES);
-	return tree_types[closest_type];
+	return closest_type;
 }
 
 void tree_cont_t::update_zmax(float &tzmax) const {

@@ -20,13 +20,13 @@ extern cube_t smap_light_clip_cube;
 extern pos_dir_up camera_pdu;
 extern building_t const *player_building;
 extern carried_item_t player_held_object;
+extern building_params_t global_building_params;
 
 unsigned get_num_screenshot_tids();
 tid_nm_pair_t get_phone_tex(room_object_t const &c);
 template< typename T > void gen_quad_ixs(vector<T> &ixs, unsigned size, unsigned ix_offset);
 
 bool has_key_3d_model() {return building_obj_model_loader.is_model_valid(OBJ_MODEL_KEY);}
-bool has_hanger_model() {return building_obj_model_loader.is_model_valid(OBJ_MODEL_HANGER);}
 
 colorRGBA room_object_t::get_model_color() const {return building_obj_model_loader.get_avg_color(get_model_id());}
 
@@ -324,7 +324,7 @@ void rgeom_mat_t::create_vbo(building_t const &building) {
 void rgeom_mat_t::create_vbo_inner() {
 	assert(itri_verts.empty() == indices.empty());
 	unsigned qsz(quad_verts.size()*sizeof(vertex_t)), itsz(itri_verts.size()*sizeof(vertex_t));
-	num_verts = quad_verts.size() + itri_verts.size();
+	num_verts   = quad_verts.size() + itri_verts.size();
 	vao_mgr.vbo = ::create_vbo();
 	check_bind_vbo(vao_mgr.vbo);
 	upload_vbo_data(nullptr, num_verts*sizeof(vertex_t));
@@ -334,24 +334,89 @@ void rgeom_mat_t::create_vbo_inner() {
 	gen_quad_ixs(indices, 6*(quad_verts.size()/4), itri_verts.size()); // append indices for quad_verts
 	create_vbo_and_upload(vao_mgr.ivbo, indices, 1, 1);
 	num_ixs = indices.size();
+
+	if (num_verts >= 32) {dir_mask = 63;} // too many verts, assume all orients
+	else {
+		dir_mask = 0;
+		for (unsigned n = 0; n < 2; ++n) {
+			for (auto const &v : (n ? itri_verts : quad_verts)) {
+				for (unsigned d = 0; d < 3; ++d) {
+					if (v.n[d] < 0) {dir_mask |= 1<<(2*d);} else if (v.n[d] > 0) {dir_mask |= 1<<(2*d+1);}
+				}
+			}
+		} // for n
+	}
 }
 
-void rgeom_mat_t::draw(shader_t &s, bool shadow_only, bool reflection_pass) {
+void brg_batch_draw_t::set_camera_dir_mask(point const &camera_bs, cube_t const &bcube) {
+	camera_dir_mask = 0;
+	for (unsigned d = 0; d < 3; ++d) {
+		if (camera_bs[d] < bcube.d[d][1]) {camera_dir_mask |=  1<<(2*d);}
+		if (camera_bs[d] > bcube.d[d][0]) {camera_dir_mask |= 1<<(2*d+1);}
+	}
+}
+void brg_batch_draw_t::add_material(rgeom_mat_t const &m) {
+#if 0 // doesn't seem like this helps for ~100 materials, but it may help when more materials are added
+	unsigned const tid((m.tex.tid < 0) ? WHITE_TEX : m.tex.tid);
+	if (tid >= tid_to_first_mat_map.size()) {tid_to_first_mat_map.resize(tid+1, -1);}
+	int &tex_ix(tid_to_first_mat_map[tid]);
+	unsigned const start_ix((tex_ix >= 0) ? tex_ix : 0); // start searching at the first material using this texture
+	assert(start_ix <= to_draw.size());
+		
+	for (auto i = to_draw.begin() + start_ix; i != to_draw.end(); ++i) {
+		if (i->tex.is_compat_ignore_shadowed(m.tex)) {i->mats.push_back(&m); return;} // found existing material
+	}
+	if (tex_ix < 0) {tex_ix = to_draw.size();} // cache this material index for later calls
+#else
+	for (auto &i : to_draw) { // check all existing materials for a matching texture, etc.
+		if (i.tex.is_compat_ignore_shadowed(m.tex)) {i.mats.push_back(&m); return;} // found existing material
+	}
+#endif
+	to_draw.emplace_back(m); // add a new material entry
+}
+void brg_batch_draw_t::draw_and_clear(shader_t &s) {
+	tid_nm_pair_dstate_t state(s);
+	enable_blend(); // needed for rugs and book text
+
+	for (auto &i : to_draw) {
+		if (i.mats.empty()) continue; // empty slot
+		i.tex.set_gl(state);
+		for (auto const &m : i.mats) {m->draw_inner(state, 0);} // shadow_only=0
+		i.tex.unset_gl(state);
+		i.mats.clear(); // clear mats but not to_draw
+	}
+	disable_blend();
+	indexed_vao_manager_with_shadow_t::post_render();
+}
+
+// shadow_only: 0=non-shadow pass, 1=shadow pass, 2=shadow pass with alpha mask texture
+void rgeom_mat_t::draw(tid_nm_pair_dstate_t &state, brg_batch_draw_t *bbd, int shadow_only, bool reflection_pass) {
 	if (shadow_only && !en_shadows)  return; // shadows not enabled for this material (picture, whiteboard, rug, etc.)
 	if (shadow_only && tex.emissive) return; // assume this is a light source and shouldn't produce shadows (also applies to bathroom windows, which don't produce shadows)
 	if (reflection_pass && tex.tid == REFLECTION_TEXTURE_ID) return; // don't draw reflections of mirrors as this doesn't work correctly
 	assert(num_verts > 0);
-	if (!shadow_only) {tex.set_gl(s);} // ignores texture scale for now
 	vao_mgr.create_and_upload(vector<vertex_t>(), vector<unsigned>(), shadow_only, 0, 1); // pass empty vectors because data is already uploaded; dynamic_level=0, setup_pointers=1
-	vao_mgr.pre_render(shadow_only);
+
+	// Note: the shadow pass doesn't normally bind textures and set uniforms, so we don't need to combine those calls into batches
+	if (bbd != nullptr && !shadow_only) { // add to batch draw (optimization)
+		if (dir_mask > 0 && bbd->camera_dir_mask > 0 && (dir_mask & bbd->camera_dir_mask) == 0) return; // check for visible surfaces
+		bbd->add_material(*this);
+	}
+	else { // draw this material now
+		if (shadow_only != 1) {tex.set_gl  (state);} // ignores texture scale for now; enable alpha texture for shadow pass
+		draw_inner(state, shadow_only);
+		if (shadow_only != 1) {tex.unset_gl(state);}
+	}
+}
+void rgeom_mat_t::draw_inner(tid_nm_pair_dstate_t &state, int shadow_only) const {
+	vao_mgr.pre_render(shadow_only != 0);
 	glDrawRangeElements(GL_TRIANGLES, 0, num_verts, num_ixs, GL_UNSIGNED_INT, nullptr);
-	if (!shadow_only) {tex.unset_gl(s);}
 }
 
-void rgeom_mat_t::upload_draw_and_clear(shader_t &s) {
+void rgeom_mat_t::upload_draw_and_clear(tid_nm_pair_dstate_t &state) { // Note: called by draw_interactive_player_obj() and water_draw_t
 	if (empty()) return; // nothing to do
 	create_vbo_inner();
-	draw(s, 0, 0);
+	draw(state, nullptr, 0, 0); // no brg_batch_draw_t
 	clear();
 }
 
@@ -367,8 +432,10 @@ unsigned building_materials_t::count_all_verts() const {
 rgeom_mat_t &building_materials_t::get_material(tid_nm_pair_t const &tex, bool inc_shadows) {
 	// for now we do a simple linear search because there shouldn't be too many unique materials
 	for (iterator m = begin(); m != end(); ++m) {
-		if (m->tex != tex) continue;
+		if (!m->tex.is_compatible(tex)) continue;
 		if (inc_shadows) {m->enable_shadows();}
+		// tscale diffs don't make new materials; copy tscales from incoming tex; this field may be used locally by the caller, but isn't used for drawing
+		m->tex.tscale_x = tex.tscale_x; m->tex.tscale_y = tex.tscale_y;
 		return *m;
 	}
 	emplace_back(tex); // not found, add a new material
@@ -379,21 +446,23 @@ rgeom_mat_t &building_materials_t::get_material(tid_nm_pair_t const &tex, bool i
 void building_materials_t::create_vbos(building_t const &building) {
 	for (iterator m = begin(); m != end(); ++m) {m->create_vbo(building);}
 }
-void building_materials_t::draw(shader_t &s, bool shadow_only, bool reflection_pass) {
+void building_materials_t::draw(brg_batch_draw_t *bbd, shader_t &s, int shadow_only, bool reflection_pass) {
 	//highres_timer_t timer("Draw Materials"); // 0.0168
 	static vector<iterator> text_mats;
 	text_mats.clear();
+	tid_nm_pair_dstate_t state(s);
 
 	// first pass, draw regular materials (excluding text)
 	for (iterator m = begin(); m != end(); ++m) {
 		if (m->tex.tid == FONT_TEXTURE_ID) {text_mats.push_back(m);} // skip in this pass
-		else {m->draw(s, shadow_only, reflection_pass);}
+		else {m->draw(state, bbd, shadow_only, reflection_pass);}
 	}
-	// second pass, draw text (if it exists) so that alpha blending works
-	for (auto m = text_mats.begin(); m != text_mats.end(); ++m) {(*m)->draw(s, shadow_only, reflection_pass);}
+	// second pass, draw text (if it exists) so that alpha blending works; really only needed for the building the player is in
+	for (auto m = text_mats.begin(); m != text_mats.end(); ++m) {(*m)->draw(state, bbd, shadow_only, reflection_pass);}
 }
 void building_materials_t::upload_draw_and_clear(shader_t &s) {
-	for (iterator m = begin(); m != end(); ++m) {m->upload_draw_and_clear(s);}
+	tid_nm_pair_dstate_t state(s);
+	for (iterator m = begin(); m != end(); ++m) {m->upload_draw_and_clear(state);}
 }
 
 void building_room_geom_t::add_tquad(building_geom_t const &bg, tquad_with_ix_t const &tquad, cube_t const &bcube, tid_nm_pair_t const &tex,
@@ -423,7 +492,7 @@ void building_room_geom_t::clear_static_vbos() { // used to clear pictures
 }
 void building_room_geom_t::clear_static_small_vbos() {
 	mats_small.clear();
-	mats_plants.clear();
+	mats_amask.clear();
 }
 
 rgeom_mat_t &building_room_geom_t::get_material(tid_nm_pair_t const &tex, bool inc_shadows, bool dynamic, bool small, bool transparent) {
@@ -502,13 +571,13 @@ void building_room_geom_t::create_static_vbos(building_t const &building) {
 
 void building_room_geom_t::create_small_static_vbos(building_t const &building) {
 	//highres_timer_t timer("Gen Room Geom Small"); // 7.8ms, slow building at 26,16
-	mats_small .clear();
-	mats_plants.clear();
-	model_objs .clear(); // currently model_objs are only created for small objects in drawers, so we clear this here
+	mats_small.clear();
+	mats_amask.clear();
+	model_objs.clear(); // currently model_objs are only created for small objects in drawers, so we clear this here
 	add_small_static_objs_to_verts(expanded_objs);
 	add_small_static_objs_to_verts(objs);
-	mats_small .create_vbos(building);
-	mats_plants.create_vbos(building);
+	mats_small.create_vbos(building);
+	mats_amask.create_vbos(building);
 }
 
 void building_room_geom_t::add_small_static_objs_to_verts(vector<room_object_t> const &objs_to_add) {
@@ -549,13 +618,13 @@ void building_room_geom_t::add_small_static_objs_to_verts(vector<room_object_t> 
 		case TYPE_MONEY:     add_money (*i); break;
 		case TYPE_PHONE:     add_phone (*i); break;
 		case TYPE_TPROLL:    add_tproll(*i); break;
+		case TYPE_TAPE:      add_tape  (*i); break;
 		case TYPE_SPRAYCAN:  add_spraycan(*i); break;
 		case TYPE_CRACK:     add_crack (*i); break;
 		case TYPE_SWITCH:    add_switch(*i); break;
 		case TYPE_PLATE:     add_plate (*i); break;
 		case TYPE_LAPTOP:    add_laptop(*i); break;
 		case TYPE_BUTTON:    if (!(i->flags & RO_FLAG_IN_ELEV)) {add_button(*i);} break; // skip buttons inside elevators, which are drawn as dynamic objects
-		case TYPE_HANGER:    if (has_hanger_model()) {model_objs.push_back(*i);} break;
 		case TYPE_LBASKET:   add_laundry_basket(*i); break;
 		case TYPE_WHEATER:   add_water_heater  (*i); break; // small since this object is only added to basements
 		default: break;
@@ -631,28 +700,40 @@ void building_room_geom_t::create_dynamic_vbos(building_t const &building) {
 void building_room_geom_t::create_door_vbos(building_t const &building) {
 	//highres_timer_t timer("Gen Room Geom Doors"); // 0.1ms
 	vector<door_t> const &doors(building.interior->doors);
+	uint8_t const door_type(building.is_house ? tquad_with_ix_t::TYPE_HDOOR : tquad_with_ix_t::TYPE_ODOOR);
 
 	for (auto i = doors.begin(); i != doors.end(); ++i) {
-		building.add_door_verts(*i, *this, tquad_with_ix_t::TYPE_HDOOR, i->dim, i->open_dir, i->open, 0, 0, i->on_stairs, i->hinge_side); // opens_out=0, exterior=0
+		building.add_door_verts(*i, *this, door_type, i->dim, i->open_dir, i->open, 0, 0, i->on_stairs, i->hinge_side); // opens_out=0, exterior=0
 	}
 	mats_doors.create_vbos(building);
 }
 
-void rotate_dir_about_z(vector3d &dir, float rate) { // Note: assumes dir is normalized
-	if (rate == 0.0) return;
+void rotate_dir_about_z(vector3d &dir, float angle) { // Note: assumes dir is normalized
+	if (angle == 0.0) return;
 	assert(dir.z == 0.0); // dir must be in XY plane
-	float const new_angle(atan2(dir.y, dir.x) + rate*fticks);
+	float const new_angle(atan2(dir.y, dir.x) + angle);
 	dir.assign(cosf(new_angle), sinf(new_angle), 0.0);
 }
 void apply_room_obj_rotate(room_object_t &obj, obj_model_inst_t &inst) {
 	if (!(obj.flags & RO_FLAG_ROTATING)) return;
-	if (office_chair_rot_rate == 0.0) {obj.flags &= ~RO_FLAG_ROTATING; return;} // if no longer rotating, clear rotation bit
-	assert(obj.type == TYPE_OFF_CHAIR); // only office chairs are supported for now
-	rotate_dir_about_z(inst.dir, office_chair_rot_rate);
+
+	if (obj.type == TYPE_OFF_CHAIR) {
+		if (office_chair_rot_rate == 0.0) {obj.flags &= ~RO_FLAG_ROTATING; return;} // if no longer rotating, clear rotation bit
+		rotate_dir_about_z(inst.dir, office_chair_rot_rate*fticks);
+	}
+	else if (obj.type == TYPE_HANGER || obj.type == TYPE_CLOTHES) {
+		inst.dir = obj.get_dir(); // reset before applying rotate
+		float const angle(((obj.flags & RO_FLAG_ADJ_LO) ? -1.0 : 1.0)*0.08*TWO_PI);
+		rotate_dir_about_z(inst.dir, -angle); // limited rotation angle
+	}
+	else {
+		assert(0); // unsupported object type
+	}
 }
 
 /*static*/ void building_room_geom_t::draw_interactive_player_obj(carried_item_t const &c, shader_t &s) {
 	static rgeom_mat_t mat; // allocated memory is reused across frames; VBO is recreated every time
+	bool needs_blend(0);
 
 	if (c.type == TYPE_SPRAYCAN || c.type == TYPE_MARKER) {
 		room_object_t c_rot(c);
@@ -666,8 +747,9 @@ void apply_room_obj_rotate(room_object_t &obj, obj_model_inst_t &inst) {
 		if (c.type == TYPE_SPRAYCAN) {add_spraycan_to_material(c_rot, mat);}
 		else {add_pen_pencil_marker_to_material(c_rot, mat);}
 	}
-	else if (c.type == TYPE_TPROLL) { // apply get_player_cview_rot_matrix()?
-		add_vert_tproll_to_material(c, mat, c.get_remaining_capacity_ratio());
+	else if (c.type == TYPE_TPROLL || c.type == TYPE_TAPE) { // apply get_player_cview_rot_matrix()?
+		add_vert_roll_to_material(c, mat, c.get_remaining_capacity_ratio(), 1); // player_held=1
+		needs_blend = 1;
 	}
 	else if (c.type == TYPE_BOOK) {
 		static building_room_geom_t tmp_rgeom;
@@ -686,16 +768,18 @@ void apply_room_obj_rotate(room_object_t &obj, obj_model_inst_t &inst) {
 			screen_mat.tex = get_phone_tex(c);
 			screen_mat.add_cube_to_verts(c, WHITE, all_zeros, ~EF_Z2, 0, 1); // mirror_x=1
 			rotate_verts(screen_mat.quad_verts, plus_z, z_rot_angle, c.get_cube_center(), 0); // rotate all quad verts about Z axis
-			screen_mat.upload_draw_and_clear(s);
+			tid_nm_pair_dstate_t state(s);
+			screen_mat.upload_draw_and_clear(state);
 		}
 		else {mat.add_cube_to_verts(c, BLACK, all_zeros, ~EF_Z2);} // screen drawn as black
 		mat.add_cube_to_verts(c, c.color, all_zeros, EF_Z2);
 		rotate_verts(mat.quad_verts, plus_z, z_rot_angle, c.get_cube_center(), 0); // rotate all quad verts about Z axis
 	}
 	else {assert(0);}
-	if (c.type == TYPE_TPROLL) {enable_blend();}
-	mat.upload_draw_and_clear(s);
-	if (c.type == TYPE_TPROLL) {disable_blend();}
+	if (needs_blend) {enable_blend();}
+	tid_nm_pair_dstate_t state(s);
+	mat.upload_draw_and_clear(state);
+	if (needs_blend) {disable_blend();}
 }
 
 class water_draw_t {
@@ -721,7 +805,8 @@ public:
 		if (mat.empty()) return;
 		glDepthMask(GL_FALSE); // disable depth writing - fixes sky visible through exterior wall, but then not drawn in front of exterior wall
 		enable_blend();
-		mat.upload_draw_and_clear(s);
+		tid_nm_pair_dstate_t state(s);
+		mat.upload_draw_and_clear(state);
 		disable_blend();
 		glDepthMask(GL_TRUE); // re-enable depth writing
 		if (animate2) {tex_off += 0.02*fticks;} // animate the texture
@@ -731,8 +816,55 @@ public:
 
 water_draw_t water_draw;
 
+int room_object_t::get_model_id() const {
+	assert(type >= TYPE_TOILET);
+	if (type == TYPE_MONITOR) return OBJ_MODEL_TV; // monitor has same model as TV
+	int id((int)type + OBJ_MODEL_TOILET - TYPE_TOILET);
+	if (type == TYPE_HANGER || type == TYPE_CLOTHES) {id += ((int)item_flags << 8);} // choose a sub_model_id for these types using bits 8-15
+	return id;
+}
+
+void building_t::draw_room_geom(brg_batch_draw_t *bbd, shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, unsigned building_ix,
+	bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building)
+{
+	if (!interior || !interior->room_geom) return;
+	if (ENABLE_MIRROR_REFLECTIONS && !shadow_only && !reflection_pass && player_in_building) {find_mirror_needing_reflection(xlate);}
+	interior->room_geom->draw(bbd, s, *this, oc, xlate, building_ix, shadow_only, reflection_pass, inc_small, player_in_building);
+}
+void building_t::gen_and_draw_room_geom(brg_batch_draw_t *bbd, shader_t &s, occlusion_checker_noncity_t &oc, vector3d const &xlate, vect_cube_t &ped_bcubes,
+	unsigned building_ix, int ped_ix, bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building)
+{
+	if (!interior) return;
+	if (!global_building_params.enable_rotated_room_geom && is_rotated()) return; // rotated buildings: need to fix texture coords, room object collisions, mirrors, etc.
+
+	if (!shadow_only && !camera_pdu.point_visible_test(bcube.get_cube_center() + xlate)) {
+		// skip if none of the building parts are visible to the camera; this is rare, so it may not help
+		bool any_part_visible(0);
+
+		for (auto p = parts.begin(); p != parts.end(); ++p) {
+			if (camera_pdu.cube_visible(*p + xlate)) {any_part_visible = 1; break;}
+		}
+		if (!any_part_visible) return;
+	}
+	if (!has_room_geom()) {
+		rand_gen_t rgen;
+		rgen.set_state(building_ix, parts.size()); // set to something canonical per building
+		ped_bcubes.clear();
+		if (ped_ix >= 0) {get_ped_bcubes_for_building(ped_ix, building_ix, ped_bcubes);}
+		gen_room_details(rgen, ped_bcubes, building_ix); // generate so that we can draw it
+		assert(has_room_geom());
+	}
+	draw_room_geom(bbd, s, oc, xlate, building_ix, shadow_only, reflection_pass, inc_small, player_in_building);
+}
+void building_t::clear_room_geom(bool force) {
+	if (!has_room_geom()) return;
+	if (interior->room_geom->modified_by_player) return; // keep the player's modifications and don't delete the room geom
+	interior->room_geom->clear(); // free VBO data before deleting the room_geom object
+	interior->room_geom.reset();
+}
+
 // Note: non-const because it creates the VBO
-void building_room_geom_t::draw(shader_t &s, building_t const &building, occlusion_checker_noncity_t &oc, vector3d const &xlate,
+void building_room_geom_t::draw(brg_batch_draw_t *bbd, shader_t &s, building_t const &building, occlusion_checker_noncity_t &oc, vector3d const &xlate,
 	unsigned building_ix, bool shadow_only, bool reflection_pass, bool inc_small, bool player_in_building)
 {
 	if (empty()) return; // no geom
@@ -741,6 +873,10 @@ void building_room_geom_t::draw(shader_t &s, building_t const &building, occlusi
 	static unsigned num_geom_this_frame(0); // used to limit per-frame geom gen time; doesn't apply to shadow pass, in case shadows are cached
 	if (frame_counter > last_frame) {num_geom_this_frame = 0; last_frame = frame_counter;}
 	bool const can_update_geom(shadow_only || num_geom_this_frame < MAX_ROOM_GEOM_GEN_PER_FRAME); // must be consistent for static and small geom
+	point const camera_bs(camera_pdu.pos - xlate);
+	bool const draw_lights(camera_bs.z < building.bcube.z2()); // don't draw ceiling lights when player is above the building
+	if (player_in_building) {bbd = nullptr;} // use immediate drawing when player is in the building because draw order matters for alpha blending
+	if (bbd != nullptr) {bbd->set_camera_dir_mask(camera_bs, building.bcube);}
 
 	if (materials_invalid) { // set in set_obj_lit_state_to()
 		clear_materials();
@@ -763,33 +899,33 @@ void building_room_geom_t::draw(shader_t &s, building_t const &building, occlusi
 		create_small_static_vbos(building);
 		++num_geom_this_frame;
 	}
-	if (mats_lights .empty()) {create_lights_vbos (building);} // create lights  materials if needed (no limit)
-	if (mats_dynamic.empty()) {create_dynamic_vbos(building);} // create dynamic materials if needed (no limit)
-	if (mats_doors  .empty()) {create_door_vbos   (building);} // create door    materials if needed (no limit)
+	if (draw_lights && mats_lights .empty()) {create_lights_vbos (building);} // create lights  materials if needed (no limit)
+	if (inc_small   && mats_dynamic.empty()) {create_dynamic_vbos(building);} // create dynamic materials if needed (no limit); drawn with small objects
+	if (mats_doors.empty()) {create_door_vbos(building);} // create door materials if needed (no limit)
 	enable_blend(); // needed for rugs and book text
 	assert(s.is_setup());
-	mats_static .draw(s, shadow_only, reflection_pass);
-	mats_lights .draw(s, shadow_only, reflection_pass);
-	mats_dynamic.draw(s, shadow_only, reflection_pass);
-	mats_doors  .draw(s, shadow_only, reflection_pass);
-
+	mats_static .draw(bbd, s, shadow_only, reflection_pass); // this is the slowest call
+	if (draw_lights) {mats_lights .draw(bbd, s, shadow_only, reflection_pass);}
+	if (inc_small  ) {mats_dynamic.draw(bbd, s, shadow_only, reflection_pass);}
+	mats_doors  .draw(bbd, s, shadow_only, reflection_pass);
+	
 	if (inc_small) {
-		mats_small.draw(s, shadow_only, reflection_pass);
+		mats_small.draw(bbd, s, shadow_only, reflection_pass);
 
-		if (player_in_building) { // if we're not in the building, don't draw plants at all; without the special shader they won't look correct when drawn through windows
+		if (player_in_building) { // if we're not in the building, don't draw alpha mask materials at all; without the special shader they won't look correct when drawn through windows
 			if (shadow_only) {
-				shader_t plant_shader;
-				plant_shader.begin_simple_textured_shader(0.9); // need to use texture with alpha test
-				mats_plants.draw(s, 0, 0);
+				shader_t amask_shader;
+				amask_shader.begin_simple_textured_shader(0.9); // need to use texture with alpha test
+				mats_amask.draw(nullptr, amask_shader, 2, 0); // shadow pass with alpha mask; no brg_batch_draw
 				s.make_current(); // switch back to the normal shader
 			}
 			else if (reflection_pass) {
-				mats_plants.draw(s, 0, 1);
+				mats_amask.draw(nullptr, s, 0, 1); // no brg_batch_draw
 			}
 			else { // this is expensive: only enable for the current building and the main draw pass
-				shader_t plant_shader;
-				setup_building_draw_shader(plant_shader, 0.9, 1, 1, 0); // min_alpha=0.5, enable_indir=1, force_tsl=1, use_texgen=1
-				mats_plants.draw(plant_shader, 0, 0);
+				shader_t amask_shader;
+				setup_building_draw_shader(amask_shader, 0.9, 1, 1, 0); // min_alpha=0.9, enable_indir=1, force_tsl=1, use_texgen=0
+				mats_amask.draw(nullptr, amask_shader, 0, 0); // no brg_batch_draw
 				s.make_current(); // switch back to the normal shader
 			}
 		}
@@ -798,7 +934,7 @@ void building_room_geom_t::draw(shader_t &s, building_t const &building, occlusi
 	indexed_vao_manager_with_shadow_t::post_render();
 	bool const disable_cull_face(0); // better but slower?
 	if (disable_cull_face) {glDisable(GL_CULL_FACE);}
-	point const camera_bs(camera_pdu.pos - xlate), building_center(building.bcube.get_cube_center());
+	point const building_center(building.bcube.get_cube_center());
 	bool const is_rotated(building.is_rotated());
 	oc.set_exclude_bix(building_ix);
 	bool obj_drawn(0);
@@ -820,8 +956,9 @@ void building_room_geom_t::draw(shader_t &s, building_t const &building, occlusi
 		bool const is_emissive(!shadow_only && obj.type == TYPE_LAMP && obj.is_lit());
 		if (is_emissive) {s.set_color_e(LAMP_COLOR*0.4);}
 		apply_room_obj_rotate(obj, *i); // Note: may modify obj by clearing flags
+		bool const untextured(obj.flags & RO_FLAG_UNTEXTURED);
 		// Note: lamps are the most common and therefore most expensive models to draw
-		building_obj_model_loader.draw_model(s, obj_center, obj, i->dir, obj.color, xlate, obj.get_model_id(), shadow_only, 0, 0);
+		building_obj_model_loader.draw_model(s, obj_center, obj, i->dir, obj.color, xlate, obj.get_model_id(), shadow_only, 0, 0, 0, untextured);
 		if (is_emissive) {s.set_color_e(BLACK);}
 		if (is_sink) {water_draw.add_water_for_sink(obj);}
 		obj_drawn = 1;
@@ -863,12 +1000,12 @@ void building_room_geom_t::draw(shader_t &s, building_t const &building, occlusi
 		else {assert(0);}
 	}
 	// alpha blended, should be drawn near last
-	if (!shadow_only) {decal_manager.draw_building_interior_decals(player_in_building);} // draw decals in this building
+	decal_manager.draw_building_interior_decals(player_in_building, shadow_only); // draw decals in this building
 	
 	if (!shadow_only && !mats_alpha.empty()) { // draw last; not shadow casters; for shower glass, etc.
 		enable_blend();
 		glDepthMask(GL_FALSE); // disable depth writing
-		mats_alpha.draw(s, shadow_only, reflection_pass);
+		mats_alpha.draw(bbd, s, shadow_only, reflection_pass);
 		glDepthMask(GL_TRUE);
 		disable_blend();
 		indexed_vao_manager_with_shadow_t::post_render();
@@ -973,16 +1110,32 @@ void paint_draw_t::draw_paint() const {
 	glDepthMask(GL_TRUE);
 }
 
-void building_decal_manager_t::draw_building_interior_decals(bool player_in_building) const {
+void building_decal_manager_t::commit_pend_tape_qbd() {
+	pend_tape_qbd.add_quads(tape_qbd);
+	pend_tape_qbd.clear();
+}
+void building_decal_manager_t::draw_building_interior_decals(bool player_in_building, bool shadow_only) const {
+	if (shadow_only) { // shadow pass, draw tape only
+		if (player_in_building) {
+			tape_qbd.draw(); // somewhat inefficient, since we have to send all the data for every light source
+			pend_tape_qbd.draw();
+		}
+		return;
+	}
 	paint_draw[1].draw_paint(); // draw exterior paint always - this will show up on windows (even when looking outside into another part of the same building)
 	if (!player_in_building) return;
 	paint_draw[0].draw_paint(); // draw interior paint
 
-	if (!tp_qbd.empty()) { // toilet paper squares
+	if (!tp_qbd.empty()) { // toilet paper squares: double sided, lit from top
 		glDisable(GL_CULL_FACE); // draw both sides
 		select_texture(WHITE_TEX);
 		tp_qbd.draw(); // use a VBO for this if the player leaves the building and then comes back?
 		glEnable(GL_CULL_FACE);
+	}
+	if (!tape_qbd.empty() || !pend_tape_qbd.empty()) { // tape lines: single sided so that lighting works, both sides drawn independently
+		select_texture(WHITE_TEX);
+		tape_qbd.draw();
+		pend_tape_qbd.draw();
 	}
 	if (!blood_qbd.empty()) {
 		select_texture(BLOOD_SPLAT_TEX);

@@ -35,37 +35,37 @@
     <ConfigurationType>Application</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Tracy|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Tracy|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -264,7 +264,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <AdditionalIncludeDirectories>dependencies\meshoptimizer\src;dependencies\glew-2.0.0\include;Targa;C:\Program Files %28x86%29\OpenAL 1.1 SDK\include;dependencies\freealut\include;dependencies\libpng-1.2.20;dependencies\zlib-1.2.1;dependencies\tiff-4.3.0\libtiff;dependencies\glm;dependencies\freeglut-2.8.1\include\GL;dependencies\gli;src;dependencies\libjpeg-turbo</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>dependencies\meshoptimizer\src;dependencies\glew-2.0.0\include;Targa;dependencies\openal-soft\include\AL;dependencies\freealut\include;dependencies\libpng-1.2.20;dependencies\zlib-1.2.1;dependencies\tiff-4.3.0\libtiff;dependencies\glm;dependencies\freeglut-2.8.1\include\GL;dependencies\gli;src;dependencies\libjpeg-turbo;dependencies\openal-soft\include</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;ENABLE_JPEG;ENABLE_PNG;ENABLE_TIFF;ENABLE_DDS;_CRT_SECURE_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -296,7 +296,7 @@
       <AdditionalDependencies>jpeg-static.lib;libpng.lib;zlibstat.lib;openal32.lib;alut.lib;glew32.lib;tiff.lib;freeglut.lib</AdditionalDependencies>
       <OutputFile>.\Debug/3DWorld.exe</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>dependencies\glew-2.0.0\lib\Release\x64;C:\Program Files %28x86%29\OpenAL 1.1 SDK\libs\Win64;dependencies\freealut\admin\VisualStudioDotNET\x64\Debug;dependencies\libpng-1.2.20\projects\visualc71\Win64_LIB_Release;dependencies\zlib-1.2.11\contrib\vstudio\vc14\x64\ZlibStatRelease;E:\Frank\Desktop\Frank\CS184\3DWorld_git\dependencies\tiff-4.3.0\libtiff\RelWithDebInfo;dependencies\freeglut-2.8.1\lib\x64\Debug;dependencies\libjpeg-turbo\RelWithDebInfo</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>dependencies\glew-2.0.0\lib\Release\x64;dependencies\openal-soft\Release;dependencies\freealut\admin\VisualStudioDotNET\x64\Debug;dependencies\libpng-1.2.20\projects\visualc71\Win64_LIB_Release;dependencies\zlib-1.2.11\contrib\vstudio\vc14\x64\ZlibStatRelease;dependencies\tiff-4.3.0\libtiff\RelWithDebInfo;dependencies\freeglut-2.8.1\lib\x64\Debug;dependencies\libjpeg-turbo\RelWithDebInfo</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>MSVCRT;LIBCMT;LIBCMTD;%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ProgramDatabaseFile>.\Debug/3DWorld.pdb</ProgramDatabaseFile>
@@ -315,7 +315,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <AdditionalIncludeDirectories>dependencies\meshoptimizer\src;dependencies\glew-2.0.0\include;Targa;C:\Program Files %28x86%29\OpenAL 1.1 SDK\include;dependencies\freealut\include;dependencies\libpng-1.2.20;dependencies\zlib-1.2.1;dependencies\tiff-4.3.0\libtiff;dependencies\glm;dependencies\freeglut-2.8.1\include\GL;dependencies\gli;src;dependencies\libjpeg-turbo</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>dependencies\meshoptimizer\src;dependencies\glew-2.0.0\include;Targa;dependencies\openal-soft\include\AL;dependencies\freealut\include;dependencies\libpng-1.2.20;dependencies\zlib-1.2.1;dependencies\tiff-4.3.0\libtiff;dependencies\glm;dependencies\freeglut-2.8.1\include\GL;dependencies\gli;src;dependencies\libjpeg-turbo;dependencies\openal-soft\include</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;ENABLE_JPEG;ENABLE_PNG;_CRT_SECURE_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -346,7 +346,7 @@
       <AdditionalDependencies>libjpeg.lib;libpng.lib;zlib.lib;openal32.lib;alut.lib;pthreadVCE.lib;glew32.lib;glut64.lib</AdditionalDependencies>
       <OutputFile>.\Debug/3DWorld.exe</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>dependencies\glew-2.0.0\lib\Release\x64;C:\Program Files %28x86%29\OpenAL 1.1 SDK\libs\Win64;dependencies\freealut\admin\VisualStudioDotNET\x64\Debug;dependencies\libpng-1.2.20\projects\visualc71\Win64_LIB_Release;dependencies\zlib-1.2.11\contrib\vstudio\vc14\x64\ZlibStatRelease;E:\Frank\Desktop\Frank\CS184\3DWorld_git\dependencies\tiff-4.3.0\libtiff\RelWithDebInfo;dependencies\freeglut-2.8.1\lib\x64\Debug;dependencies\libjpeg-turbo\RelWithDebInfo</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>dependencies\glew-2.0.0\lib\Release\x64;dependencies\openal-soft\Release;dependencies\freealut\admin\VisualStudioDotNET\x64\Debug;dependencies\libpng-1.2.20\projects\visualc71\Win64_LIB_Release;dependencies\zlib-1.2.11\contrib\vstudio\vc14\x64\ZlibStatRelease;dependencies\tiff-4.3.0\libtiff\RelWithDebInfo;dependencies\freeglut-2.8.1\lib\x64\Debug;dependencies\libjpeg-turbo\RelWithDebInfo</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>MSVCRT;%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ProgramDatabaseFile>.\Debug/3DWorld.pdb</ProgramDatabaseFile>
@@ -418,7 +418,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <WholeProgramOptimization>true</WholeProgramOptimization>
-      <AdditionalIncludeDirectories>dependencies\meshoptimizer\src;dependencies\glew-2.0.0\include;Targa;C:\Program Files %28x86%29\OpenAL 1.1 SDK\include;dependencies\freealut\include;dependencies\libpng-1.2.20;dependencies\zlib-1.2.1;dependencies\tiff-4.3.0\libtiff;dependencies\glm;dependencies\freeglut-2.8.1\include\GL;dependencies\gli;src;dependencies\libjpeg-turbo</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>dependencies\meshoptimizer\src;dependencies\glew-2.0.0\include;Targa;dependencies\openal-soft\include\AL;dependencies\freealut\include;dependencies\libpng-1.2.20;dependencies\zlib-1.2.1;dependencies\tiff-4.3.0\libtiff;dependencies\glm;dependencies\freeglut-2.8.1\include\GL;dependencies\gli;src;dependencies\libjpeg-turbo;dependencies\openal-soft\include</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_CONSOLE;ENABLE_JPEG;ENABLE_PNG;ENABLE_TIFF;ENABLE_DDS;_CRT_SECURE_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -447,7 +447,7 @@
       <AdditionalDependencies>jpeg-static.lib;libpng.lib;zlibstat.lib;openal32.lib;alut.lib;glew32.lib;tiff.lib;freeglut.lib</AdditionalDependencies>
       <OutputFile>.\Release/3DWorld.exe</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>dependencies\glew-2.0.0\lib\Release\x64;C:\Program Files %28x86%29\OpenAL 1.1 SDK\libs\Win64;dependencies\freealut\admin\VisualStudioDotNET\x64\Debug;dependencies\libpng-1.2.20\projects\visualc71\Win64_LIB_Release;dependencies\zlib-1.2.11\contrib\vstudio\vc14\x64\ZlibStatRelease;E:\Frank\Desktop\Frank\CS184\3DWorld_git\dependencies\tiff-4.3.0\libtiff\RelWithDebInfo;dependencies\freeglut-2.8.1\lib\x64\Debug;dependencies\libjpeg-turbo\RelWithDebInfo</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>dependencies\glew-2.0.0\lib\Release\x64;dependencies\openal-soft\Release;dependencies\freealut\admin\VisualStudioDotNET\x64\Debug;dependencies\libpng-1.2.20\projects\visualc71\Win64_LIB_Release;dependencies\zlib-1.2.11\contrib\vstudio\vc14\x64\ZlibStatRelease;dependencies\tiff-4.3.0\libtiff\RelWithDebInfo;dependencies\freeglut-2.8.1\lib\x64\Debug;dependencies\libjpeg-turbo\RelWithDebInfo</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>MSVCRT;%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
       <SubSystem>Console</SubSystem>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
@@ -488,6 +488,7 @@
     <ClCompile Include="src\building_lighting.cpp" />
     <ClCompile Include="src\building_navigation.cpp" />
     <ClCompile Include="src\building_pictures.cpp" />
+    <ClCompile Include="src\building_query.cpp" />
     <ClCompile Include="src\building_reflections.cpp" />
     <ClCompile Include="src\building_rooms.cpp" />
     <ClCompile Include="src\building_room_geom.cpp" />
@@ -520,6 +521,7 @@
     <ClCompile Include="src\cars.cpp" />
     <ClCompile Include="src\city_building_params.cpp" />
     <ClCompile Include="src\city_gen.cpp" />
+    <ClCompile Include="src\city_interact.cpp" />
     <ClCompile Include="src\city_model.cpp" />
     <ClCompile Include="src\city_objects.cpp" />
     <ClCompile Include="src\city_terrain.cpp" />

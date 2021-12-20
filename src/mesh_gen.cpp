@@ -203,7 +203,7 @@ void gen_mesh_sine_table(float **matrix, int x_offset, int y_offset, int xsize, 
 
 	assert(matrix);
 	mesh_xy_grid_cache_t height_gen;
-	height_gen.build_arrays((x_offset - xsize/2)*DX_VAL, (y_offset - ysize/2)*DY_VAL, DX_VAL, DY_VAL, xsize, ysize);
+	height_gen.build_arrays(float(x_offset - xsize/2)*DX_VAL, float(y_offset - ysize/2)*DY_VAL, DX_VAL, DY_VAL, xsize, ysize);
 
 	for (int i = 0; i < ysize; ++i) {
 		for (int j = 0; j < xsize; ++j) {matrix[i][j] = height_gen.eval_index(j, i);}
@@ -222,7 +222,7 @@ void gen_rand_sine_table_entries(float scaled_height) {
 	float xf_scale((float)MESH_Y_SIZE/(float)MESH_X_SIZE), yf_scale(1.0/xf_scale);
 	if (X_SCENE_SIZE > Y_SCENE_SIZE) yf_scale *= (float)Y_SCENE_SIZE/(float)X_SCENE_SIZE;
 	if (Y_SCENE_SIZE > X_SCENE_SIZE) xf_scale *= (float)X_SCENE_SIZE/(float)Y_SCENE_SIZE;
-	float mags[NUM_FREQ_COMP], freqs[NUM_FREQ_COMP];
+	float mags[NUM_FREQ_COMP] = {}, freqs[NUM_FREQ_COMP] = {};
 	// Note: none of these config values are error checked, maybe should at least check >= 0.0
 	freqs[0] = MESH_START_FREQ;
 	mags [0] = MESH_START_MAG;
@@ -397,7 +397,7 @@ void glaciate() {
 		for (int j = 0; j < MESH_X_SIZE; ++j) {
 			float &zval(mesh_height[i][j]);
 			apply_glaciate(zval);
-			apply_mesh_sine(zval, (j + xoff2 - MESH_X_SIZE/2), (i + yoff2 - MESH_Y_SIZE/2));
+			apply_mesh_sine(zval, float(j + xoff2 - MESH_X_SIZE/2), float(i + yoff2 - MESH_Y_SIZE/2));
 			zbottom = min(zbottom, zval);
 			ztop    = max(ztop, zval);
 		}
@@ -587,7 +587,6 @@ void gen_rx_ry(float &rx, float &ry) {
 	ry = rgen.rand_float() + 1.0;
 }
 
-
 bool mesh_xy_grid_cache_t::build_arrays(float x0, float y0, float dx, float dy,
 	unsigned nx, unsigned ny, bool cache_values, bool force_sine_mode, bool no_wait)
 {
@@ -614,16 +613,17 @@ bool mesh_xy_grid_cache_t::build_arrays(float x0, float y0, float dx, float dy,
 		float const x_mult(msx*sinTable[k][4]), y_mult(msy*sinTable[k][3]), y_scale(mesh_scale_z_inv*sinTable[k][0]);
 		float const x_const(ms2*sinTable[k][4] + sinTable[k][2] + x_mult*x0), y_const(ms2*sinTable[k][3] + sinTable[k][1] + y_mult*y0);
 		float const xmdx(x_mult*dx), ymdy(y_mult*dy);
+		float *x_ptr(xyterms.data() + k), *y_ptr(x_ptr + yterms_start);
 
 		for (unsigned i = 0; i < nx; ++i) {
 			float sin_val(SINF(xmdx*i + x_const));
 			//apply_noise_shape_per_term(sin_val, gen_shape);
-			xyterms[i*F_TABLE_SIZE+k] = sin_val;
+			x_ptr[i*F_TABLE_SIZE] = sin_val;
 		}
 		for (unsigned i = 0; i < ny; ++i) {
 			float sin_val(SINF(ymdy*i + y_const));
 			//apply_noise_shape_per_term(sin_val, gen_shape);
-			xyterms[yterms_start + i*F_TABLE_SIZE+k] = y_scale*sin_val;
+			y_ptr[i*F_TABLE_SIZE] = y_scale*sin_val;
 		}
 	}
 	if (cache_values) {
@@ -767,8 +767,8 @@ float mesh_xy_grid_cache_t::eval_index(unsigned x, unsigned y, int min_start_sin
 		zval += get_noise_zval(xval, yval, gen_mode, gen_shape);
 	}
 	else { // sine tables
-		float const *const xptr(&xyterms.front() + x*F_TABLE_SIZE);
-		float const *const yptr(&xyterms.front() + yterms_start + y*F_TABLE_SIZE);
+		float const *const xptr(xyterms.data() + x*F_TABLE_SIZE);
+		float const *const yptr(xyterms.data() + yterms_start + y*F_TABLE_SIZE);
 		int const start_ix(max(start_eval_sin, min_start_sin));
 		// performance critical
 		if (start_ix == 0) { // common case

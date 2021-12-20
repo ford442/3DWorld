@@ -94,7 +94,8 @@ int reset_timing(0), read_heightmap(0), default_ground_tex(-1), num_dodgeballs(1
 int enable_fsource(0), run_forward(0), advanced(0), dynamic_mesh_scroll(0);
 int read_snow_file(0), write_snow_file(0), mesh_detail_tex(NOISE_TEX);
 int read_light_files[NUM_LIGHTING_TYPES] = {0}, write_light_files[NUM_LIGHTING_TYPES] = {0};
-unsigned num_snowflakes(0), create_voxel_landscape(0), hmap_filter_width(0), num_dynam_parts(100), snow_coverage_resolution(2), num_birds_per_tile(2), num_fish_per_tile(15);
+unsigned num_snowflakes(0), create_voxel_landscape(0), hmap_filter_width(0), num_dynam_parts(100), snow_coverage_resolution(2);
+unsigned num_birds_per_tile(2), num_fish_per_tile(15), num_bflies_per_tile(4);
 unsigned erosion_iters(0), erosion_iters_tt(0), video_framerate(60), num_video_threads(0), skybox_tid(0), tiled_terrain_gen_heightmap_sz(0);
 float NEAR_CLIP(DEF_NEAR_CLIP), FAR_CLIP(DEF_FAR_CLIP), system_max_orbit(1.0), sky_occlude_scale(0.0), tree_slope_thresh(5.0), mouse_sensitivity(1.0), tt_grass_scale_factor(1.0);
 float water_plane_z(0.0), base_gravity(1.0), crater_depth(1.0), crater_radius(1.0), disabled_mesh_z(FAR_CLIP), vegetation(1.0), atmosphere(1.0), biome_x_offset(0.0);
@@ -175,8 +176,8 @@ void apply_grass_scale();
 void take_screenshot_texture();
 void teleport_to_map_location();
 void building_gameplay_action_key(int mode, bool mouse_wheel);
-void building_gameplay_switch_item(bool dir);
 float get_player_building_speed_mult();
+void toggle_city_spectate_mode();
 
 
 // all OpenGL error handling goes through these functions
@@ -581,6 +582,7 @@ void resize(int x, int y) {
 	if (init_resize) {init_resize = 0;}
 	else {add_uevent_resize(x, y);}
 	y = y & (~1); // make sure y is even (required for video encoding)
+	x = x & (~1); // make sure x is even (required for video encoding)
  	glViewport(0, 0, x, y);
  	window_width  = x;
  	window_height = y;
@@ -779,6 +781,11 @@ void toggle_camera_mode() {
 	if (camera_mode == 1) {camera_invincible = 1;} // in air (else on ground)
 }
 
+void update_precip_rate_verbose(float val) {
+	update_precip_rate(val);
+	cout << ((val > 1.0) ? "increase" : "decrease") << " precip to " << obj_groups[coll_id[PRECIP]].max_objs << endl;
+}
+
 
 // This function is called whenever there is a keyboard input;
 // key is the ASCII value of the key pressed (esc = 27, enter = 13, backspace = 8, tab = 9, del = 127);
@@ -835,7 +842,7 @@ void keyboard_proc(unsigned char key, int x, int y) {
 
 	case 'x': // toggle animation
 		animate = !animate;
-		if (animate) reset_timing = 1;
+		if (animate) {reset_timing = 1;}
 		break;
 	case 't': // animation - movement (freeze frame on objects), show star streams in universe mode
 		animate2 = !animate2;
@@ -978,7 +985,7 @@ void keyboard_proc(unsigned char key, int x, int y) {
 			rand_gen_index = rand(); // Note: doesn't set mesh_rgen_index
 
 			if (world_mode == WMODE_GROUND) {
-				//gen_scenery();
+				//gen_scenery(t_trees);
 				//regen_trees(0);
 				gen_scene(0, 1, 1, 0, 1);
 			}
@@ -1080,12 +1087,10 @@ void keyboard_proc(unsigned char key, int x, int y) {
 		break;
 
 	case 'N': // decrease precipitation rate by 1.5X
-		update_precip_rate(1.0/1.5);
-		cout << "decrease precip to " << obj_groups[coll_id[PRECIP]].max_objects() << endl;
+		update_precip_rate_verbose(1.0/1.5);
 		break;
 	case 'M': // increase precipitation rate by 1.5X
-		update_precip_rate(1.5);
-		cout << "increase precip to " << obj_groups[coll_id[PRECIP]].max_objects() << endl;
+		update_precip_rate_verbose(1.5);
 		break;
 
 	case 'H': // save mesh state/modmap/voxel brushes/cobj file/materials/heightmap
@@ -1354,6 +1359,7 @@ void keyboard2(int key, int x, int y) { // handling of special keys
 		break;
 
 	case GLUT_KEY_F8: // toggle spectator gameplay mode
+		if (world_mode == WMODE_INF_TERRAIN && have_buildings()) {toggle_city_spectate_mode(); break;}
 		if (!spectate && (num_smileys == 0 || !obj_groups[coll_id[SMILEY]].enabled)) break;
 		if (spectate) {camera_reset = camera_change = 1;}
 		spectate = !spectate;
@@ -1482,20 +1488,26 @@ void alloc_if_req(char *&fn, const char *def_fn=nullptr) {
 
 bool load_config_file(const char *fn) {
 
-	string config_file;
+	string line, config_file;
 	ifstream in(fn);
 	if (!in.good()) return 0;
 
-	while (in >> config_file) {
-		if (!config_file.empty() && config_file[0] != '#') { // not commented out
-			cout << "Using config file " << config_file << "." << endl;
+	while (std::getline(in, line)) {
+		if (line.empty() || line[0] == '#') continue; // comment
+		config_file.clear();
 
-			if (!load_config(config_file)) {
-				cerr << "Error: Failed to open config file " << config_file << " for read" << endl;
-				return 0;
-			}
+		for (auto const &c : line) {
+			if (isspace(c) || c == '#') break; // ignore anything after the first string - assume it's a comment
+			config_file.push_back(c);
 		}
-	}
+		if (config_file.empty()) continue;
+		cout << "Using config file " << config_file << "." << endl;
+
+		if (!load_config(config_file)) {
+			cerr << "Error: Failed to open config file " << config_file << " for read" << endl;
+			return 0;
+		}
+	} // end while
 	min_eq(NEAR_CLIP, 0.5f*CAMERA_RADIUS); // make sure the player's view can't clip through scene objects
 	return 1;
 }
@@ -1746,6 +1758,7 @@ int load_config(string const &config_file) {
 	kwmu.add("num_dynam_parts", num_dynam_parts);
 	kwmu.add("num_birds_per_tile", num_birds_per_tile);
 	kwmu.add("num_fish_per_tile", num_fish_per_tile);
+	kwmu.add("num_bflies_per_tile", num_bflies_per_tile);
 	kwmu.add("max_cube_map_tex_sz", max_cube_map_tex_sz);
 	kwmu.add("snow_coverage_resolution", snow_coverage_resolution);
 	kwmu.add("dlight_grid_bitshift", DL_GRID_BS);
@@ -2218,7 +2231,7 @@ int main(int argc, char** argv) {
 	glutInitWindowSize(window_width, window_height);
 
 	if (init_core_context) {
-		glutInitContextVersion(4, 3);
+		glutInitContextVersion(4, 5);
 		glutInitContextFlags(GLUT_CORE_PROFILE
 #if _DEBUG
 			| GLUT_DEBUG
@@ -2241,7 +2254,7 @@ int main(int argc, char** argv) {
 	uevent_advance_frame();
 	--frame_counter;
 
-	if (0) { // reversed Z-buffer; OpenGL 4.5 only
+	if (0) { // reversed Z-buffer; OpenGL 4.5 only; appears to break shadows
 		// see https://www.wedesoft.de/software/2021/09/20/reversed-z-rendering/
 		glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
 	}

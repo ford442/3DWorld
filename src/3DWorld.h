@@ -163,11 +163,14 @@ template<typename T> struct point2d { // size = 8
 	point2d() : x(0.0), y(0.0) {}
 	point2d(T x_, T y_) : x(x_), y(y_) {}
 	point2d(point2d const &a, point2d const &b) : x(a.x - b.x), y(a.y - b.y) {}
+	void assign(T x_, T y_) {x = x_; y = y_;}
 	bool operator==(point2d const &p) const {return (x == p.x && y == p.y);}
 	bool operator!=(point2d const &p) const {return (x != p.x || y != p.y);}
 	T mag_sq() const {return (x*x + y*y);}
 	T mag()    const {return sqrt(mag_sq());}
 	T cp_mag(point2d const &p) const {return (x*p.y - y*p.x);}
+	T get_max_val() const {return std::max(x, y);}
+	T get_min_val() const {return std::min(x, y);}
 	void operator+=(point2d const &p) {x += p.x; y += p.y;}
 	void operator-=(point2d const &p) {x -= p.x; y -= p.y;}
 	void operator*=(point2d const &p) {x *= p.x; y *= p.y;} // component multiply
@@ -214,13 +217,14 @@ typedef point2d<float> vector2d;
 
 template<typename T> struct pointT { // size = 12 (float), 24(double)
 
+	typedef T value_type;
 	T x, y, z;
 
 	pointT() : x(0.0), y(0.0), z(0.0) {}
 	//pointT(T v) : x(v), y(v), z(v) {} // unsafe?
 	pointT(T x_, T y_, T z_) : x(x_), y(y_), z(z_) {}
 	pointT(pointT const &p1, pointT const &p2) : x(p1.x-p2.x), y(p1.y-p2.y), z(p1.z-p2.z) {} // take the difference (vector)
-	template<typename S> pointT(S const &p) : x(p.x), y(p.y), z(p.z) {}
+	template<typename S> pointT(pointT<S> const &p) : x(p.x), y(p.y), z(p.z) {}
 
 	std::string str() const {std::ostringstream oss; oss << x << ", " << y << ", " << z; return oss.str();}
 	std::string raw_str() const {std::ostringstream oss; oss << x << " " << y << " " << z; return oss.str();}
@@ -281,6 +285,8 @@ template<typename T> struct pointT { // size = 12 (float), 24(double)
 		if (z == 0.0) {z = TOLERANCE;}
 		x = 1.0/x; y = 1.0/y; z = 1.0/z;
 	}
+	pointT inverse() const {return pointT(1.0/x, 1.0/y, 1.0/z);} // no divide by zero check
+
 	pointT get_norm() const {
 		T const vmag(mag());
 		return ((vmag < TOLERANCE) ? *this : pointT(x/vmag, y/vmag, z/vmag));
@@ -343,6 +349,23 @@ vector3d const plus_y(0, 1, 0);
 vector3d const plus_z(0, 0, 1);
 vector3d const zero_vector(0, 0, 0);
 vector3d const all_ones(1, 1, 1);
+
+
+template<typename T> uint32_t jenkins_one_at_a_time_hash(const T* key, size_t length) { // T is an unsigned integer type
+	size_t i = 0;
+	uint32_t hash = 0;
+	while (i != length) {hash += key[i++]; hash += hash << 10; hash ^= hash >> 6;}
+	hash += hash << 3;
+	hash ^= hash >> 11;
+	hash += hash << 15;
+	return hash;
+}
+
+template<typename T> struct hash_by_bytes { // should work with all packed vertex types
+	uint32_t operator()(T const &v) const {return jenkins_one_at_a_time_hash((const uint8_t*)&v, sizeof(T));} // slower but better quality hash
+	//uint32_t operator()(T const &v) const {return jenkins_one_at_a_time_hash((const uint32_t*)&v, sizeof(T)>>2);} // faster but lower quality hash
+};
+inline unsigned hash_point(point const &p) {return hash_by_bytes<point>()(p);}
 
 
 struct vector4d : public vector3d { // size = 16
@@ -660,7 +683,8 @@ struct pos_dir_up { // defines a view frustum
 	bool sphere_visible_test_no_inside_test(point const &pos_, float radius) const;
 	bool sphere_completely_visible_test(point const &pos_, float radius) const {return sphere_visible_test(pos_, -radius);}
 	template<unsigned N> bool pt_set_visible(point const *const pts) const;
-	bool cube_visible(cube_t const &cube) const;
+	bool cube_visible(cube_t const &c) const;
+	bool cube_completely_visible(cube_t const &c) const;
 	bool cube_visible_likely(cube_t const &c) const {return (!valid || point_visible_test(c.get_cube_center()) || cube_visible(c));}
 	bool cube_visible_for_light_cone(cube_t const &c) const;
 	bool projected_cube_visible(cube_t const &cube, point const &proj_pt) const;
@@ -925,8 +949,7 @@ template<typename T> struct triangle_t {
 };
 
 typedef triangle_t<point>        triangle;
-typedef triangle_t<point_d>      triangle_d;
-typedef triangle_t<vert_tc_t>    triangle_vtc; // unused
+typedef triangle_t<point_d>      triangle_d; // unused
 typedef triangle_t<vert_norm_tc> triangle_vntc;
 
 

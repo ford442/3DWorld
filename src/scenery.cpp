@@ -6,6 +6,8 @@
 #include "mesh.h"
 #include "shaders.h"
 #include "gl_ext_arb.h"
+#include "tree_leaf.h" // for tree_type
+#include "tree_3dw.h" // for get_closest_tree_type
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
@@ -44,9 +46,10 @@ extern int num_trees, xoff2, yoff2, rand_gen_index, window_width, do_zoom, displ
 extern float zmin, zmax_est, water_plane_z, tree_scale, vegetation, fticks, ocean_wave_height;
 extern pt_line_drawer tree_scenery_pld; // we can use this for plant trunks
 extern voxel_params_t global_voxel_params;
+extern tree_type tree_types[];
 
 
-int get_bark_tex_for_tree_type(int type);
+int get_bark_tex_for_tree_type(int type); // for small trees
 bool is_pine_tree_type(int type);
 
 
@@ -566,23 +569,22 @@ void burnable_scenery_obj::draw_fire(fire_drawer_t &fire_drawer, float rscale, u
 
 void wood_scenery_obj::calc_type() {type = (char)get_tree_type_from_height(pos.z, global_rand_gen, 1);}
 
-int get_closest_tree_bark_tid(point const &pos);
-colorRGBA get_closest_tree_bark_color(point const &pos);
-
 bool wood_scenery_obj::is_from_large_trees() const {
 	if (tree_mode == 0) return 0; // no trees enabled: any solution is acceptable, so use the simplest one
 	if (tree_mode == 2) return 0; // small trees only: correct/simple
 	if (tree_mode == 3) return !is_pine_tree_type(type); // both large and small trees: choose based on pine vs. decid tree type
 	return 1;
 }
+void wood_scenery_obj::cache_closest_tree_type(tree_cont_t const &trees) {
+	if (closest_tree_type < 0) {closest_tree_type = trees.get_closest_tree_type(pos);} // compute once and cache
+}
 int wood_scenery_obj::get_tid() const {
-	if (!is_from_large_trees()) {return get_bark_tex_for_tree_type(type);}
+	if (!is_from_large_trees()) {return get_bark_tex_for_tree_type(type);} // small tree
 	// else large trees only, or large (non-pine) trees at this height
-	if (closest_bark_tid < 0) {closest_bark_tid = get_closest_tree_bark_tid(pos);}
-	return closest_bark_tid;
+	return tree_types[closest_tree_type].bark_tex;
 }
 colorRGBA wood_scenery_obj::get_bark_color(vector3d const &xlate) const {
-	colorRGBA const base_color((is_from_large_trees() ? get_closest_tree_bark_color(pos) : get_tree_trunk_color(type, 0)));
+	colorRGBA const base_color(is_from_large_trees() ? tree_types[closest_tree_type].barkc : get_tree_trunk_color(type, 0));
 	return get_atten_color(blend_color(BLACK, base_color, burn_amt, 0), xlate);
 }
 
@@ -684,6 +686,7 @@ void s_stump::add_cobjs() {
 }
 
 bool s_stump::check_sphere_coll(point &center, float sphere_radius) const {
+	if (!dist_less_than(center, pos, (max(height, max(radius, radius2)) + sphere_radius))) return 0; // sphere-sphere coll optimization
 	return sphere_vert_cylin_intersect(center, sphere_radius, cylinder_3dw(pos-point(0.0, 0.0, 0.2*height), pos+point(0.0, 0.0, height), radius, radius));
 }
 
@@ -776,11 +779,12 @@ void s_plant::add_cobjs() {
 	cpos2.z += 3.0*height/(36.0*height + 4.0);
 	bpos.z  -= 0.1*height;
 	coll_id  = add_coll_cylinder(cpos2, cpos, r2, radius, cobj_params(0.4, get_leaf_color(), 0, 0, NULL, 0, get_leaf_tid())); // leaves
-	coll_id2 = add_coll_cylinder(bpos, cpos, radius, 0.0, cobj_params(0.4, get_stem_color(), 0, 0, NULL, 0, WOOD_TEX)); // trunk
+	coll_id2 = add_coll_cylinder(bpos, cpos, radius, 0.0, cobj_params(0.4, get_stem_color(), 0, 0, NULL, 0, WOOD_TEX      )); // trunk
 }
 
 bool s_plant::check_sphere_coll(point &center, float sphere_radius) const { // used in tiled terrain mode
-	return sphere_vert_cylin_intersect(center, sphere_radius, cylinder_3dw(pos-point(0.0, 0.0, 0.1*height), pos+point(0.0, 0.0, height), radius, radius));
+	if (!dist_less_than(center, pos, (0.5f*(height + radius) + sphere_radius))) return 0; // sphere-sphere coll optimization
+	return sphere_vert_cylin_intersect(center, sphere_radius, cylinder_3dw(pos-point(0.0, 0.0, 0.1*height), get_top_pt(), radius, radius));
 }
 
 void s_plant::create_leaf_points(vector<vert_norm_comp> &points, float plant_scale, float nlevels_scale, unsigned nrings) const {
@@ -860,15 +864,16 @@ bool s_plant::is_shadowed() const {
 	return 1;
 }
 
+bool s_plant::is_water_plant() const {return (type >= (int)NUM_LAND_PLANT_TYPES);}
+
 void s_plant::draw_stem(float sscale, bool shadow_only, bool reflection_pass, vector3d const &xlate) const {
 
-	bool const is_water_plant(type >= (int)NUM_LAND_PLANT_TYPES);
-	if (world_mode == WMODE_INF_TERRAIN && is_water_plant && (reflection_pass || (!shadow_only && pos.z < water_plane_z && get_camera_pos().z > water_plane_z))) return; // underwater, skip
+	if (world_mode == WMODE_INF_TERRAIN && is_water_plant() && (reflection_pass || (!shadow_only && pos.z < water_plane_z && get_camera_pos().z > water_plane_z))) return; // underwater, skip
 	point const pos2(pos + xlate + point(0.0, 0.0, 0.5*height));
 	if (!check_visible(shadow_only, (height + radius), pos2)) return;
 	bool const shadowed(shadow_only ? 0 : is_shadowed());
 	colorRGBA color(get_stem_color()*(shadowed ? SHADOW_VAL : 1.0));
-	if (is_water_plant && !shadow_only) {water_color_atten_at_pos(color, pos+xlate);}
+	if (is_water_plant() && !shadow_only) {water_color_atten_at_pos(color, pos+xlate);}
 	float const dist(distance_to_camera(pos2));
 
 	if (!shadow_only && 2*get_pt_line_thresh()*radius < dist) { // draw as line
@@ -877,7 +882,7 @@ void s_plant::draw_stem(float sscale, bool shadow_only, bool reflection_pass, ve
 	else {
 		int const ndiv(max(3, min(N_CYL_SIDES, (shadow_only ? get_def_smap_ndiv(2.0*radius) : int(2.0*sscale*radius/dist)))));
 		if (!shadow_only) {color.set_for_cur_shader();}
-		draw_fast_cylinder((pos - point(0.0, 0.0, 0.1*height)), (pos + point(0.0, 0.0, height)), radius, 0.0, ndiv, !shadow_only, 0, 0, nullptr, 6.0);
+		draw_fast_cylinder((pos - point(0.0, 0.0, 0.1*height)), get_top_pt(), radius, 0.0, ndiv, !shadow_only, 0, 0, nullptr, 6.0);
 	}
 }
 
@@ -903,13 +908,12 @@ void s_plant::shader_state_t::set_wind_add(shader_t &s, float w_add) {
 void s_plant::draw_leaves(shader_t &s, vbo_vnc_block_manager_t &vbo_manager, bool shadow_only, bool reflection_pass, vector3d const &xlate, shader_state_t &state) const {
 
 	if (burn_amt == 1.0) return;
-	bool const is_water_plant(type >= (int)NUM_LAND_PLANT_TYPES);
-	if (world_mode == WMODE_INF_TERRAIN && is_water_plant && (reflection_pass || (!shadow_only && pos.z < water_plane_z && get_camera_pos().z > water_plane_z))) return; // underwater, skip
+	if (world_mode == WMODE_INF_TERRAIN && is_water_plant() && (reflection_pass || (!shadow_only && pos.z < water_plane_z && get_camera_pos().z > water_plane_z))) return; // underwater, skip
 	point const pos2(pos + xlate + point(0.0, 0.0, 0.5*height));
 	if (!check_visible(shadow_only, 0.5f*(height + radius), pos2)) return;
 	bool const shadowed((shadow_only || (ENABLE_PLANT_SHADOWS && shadow_map_enabled())) ? 0 : is_shadowed());
-	float const wind_scale(berries.empty() ? (is_water_plant ? 5.0 : 1.0) : 0.0); // no wind if this plant type has berries
-	bool const set_color(!shadow_only && (is_water_plant || burn_amt > 0.0));
+	float const wind_scale(berries.empty() ? (is_water_plant() ? 5.0 : 1.0) : 0.0); // no wind if this plant type has berries
+	bool const set_color(!shadow_only && (is_water_plant() || burn_amt > 0.0));
 	if (set_color) {state.set_color_scale(s, get_plant_color(xlate));}
 	if (shadowed) {state.set_normal_scale(s, 0.0);}
 	state.set_wind_scale(s, wind_scale);
@@ -1244,7 +1248,7 @@ void scenery_group::add_leafy_plant(point const &pos, float radius, int type, in
 
 bool check_valid_scenery_pos(scenery_obj const &obj) {return check_valid_scenery_pos(obj.get_pos(), obj.get_radius());}
 
-void scenery_group::gen(int x1, int y1, int x2, int y2, float vegetation_, bool fixed_sz_rock_cache) {
+void scenery_group::gen(int x1, int y1, int x2, int y2, float vegetation_, bool fixed_sz_rock_cache, tree_cont_t const &trees) { // called in tiled terrain mode
 
 	//RESET_TIME;
 	unsigned const smod(max(200U, unsigned(3.321f*XY_MULT_SIZE/(tree_scale+1))));
@@ -1319,10 +1323,10 @@ void scenery_group::gen(int x1, int y1, int x2, int y2, float vegetation_, bool 
 		} // for j
 	} // for i
 	if (!fixed_sz_rock_cache) {surface_rock_cache.clear_unref();}
-	post_gen_setup();
+	post_gen_setup(trees);
 }
 
-void scenery_group::post_gen_setup() {
+void scenery_group::post_gen_setup(tree_cont_t const &trees) {
 
 	if (!leafy_plants.empty()) {
 		bool const use_tri_strip = 1;
@@ -1342,6 +1346,8 @@ void scenery_group::post_gen_setup() {
 		i->build_model();
 		i->add_bounds_to_bcube(all_bcube);
 	}
+	for (auto &log   : logs  ) {log  .cache_closest_tree_type(trees);}
+	for (auto &stump : stumps) {stump.cache_closest_tree_type(trees);}
 	//PRINT_TIME("Gen Scenery");
 }
 
@@ -1470,19 +1476,39 @@ void scenery_group::leafy_plant_coll(unsigned plant_ix, float energy) {
 	leafy_plants[plant_ix].obj_collision(energy);
 }
 
+bool scenery_group::choose_butterfly_dest(point &dest, sphere_t &plant_bsphere, rand_gen_t &rgen) const {
+	unsigned const tot_plants(plants.size() + leafy_plants.size());
+	if (tot_plants == 0) return 0; // no plants
+	unsigned const plant_ix(rgen.rand() % tot_plants);
+
+	if (plant_ix < plants.size()) { // choose a plant
+		s_plant const &plant(plants[plant_ix]);
+		if (plant.is_water_plant() || plant.get_pos().z < water_plane_z) return 0; // butterfly can't land on an underwater plant, try again next time
+		dest = plant.get_top_pt();
+		plant_bsphere = sphere_t(plant.get_pos(), plant.get_bsphere_radius());
+	}
+	else { // choose a leafy plant
+		leafy_plant const &plant(leafy_plants[plant_ix - plants.size()]);
+		if (plant.get_pos().z < water_plane_z) return 0; // butterfly can't land on an underwater plant, try again next time
+		dest = plant.get_top_pt();
+		plant_bsphere = sphere_t(plant.get_pos(), plant.get_bsphere_radius());
+	}
+	return 1;
+}
+
 
 scenery_group all_scenery;
 
 
-void gen_scenery() {
+void gen_scenery(tree_cont_t const &trees) { // called in ground mode
 
-	if (has_scenery2) {all_scenery.post_gen_setup(); return;} // don't generate scenery if some has already been added
+	if (has_scenery2) {all_scenery.post_gen_setup(trees); return;} // don't generate scenery if some has already been added
 	all_scenery.clear();
 	all_scenery = scenery_group(); // really force a clear
 	has_scenery = 0;
 	if (DISABLE_SCENERY) return;
 	has_scenery = 1;
-	all_scenery.gen(1, 1, MESH_X_SIZE-1, MESH_Y_SIZE-1, vegetation, 0);
+	all_scenery.gen(1, 1, MESH_X_SIZE-1, MESH_Y_SIZE-1, vegetation, 0, trees);
 	all_scenery.add_cobjs();
 }
 

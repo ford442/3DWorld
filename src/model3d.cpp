@@ -79,17 +79,18 @@ void texture_manager::clear() {
 }
 
 void texture_manager::free_tids() {
-	for (deque<texture_t>::iterator t = textures.begin(); t != textures.end(); ++t) {t->gl_delete();}
+	for (auto &t : textures) {t.gl_delete();}
 }
 void texture_manager::free_textures() {
-	for (deque<texture_t>::iterator t = textures.begin(); t != textures.end(); ++t) {t->free_data();}
+	for (auto &t : textures) {t.free_data();}
 }
 void texture_manager::free_client_mem() { // Note: should not be called if model textures can overlap with predefined textures
-	for (deque<texture_t>::iterator t = textures.begin(); t != textures.end(); ++t) {t->free_client_mem();}
+	for (auto &t : textures) {t.free_client_mem();}
 }
 
-bool texture_manager::ensure_texture_loaded(texture_t &t, int tid, bool is_bump) {
+bool texture_manager::ensure_texture_loaded(int tid, bool is_bump) {
 
+	texture_t &t(get_texture(tid));
 	if (t.is_loaded()) return 0; // already loaded from disk
 	if (t.is_bound() ) return 0; // already bound to a texture/sent to the GPU, no need to reload
 	//if (is_bump) {t.do_compress = 0;} // don't compress normal maps
@@ -121,6 +122,19 @@ void texture_manager::bind_alpha_channel_to_texture(int tid, int alpha_tid) {
 	t.alpha_tid = alpha_tid;
 	t.ncolors   = 4; // add alpha channel
 	if (t.use_mipmaps) {t.use_mipmaps = 3;} // generate custom alpha mipmaps
+}
+
+void texture_manager::add_work_item(int tid, bool is_nm) {
+	if (tid < 0) return;
+	if (get_texture(tid).is_loaded() || get_texture(tid).is_bound()) return; // already loaded or bound, nothing to do
+	to_load.emplace_back(tid, is_nm);
+}
+void texture_manager::load_work_items_mt() {
+	if (to_load.empty()) return; // nothing to do
+	sort_and_unique(to_load);
+#pragma omp parallel for schedule(dynamic)
+	for (int i = 0; i < (int)to_load.size(); ++i) {ensure_texture_loaded(to_load[i].tid, to_load[i].is_nm);}
+	to_load.clear();
 }
 
 texture_t &get_builtin_texture(int tid) {
@@ -1093,6 +1107,17 @@ void material_t::init_textures(texture_manager &tmgr) {
 	}
 }
 
+void material_t::queue_textures_to_load(texture_manager &tmgr) {
+
+	if (!mat_is_used()) return;
+	int const tid(get_render_texture());
+	tmgr.bind_alpha_channel_to_texture(tid, alpha_tid);
+	tmgr.add_work_item(tid, 0);
+	if (use_bump_map()) {tmgr.add_work_item(bump_tid, 1);} else {bump_tid = -1;}
+	if (use_spec_map()) {tmgr.add_work_item( s_tid,   0);} else {s_tid    = -1;}
+	if (use_spec_map()) {tmgr.add_work_item(ns_tid,   0);} else {ns_tid   = -1;}
+}
+
 void material_t::check_for_tc_invert_y(texture_manager &tmgr) {
 
 	if (tcs_checked) return; // already done
@@ -1157,7 +1182,7 @@ void material_t::render(shader_t &shader, texture_manager const &tmgr, int defau
 			tmgr.bind_texture(tex_id);
 			has_binary_alpha = tmgr.has_binary_alpha(tex_id);
 		}
-		else {
+		else if (tex_id != -2) { // Note: the special tid of -2 is used to indicate the caller has already bound the correct texture, so we should not bind a texture here
 			select_texture((default_tid >= 0) ? default_tid : WHITE_TEX); // no texture specified - use white texture
 		}
 		if (use_bump_map()) {
@@ -1187,14 +1212,13 @@ void material_t::render(shader_t &shader, texture_manager const &tmgr, int defau
 		// 3DWorld uses a more realistic lighting model where ambient comes from indirect lighting that's computed independently from the material;
 		// however, it might make sense to use ka instead of ke when ke is not specified?
 		shader.set_cur_color(get_ad_color());
-		geom.render(shader, 0, xlate);
+		geom    .render(shader, 0, xlate);
 		geom_tan.render(shader, 0, xlate);
 		shader.clear_color_e();
-		if (ke != BLACK) {shader.set_color_e(BLACK);}
 		if (ns > 0.0)    {shader.clear_specular();}
 		if (need_blend)  {disable_blend();}
-		if (set_ref_ix)  {shader.add_uniform_float("refract_ix", 1.0);}
-		if (metalness >= 0.0) {shader.add_uniform_float("metalness", 0.0);} // if metalness was specified, reset to the default of 0.0 for the next material
+		if (set_ref_ix)       {shader.add_uniform_float("refract_ix",   1.0);}
+		if (metalness >= 0.0) {shader.add_uniform_float("metalness",    0.0);} // if metalness was specified, reset to the default of 0.0 for the next material
 		if (bmap_disabled)    {shader.add_uniform_float("bump_map_mag", 1.0);} // reset back to default
 	}
 }
@@ -1609,9 +1633,17 @@ void model3d::clear_smaps() { // frees GL state
 void model3d::load_all_used_tids() {
 
 	if (textures_loaded) return; // is this safe to skip?
-	timer_t timer("Model3d Texture Load");
-//#pragma omp parallel for schedule(dynamic) // not thread safe due to texture_t::resize() GL calls and reuse of textures across materials
-	for (int i = 0; i < (int)materials.size(); ++i) {materials[i].init_textures(tmgr);}
+	timer_t timer("Model3d Texture Load", !tmgr.empty());
+#if 0
+	// MT loading flow; will fail with an error if any textures require calling texture_t::resize() due to nested OpenGL calls;
+	// while this mostly works, it's not much faster because the majority of the time is spent in OpenGL calls for things like texture compression
+	// build a worklist of files to load from disk
+	for (auto &m : materials) {m.queue_textures_to_load(tmgr);}
+	// load the textures from disk in parallel; requires sorting and uniquing textures, which may be shared across multiple materials
+	tmgr.load_work_items_mt();
+	// run serial post load steps and make any required OpenGL calls
+#endif
+	for (auto &m : materials) {m.init_textures(tmgr);}
 	textures_loaded = 1;
 	if (no_store_model_textures_in_memory) {tmgr.free_client_mem();}
 }
@@ -1668,7 +1700,7 @@ void set_def_spec_map() {
 
 void model3d::render_materials(shader_t &shader, bool is_shadow_pass, int reflection_pass, bool is_z_prepass, int enable_alpha_mask,
 	unsigned bmap_pass_mask, int trans_op_mask, base_mat_t const &unbound_mat, rotation_t const &rot, point const *const xlate,
-	xform_matrix const *const mvm, bool force_lod, float model_lod_mult, float fixed_lod_dist, bool skip_cull_face)
+	xform_matrix const *const mvm, bool force_lod, float model_lod_mult, float fixed_lod_dist, bool skip_cull_face, bool is_scaled)
 {
 	bool const is_normal_pass(!is_shadow_pass && !is_z_prepass), is_bmap_pass((bmap_pass_mask & 2) != 0);
 	if (is_normal_pass) {smap_data[rot].set_for_all_lights(shader, mvm);} // choose correct shadow map based on rotation
@@ -1679,7 +1711,7 @@ void model3d::render_materials(shader_t &shader, bool is_shadow_pass, int reflec
 	}
 
 	// render geom that was not bound to a material
-	if ((bmap_pass_mask & 1) && unbound_mat.color.alpha > 0.0 && (trans_op_mask & 1)) { // enabled, not in bump map only pass; assume opaque
+	if ((bmap_pass_mask & 1) && unbound_mat.color.alpha > 0.0 && (trans_op_mask & 1) && !unbound_geom.empty()) { // enabled, not in bump map only pass; assume opaque
 		if (is_normal_pass) { // cur_ub_tid texture shouldn't have an alpha mask, so we don't need to use it in the shadow pass
 			assert(unbound_mat.tid >= 0);
 			select_texture(unbound_mat.tid);
@@ -1699,7 +1731,10 @@ void model3d::render_materials(shader_t &shader, bool is_shadow_pass, int reflec
 		point pts[2] = {bcube.get_llc(), bcube.get_urc()};
 		rot.rotate_point(pts[0], -1.0); rot.rotate_point(pts[1], -1.0);
 		cube_t const bcube_rot(pts[0], pts[1]);
-		check_lod |= !bcube_rot.contains_pt(camera_pdu.pos);
+		// Note: this code assumes the model is in camera space and only rot is used to transform it;
+		// if the model is translated, it's up to the caller to translate camera_pdu.pos into model space for LOD to work;
+		// if the model is scaled, the containment test below is likely invalid, so we assume the camera is not inside the model and set check_lod=1
+		check_lod |= (is_scaled || !bcube_rot.contains_pt(camera_pdu.pos));
 		if (check_lod) {center = bcube_rot.get_cube_center();}
 	}
 	if (check_lod) {
@@ -1744,12 +1779,26 @@ material_t *model3d::get_material_by_name(string const &name) {
 	return ((mat_ix < 0) ? nullptr : &materials[mat_ix]);
 }
 
-void model3d::set_color_for_material(unsigned mat_id, colorRGBA const &color) {
-	if (mat_id == materials.size()) {unbound_mat.color = color;} // unbound geom is material ID materials.size() (one past the end)
+colorRGBA model3d::set_color_for_material(unsigned mat_id, colorRGBA const &color) { // returns the original color
+	colorRGBA orig_color;
+
+	if (mat_id == materials.size()) { // unbound geom is material ID materials.size() (one past the end)
+		orig_color = unbound_mat.color;
+		unbound_mat.color = color;
+	}
 	else {
 		material_t &mat(get_material(mat_id));
+		orig_color = mat.kd;
 		mat.ka = mat.kd = color;
 	}
+	return orig_color;
+}
+
+int model3d::set_texture_for_material(unsigned mat_id, int tid) { // returns the original texture ID
+	int orig_tid(tid);
+	if (mat_id == materials.size()) {swap(orig_tid, unbound_mat.tid);} // unbound geom is material ID materials.size() (one past the end)
+	else {swap(orig_tid, get_material(mat_id).d_tid);}
+	return orig_tid;
 }
 
 
@@ -1980,10 +2029,15 @@ void model3d::set_sky_lighting_file(string const &fn, float weight, unsigned sz[
 
 void model3d::create_indir_texture() {
 
-	timer_t timer("Create Indir Texture");
 	unsigned const xsize(sky_lighting_sz[0]), ysize(sky_lighting_sz[1]), zsize(sky_lighting_sz[2]), tot_sz(xsize*ysize*zsize);
-	assert(tot_sz > 0);
-	if (tot_sz == 0) return; // nothing to do
+	
+	if (tot_sz == 0) {
+		static bool showed_warning(0);
+		if (!showed_warning) {cout << "Failed to allocate indir lighting texture: " << TXT(xsize) << TXT(ysize) << TXT(zsize) << endl;}
+		showed_warning = 1;
+		return; // nothing to do
+	}
+	timer_t timer("Create Indir Texture");
 	lmap_manager_t local_lmap_manager; // store in the model3d and cache for reuse on context change (at the cost of more CPU memory usage)? only matters when ray tracing (below)?
 	lmcell init_lmcell;
 	unsigned char **need_lmcell = nullptr; // not used - dense mode
@@ -1995,12 +2049,11 @@ void model3d::create_indir_texture() {
 		light_int_scale[LIGHTING_SKY] = sky_lighting_weight;
 	}
 	else {
-		// FIXME: run raytracing to fill in local_lmap_manager, use bcube for bounds (scale to get_scene_bounds_bcube())
+		// TODO: run raytracing to fill in local_lmap_manager, use bcube for bounds (scale to get_scene_bounds_bcube())
 	}
 	vector<unsigned char> tex_data;
 	indir_light_tex_from_lmap(model_indir_tid, local_lmap_manager, tex_data, xsize, ysize, zsize);
 	light_int_scale[LIGHTING_SKY] = init_weight; // restore orig value
-	//cout << TXT(zsize) << TXT(tot_sz) << TXT(model_indir_tid) << endl;
 }
 
 void model3d::set_local_model_scene_bounds(shader_t &s) { // tight bounds

@@ -55,45 +55,67 @@ vector_point_norm const &gen_cylinder_data(point const ce[2], float radius1, flo
 										   float const *const perturb_map, float s_beg, float s_end, int force_dim)
 {
 	assert(ndiv > 0 && ndiv < 100000);
-	v12 = (ce[1] - ce[0]).get_norm();
-	float const r[2] = {radius1, radius2};
-	vector3d vab[2];
-	get_ortho_vectors(v12, vab, force_dim);
 	vector_point_norm &vpn(cylinder_vpn);
-	unsigned s0(NDIV_SCALE(s_beg)), s1(NDIV_SCALE(s_end));
-	if (s1 == ndiv) s0 = 0; // make wraparound correct
-	s1 = min(ndiv, s1+1);   // allow for sn
 	vpn.p.resize(2*ndiv);
-	vpn.n.resize(ndiv);
+	vpn.n.resize(  ndiv);
+	float const r[2] = {radius1, radius2};
 	float const css(TWO_PI/(float)ndiv), sin_ds(sin(css)), cos_ds(cos(css));
-	float sin_s((s0 == 0) ? 0.0 : sin(s0*css)), cos_s((s0 == 0) ? 1.0 : cos(s0*css));
-	// sin(x + y) = sin(x)*cos(y) + cos(x)*sin(y)
-	// cos(x + y) = cos(x)*cos(y) - sin(x)*sin(y)
+	unsigned s0(0), s1(ndiv);
 
-	for (unsigned S = s0; S < s1; ++S) { // build points table
-		float const s(sin_s), c(cos_s);
-		vpn.p[(S<<1)+0] = ce[0] + (vab[0]*(r[0]*s)) + (vab[1]*(r[0]*c)); // loop unrolled
-		vpn.p[(S<<1)+1] = ce[1] + (vab[0]*(r[1]*s)) + (vab[1]*(r[1]*c));
-		sin_s = s*cos_ds + c*sin_ds;
-		cos_s = c*cos_ds - s*sin_ds;
+	if (ce[0].x == ce[1].x && ce[0].y == ce[1].y && s_beg == 0.0 && s_end == 1.0) { // special case optimization for full vertical cylinder
+		float const z_sign((ce[1].z > ce[0].z) ? 1.0 : -1.0);
+		v12 = z_sign*plus_z;
+		float sin_s(0.0), cos_s(1.0);
+
+		for (unsigned S = 0; S < ndiv; ++S) { // build points table
+			float const s(sin_s), c(cos_s);
+			vpn.p[(S<<1)+0] = ce[0] + vector3d(z_sign*r[0]*s, r[0]*c, 0.0);
+			vpn.p[(S<<1)+1] = ce[1] + vector3d(z_sign*r[1]*s, r[1]*c, 0.0);
+			sin_s = s*cos_ds + c*sin_ds;
+			cos_s = c*cos_ds - s*sin_ds;
+		}
 	}
-	float nmag_inv(0.0);
-	bool const npt_r2(radius1 < radius2); // determine normal from longest edge for highest accuracy (required for when r1 == 0.0)
+	else {
+		v12 = (ce[1] - ce[0]).get_norm();
+		vector3d vab[2];
+		get_ortho_vectors(v12, vab, force_dim);
+		s0 = NDIV_SCALE(s_beg); s1 = NDIV_SCALE(s_end);
+		if (s1 == ndiv) {s0 = 0;} // make wraparound correct
+		s1 = min(ndiv, s1+1); // allow for sn
+		float sin_s((s0 == 0) ? 0.0 : sin(s0*css)), cos_s((s0 == 0) ? 1.0 : cos(s0*css));
+		// sin(x + y) = sin(x)*cos(y) + cos(x)*sin(y)
+		// cos(x + y) = cos(x)*cos(y) - sin(x)*sin(y)
 
-	for (unsigned S = s0; S < s1; ++S) { // build normals table
-		vector3d const v1(vpn.p[(((S+1)%ndiv)<<1)+npt_r2], vpn.p[(S<<1)+npt_r2]), v2(vpn.p[(S<<1)+1], vpn.p[S<<1]);
-		cross_product(v2, v1, vpn.n[S]);
-		if (S == s0) nmag_inv = 1.0/vpn.n[S].mag(); // first one (should not have a divide by zero)
-		vpn.n[S] *= nmag_inv; //norms[S].normalize();
+		for (unsigned S = s0; S < s1; ++S) { // build points table
+			float const s(sin_s), c(cos_s);
+			vpn.p[(S<<1)+0] = ce[0] + (vab[0]*(r[0]*s)) + (vab[1]*(r[0]*c)); // loop unrolled
+			vpn.p[(S<<1)+1] = ce[1] + (vab[0]*(r[1]*s)) + (vab[1]*(r[1]*c));
+			sin_s = s*cos_ds + c*sin_ds;
+			cos_s = c*cos_ds - s*sin_ds;
+		}
+	}
+	if (radius1 == radius2) { // special case optimization for cylinder rather than truncated cone
+		float const nscale(1.0/(0.5f*(vpn.p[0] + vpn.p[2]) - ce[0]).mag()); // slightly larger than 1.0/radius
+		for (unsigned S = s0; S < s1; ++S) {vpn.n[S] = (0.5f*(vpn.p[S<<1] + vpn.p[((S+1)%ndiv)<<1]) - ce[0])*nscale;} // build normals table
+	}
+	else {
+		bool const npt_r2(radius1 < radius2); // determine normal from longest edge for highest accuracy (required for when r1 == 0.0)
+		float nmag_inv(0.0);
+
+		for (unsigned S = s0; S < s1; ++S) { // build normals table
+			vector3d const v1(vpn.p[(((S+1)%ndiv)<<1)+npt_r2], vpn.p[(S<<1)+npt_r2]), v2(vpn.p[(S<<1)+1], vpn.p[S<<1]);
+			vector3d &normal(vpn.n[S]);
+			cross_product(v2, v1, normal);
+			if (S == s0) {nmag_inv = 1.0/normal.mag();} // first one (should not have a divide by zero)
+			normal *= nmag_inv; //norms[S].normalize();
+		}
 	}
 	if (perturb_map != NULL) { // add in perturbations
 		float const ravg(0.5f*(r[0] + r[1]));
 		float const pscale[2] = {r[0]/ravg, r[1]/ravg};
 
 		for (unsigned S = s0; S < s1; ++S) {
-			for (unsigned i = 0; i < 2; ++i) {
-				vpn.p[(S<<1)+i] += vpn.n[S]*(pscale[i]*perturb_map[S]);
-			}
+			for (unsigned i = 0; i < 2; ++i) {vpn.p[(S<<1)+i] += vpn.n[S]*(pscale[i]*perturb_map[S]);}
 		}
 		// update normals?
 	}
@@ -309,18 +331,30 @@ void create_vert(vert_norm_texp &v, point const &p, vector3d const &n, texgen_pa
 	v = vert_norm_texp(p, calc_oriented_normal(p, n, two_sided_lighting), tp);
 }
 
-void gen_cone_triangles(vector<vert_norm_tc> &verts, vector_point_norm const &vpn, bool two_sided_lighting, float tc_t0, float tc_t1, vector3d const &xlate) {
+void gen_cone_triangles(vector<vert_norm_tc> &verts, vector_point_norm const &vpn, bool two_sided_lighting, float tc_t0, float tc_t1, float ts_scale, vector3d const &xlate) {
 	
 	unsigned const ixoff(verts.size()), ndiv(vpn.n.size());
 	verts.resize(3*ndiv + ixoff);
 	float const ndiv_inv(1.0/ndiv);
 
-	for (unsigned s = 0; s < (unsigned)ndiv; ++s) { // Note: always has tex coords
-		unsigned const sp((s+ndiv-1)%ndiv), sn((s+1)%ndiv), vix(3*s + ixoff);
-		//create_vert(verts[vix+0], vpn.p[(s <<1)+1],        vpn.n[s],              (1.0 - (s+0.5)*ndiv_inv), tex_scale_len, two_sided_lighting); // small discontinuities at every position
-		create_vert(verts[vix+0], vpn.p[(s <<1)+1]+xlate,  vpn.n[s],               0.5,                     tc_t1, two_sided_lighting); // one big discontinuity at one position
-		create_vert(verts[vix+1], vpn.p[(sn<<1)+0]+xlate, (vpn.n[s] + vpn.n[sn]), (1.0 - (s+1.0)*ndiv_inv), tc_t0, two_sided_lighting); // normalize?
-		create_vert(verts[vix+2], vpn.p[(s <<1)+0]+xlate, (vpn.n[s] + vpn.n[sp]), (1.0 - (s+0.0)*ndiv_inv), tc_t0, two_sided_lighting); // normalize?
+	if (!two_sided_lighting && xlate == zero_vector) { // common case optimization, for example for tree trunks
+		for (unsigned s = 0; s < (unsigned)ndiv; ++s) { // Note: always has tex coords
+			unsigned const sp((s+ndiv-1)%ndiv), sn((s+1)%ndiv), vix(3*s + ixoff);
+			float const ts(ts_scale*(1.0 - s*ndiv_inv));
+			verts[vix+0].assign(vpn.p[(s <<1)+1],  vpn.n[s],              ts_scale*0.5,    tc_t1); // one big discontinuity at one position
+			verts[vix+1].assign(vpn.p[(sn<<1)+0], (vpn.n[s] + vpn.n[sn]), (ts - ndiv_inv), tc_t0); // normalize?
+			verts[vix+2].assign(vpn.p[(s <<1)+0], (vpn.n[s] + vpn.n[sp]), ts,              tc_t0); // normalize?
+		}
+	}
+	else {
+		for (unsigned s = 0; s < (unsigned)ndiv; ++s) { // Note: always has tex coords
+			unsigned const sp((s+ndiv-1)%ndiv), sn((s+1)%ndiv), vix(3*s + ixoff);
+			float const ts(ts_scale*(1.0 - s*ndiv_inv));
+			//create_vert(verts[vix+0], vpn.p[(s <<1)+1],        vpn.n[s], (ts - 0.5f*ndiv_inv), tex_scale_len, two_sided_lighting); // small discontinuities at every position
+			create_vert(verts[vix+0], vpn.p[(s <<1)+1]+xlate,  vpn.n[s],              ts_scale*0.5,    tc_t1, two_sided_lighting); // one big discontinuity at one position
+			create_vert(verts[vix+1], vpn.p[(sn<<1)+0]+xlate, (vpn.n[s] + vpn.n[sn]), (ts - ndiv_inv), tc_t0, two_sided_lighting); // normalize?
+			create_vert(verts[vix+2], vpn.p[(s <<1)+0]+xlate, (vpn.n[s] + vpn.n[sp]), ts,              tc_t0, two_sided_lighting); // normalize?
+		}
 	}
 }
 
@@ -337,8 +371,9 @@ void gen_cone_triangles_tp(vector<vert_norm_texp> &verts, vector_point_norm cons
 	}
 }
 
-void gen_cylinder_triangle_strip(vector<vert_norm_tc> &verts, vector_point_norm const &vpn, bool two_sided_lighting, float tc_t0, float tc_t1, vector3d const &xlate) {
-
+void gen_cylinder_triangle_strip(vector<vert_norm_tc> &verts, vector_point_norm const &vpn,
+	bool two_sided_lighting, float tc_t0, float tc_t1, float ts_scale, vector3d const &xlate)
+{
 	bool const prev_strip(!verts.empty());
 	unsigned const ixoff(prev_strip ? (verts.size() + 2) : 0), ndiv(vpn.n.size()); // 2 extra for connecting with degenerate triangles
 	verts.resize(2*(ndiv+1) + ixoff);
@@ -346,7 +381,7 @@ void gen_cylinder_triangle_strip(vector<vert_norm_tc> &verts, vector_point_norm 
 
 	for (unsigned S = 0; S <= ndiv; ++S) { // Note: always has tex coords
 		unsigned const s(S%ndiv), vix(2*S + ixoff);
-		float const ts(1.0f - S*ndiv_inv);
+		float const ts(ts_scale*(1.0f - S*ndiv_inv));
 		vector3d const normal(vpn.n[s] + vpn.n[(S+ndiv-1)%ndiv]); // normalize?
 		create_vert(verts[vix+0], vpn.p[(s<<1)+0]+xlate, normal, ts, tc_t0, two_sided_lighting);
 		create_vert(verts[vix+1], vpn.p[(s<<1)+1]+xlate, normal, ts, tc_t1, two_sided_lighting);
@@ -415,7 +450,7 @@ cylin_vertex_buffer_t cylin_vertex_buffer;
 void begin_cylin_vertex_buffering() {cylin_vertex_buffer.begin_buffering();}
 void flush_cylin_vertex_buffer   () {cylin_vertex_buffer.draw_and_clear_buffers();}
 
-
+// draw_sides_ends: 0 = draw sides only, 1 = draw sides and ends, 2 = draw ends only, 3 = pt1 end, 4 = pt2 end
 void add_cylin_ends(float radius1, float radius2, int ndiv, bool texture, int draw_sides_ends,
 	vector3d const &v12, point const ce[2], point const &xlate, vector_point_norm const &vpn)
 {
@@ -444,9 +479,9 @@ void add_cylin_ends(float radius1, float radius2, int ndiv, bool texture, int dr
 	}
 }
 
-// draw_sides_ends: 0 = draw sides only, 1 = draw sides and ends, 2 = draw ends only, 3 = pt1 end, 4 = pt2 end
+// draw_sides_ends: 0 = draw sides only, 1 = draw sides and ends, 2 = draw ends only, 3 = sides + pt1 end, 4 = sides + pt2 end
 void draw_fast_cylinder(point const &p1, point const &p2, float radius1, float radius2, int ndiv, bool texture, int draw_sides_ends,
-	bool two_sided_lighting, float const *const perturb_map, float tex_scale_len, float tex_t_start, point const *inst_pos, unsigned num_insts)
+	bool two_sided_lighting, float const *const perturb_map, float tex_scale_len, float tex_t_start, point const *inst_pos, unsigned num_insts, float tex_width_scale)
 {
 	assert(radius1 > 0.0 || radius2 > 0.0);
 	point const ce[2] = {p1, p2};
@@ -461,10 +496,10 @@ void draw_fast_cylinder(point const &p1, point const &p2, float radius1, float r
 			// draw ends only - nothing to do here
 		}
 		else if (radius2 == 0.0) { // cone (Note: still not perfect for pine tree trunks and enforcer ships)
-			gen_cone_triangles(cvb.tverts, vpn, two_sided_lighting, tex_t_start, tex_scale_len+tex_t_start, inst_pos[inst]);
+			gen_cone_triangles(cvb.tverts, vpn, two_sided_lighting, tex_t_start, tex_scale_len+tex_t_start, tex_width_scale, inst_pos[inst]);
 		}
 		else {
-			gen_cylinder_triangle_strip(cvb.sverts, vpn, two_sided_lighting, tex_t_start, tex_scale_len+tex_t_start, inst_pos[inst]);
+			gen_cylinder_triangle_strip(cvb.sverts, vpn, two_sided_lighting, tex_t_start, tex_scale_len+tex_t_start, tex_width_scale, inst_pos[inst]);
 		}
 		if (draw_sides_ends != 0) {add_cylin_ends(radius1, radius2, ndiv, texture, draw_sides_ends, v12, ce, inst_pos[inst], vpn);} // Note: TSL doesn't apply here
 	} // for inst

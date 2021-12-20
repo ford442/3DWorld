@@ -12,7 +12,7 @@ extern building_params_t global_building_params;
 
 string const model_opt_names[NUM_OBJ_MODELS] =
 {"toilet_model", "sink_model", "tub_model", "fridge_model", "stove_model", "tv_model", ""/*monitor*/, "couch_model", "office_chair_model", "urinal_model",
-"lamp_model", "washer_model", "dryer_model", "key_model", "hanger_model", "fire_hydrant_model"};
+"lamp_model", "washer_model", "dryer_model", "key_model", "hanger_model", "clothing_model", "fire_hydrant_model", "substation_model", "umbrella_model"};
 
 bool city_params_t::read_option(FILE *fp) {
 
@@ -75,6 +75,9 @@ bool city_params_t::read_option(FILE *fp) {
 	else if (str == "make_4_way_ints") {
 		if (!read_uint(fp, make_4_way_ints) || make_4_way_ints > 3) {return read_error(str);}
 	}
+	else if (str == "add_transmission_lines") {
+		if (!read_uint(fp, add_tlines) || add_tlines > 2) {return read_error(str);}
+	}
 	else if (str == "residential_probability") {
 		if (!read_float(fp, residential_probability)) {return read_error(str);}
 	}
@@ -102,6 +105,9 @@ bool city_params_t::read_option(FILE *fp) {
 	}
 	else if (str == "convert_model_files") {
 		if (!read_bool(fp, convert_model_files)) {return read_error(str);}
+	}
+	else if (str == "cars_use_driveways") {
+		if (!read_bool(fp, cars_use_driveways)) {return read_error(str);}
 	}
 	else if (str == "car_model") { // multiple car models
 		city_model_t car_model;

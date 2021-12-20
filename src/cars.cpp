@@ -20,22 +20,39 @@ extern vector<light_source> dl_sources;
 extern city_params_t city_params;
 
 
+float get_clamped_fticks() {return min(fticks, 4.0f);} // clamp to 100ms
+
 float car_t::get_max_lookahead_dist() const {return (get_length() + city_params.road_width);} // extend one car length + one road width in front
 float car_t::get_turn_rot_z(float dist_to_turn) const {return (1.0 - CLIP_TO_01(4.0f*fabs(dist_to_turn)/city_params.road_width));}
 
+void car_t::set_bcube(point const &center, vector3d const &sz) {
+	height = sz.z;
+	bcube.set_from_point(center);
+	bcube.expand_by_xy(0.5*(dim ? vector3d(sz.y, sz.x, sz.z) : sz)); // swap size X and Y when dim==1
+	bcube.z2() += height; // set height
+}
 bool car_t::headlights_on() const { // no headlights when parked
-	return (!is_parked() && (in_tunnel || ((light_factor < (0.5 + HEADLIGHT_ON_RAND)) && is_night(HEADLIGHT_ON_RAND*signed_rand_hash(height + max_speed)))));
+	return (engine_running && (in_tunnel || ((light_factor < (0.5 + HEADLIGHT_ON_RAND)) && is_night(HEADLIGHT_ON_RAND*signed_rand_hash(height + max_speed)))));
+}
+bool car_t::is_close_to_player() const { // for debugging
+	return dist_xy_less_than(get_camera_building_space(), get_center(), city_params.road_width);
 }
 
 void car_t::apply_scale(float scale) {
 	if (scale == 1.0) return; // no scale
-	float const prev_height(height);
 	height *= scale;
 	point const pos(get_center());
-	bcube.z2() += height - prev_height; // z1 is unchanged
-	float const dx(bcube.x2() - pos.x), dy(bcube.y2() - pos.y);
-	bcube.x1() = pos.x - scale*dx; bcube.x2() = pos.x + scale*dx;
-	bcube.y1() = pos.y - scale*dy; bcube.y2() = pos.y + scale*dy;
+	vector2d sz((bcube.x2() - pos.x), (bcube.y2() - pos.y));
+	is_truck = (scale > 1.2); // trucks are larger in size
+
+	if (is_truck) { // truck bcube is taller and less wide
+		height   *= 1.55;
+		sz[ dim] *= 0.85; // length
+		sz[!dim] *= 0.75; // width
+	}
+	bcube.z2() = bcube.z1() + height; // z1 is unchanged
+	bcube.x1() = pos.x - scale*sz.x; bcube.x2() = pos.x + scale*sz.x;
+	bcube.y1() = pos.y - scale*sz.y; bcube.y2() = pos.y + scale*sz.y;
 }
 
 void car_t::destroy() { // Note: not calling create_explosion(), so no chain reactions
@@ -52,8 +69,9 @@ void car_t::destroy() { // Note: not calling create_explosion(), so no chain rea
 		gen_smoke(exp_pos, 1.0, rgen.rand_uniform(0.4, 0.6));
 	} // for n
 	gen_delayed_from_player_sound(SOUND_EXPLODE, pos, 1.0);
-	park();
 	destroyed = 1;
+	engine_running = 0;
+	park();
 }
 
 float car_t::get_min_sep_dist_to_car(car_t const &c, bool add_one_car_len) const { // should this depend on in_reverse?
@@ -64,20 +82,24 @@ float car_t::get_min_sep_dist_to_car(car_t const &c, bool add_one_car_len) const
 
 string car_t::str() const {
 	std::ostringstream oss;
-	oss << "Car " << TXT(dim) << TXT(dir) << TXT(cur_city) << TXT(cur_road) << TXT(cur_seg) << TXT(dz) << TXT(max_speed) << TXT(cur_speed)
-		<< TXTi(cur_road_type) << TXTi(color_id) << " bcube=" << bcube.str();
+	oss << "Car " << TXT(dim) << TXT(dir) << TXT(cur_city) << TXT(cur_road) << TXT(cur_seg) << TXTi(turn_dir) << TXT(dz)
+		<< TXT(max_speed) << TXT(cur_speed) << TXTi(cur_road_type) << TXTi(color_id) << " bcube=" << bcube.str();
 	return oss.str();
 }
 
 string car_t::label_str() const {
 	std::ostringstream oss;
 	oss << TXT(dim) << TXTn(dir) << TXT(cur_city) << TXT(cur_road) << TXTn(cur_seg) << TXT(dz) << TXTn(turn_val) << TXT(max_speed) << TXTn(cur_speed)
-		<< "wait_time=" << get_wait_time_secs() << "\n" << TXTin(cur_road_type)
+		<< "sleep=" << is_sleeping() << " wait_time=" << get_wait_time_secs() << "\n" << TXTin(cur_road_type)
 		<< TXTn(stopped_at_light) << TXTn(in_isect()) << "cars_in_front=" << count_cars_in_front() << "\n" << TXT(dest_city) << TXTn(dest_isec);
 	oss << "car=" << this << " car_in_front=" << car_in_front << endl; // debugging
 	return oss.str();
 }
 
+void car_t::choose_max_speed(rand_gen_t &rgen) { // add some speed variation
+	max_speed = rgen.rand_uniform(0.66, 1.0);
+	engine_running = 1; // car starts up
+}
 void car_t::move(float speed_mult) {
 	prev_bcube = bcube;
 	if (destroyed || stopped_at_light || is_stopped()) return;
@@ -91,6 +113,12 @@ void car_t::move(float speed_mult) {
 	if (fabs(cur_pos - waiting_pos) > get_length()) {waiting_pos = cur_pos; reset_waiting();} // update when we move at least a car length
 }
 
+void car_t::set_target_speed(float speed_factor) {
+	float const target_speed(speed_factor*max_speed);
+	if      (cur_speed < 0.9*target_speed) {maybe_accelerate();}
+	else if (cur_speed > 1.1*target_speed) {decelerate();}
+}
+
 void car_t::maybe_accelerate(float mult) {
 	if (car_in_front) {
 		float const dist_sq(p2p_dist_xy_sq(get_center(), car_in_front->get_center())), length(get_length());
@@ -101,6 +129,176 @@ void car_t::maybe_accelerate(float mult) {
 		}
 	}
 	accelerate(mult);
+}
+
+void car_t::sleep(rand_gen_t &rgen, float min_time_secs) {
+	park();
+	if (destroyed || is_sleeping()) return; // don't reset wake_time if already sleeping
+	wake_time = (float)tfticks + rgen.rand_uniform(1.0, 2.0)*min_time_secs*TICKS_PER_SECOND; // randomly wait 1-2x min_time_secs
+}
+bool car_t::maybe_wake(rand_gen_t &rgen) {
+	if (destroyed || !is_sleeping() || tfticks < wake_time) return 0; // continue to sleep
+	wake_time = 0.0;
+	choose_max_speed(rgen);
+	return 1;
+}
+
+bool car_t::maybe_apply_turn(float centerline, bool for_driveway) {
+	bool const right_turn(turn_dir == TURN_RIGHT); // 0=left, 1=right
+	bool const tdir(dir ^ in_reverse); // direction of movement
+	point const car_center(get_center()), prev_center(prev_bcube.get_cube_center());
+	float const prev_val(prev_center[dim]), cur_val(car_center[dim]);
+	float const turn_radius_mult(for_driveway ? 1.0 : ((cur_road_type == TYPE_ISEC2) ? 2.0 : 1.0)); // larger turn radius for 2-way intersections (bends)
+	float const turn_radius((for_driveway ? 0.75 : 1.0)*(right_turn ? 0.15 : 0.25)*turn_radius_mult*city_params.road_width); // right turn has smaller radius; driveway has smaller radius
+	float const dist_to_turn(max(0.0f, (cur_val - centerline)*(tdir ? -1.0f : 1.0f))); // Note: can be negative if we overshot the turn, so clamp to 0
+	if (dist_to_turn > turn_radius) return 0; // not yet time to turn
+	// Note: cars turn around their center points, not their front wheels, which looks odd
+	float const dist_from_turn_start(turn_radius - dist_to_turn);
+	float const dev(turn_radius - sqrt(max((turn_radius*turn_radius - dist_from_turn_start*dist_from_turn_start), 0.0f))); // clamp to 0 to avoid NAN due to FP error
+	float const new_center(turn_val + dev*((right_turn ^ tdir ^ dim) ? 1.0 : -1.0));
+	rot_z = (right_turn ? -1.0 : 1.0)*(1.0 - CLIP_TO_01(dist_to_turn/turn_radius));
+	bcube.translate_dim(!dim, (new_center - car_center[!dim])); // translate to new center point
+	vector3d const move_dir(get_center() - prev_center); // total movement from car + turn
+	float const move_dist(move_dir.mag());
+
+	if (move_dist > TOLERANCE) { // avoid division by zero
+		float const frame_dist(p2p_dist_xy(car_center, prev_center)); // total XY distance the car is allowed to move
+		vector3d const delta(move_dir*(frame_dist/move_dist - 1.0)); // overshoot value due to turn
+		bcube += delta;
+	}
+	if (min(prev_val, cur_val) <= centerline && max(prev_val, cur_val) > centerline) { // crossed the lane centerline boundary
+		move_by(centerline - bcube.get_center_dim(dim)); // align to lane centerline, using the current position (post translate above)
+		complete_turn_and_swap_dim();
+	}
+	return 1;
+}
+void car_t::complete_turn_and_swap_dim() {
+	vector3d const car_sz(bcube.get_size());
+	float const size_adj(0.5f*(car_sz[dim] - car_sz[!dim]));
+	vector3d expand(zero_vector);
+	expand[dim] -= size_adj; expand[!dim] += size_adj;
+	bcube.expand_by(expand); // fix aspect ratio
+	if ((dim == 0) ^ (turn_dir == TURN_LEFT)) {dir ^= 1;}
+	dim     ^= 1;
+	rot_z    = 0.0;
+	turn_val = 0.0; // reset
+	turn_dir = TURN_NONE; // turn completed
+	entering_city = 0; // clear flag in case we turned into the city
+}
+
+bool car_t::must_wait_entering_or_crossing_road(vector<car_t> const &cars, driveway_t const &driveway, unsigned road_ix, float lookahead_time) const {
+	bool const in_driveway(cur_road_type == TYPE_DRIVEWAY);
+	bool const rdim(!driveway.dim), rdir(driveway.dir ^ rdim); // dim/dir of cars on the road we're on or entering
+	float far_side (bcube.d[rdim][ rdir]); // side of car not in danger of being hit
+	float near_side(bcube.d[rdim][!rdir]); // side of car in danger of being hit
+	if (in_driveway) {far_side += (rdir ? 1.0 : -1.0)*get_length();} // if exiting a driveway, must leave space for the car to fit in the road
+	if (in_driveway && in_reverse) {near_side -= (rdir ? 1.0 : -1.0)*get_length();} // if backing out of driveway, we must have space to fit when fully backed out
+	// the following logic is similar to ped_manager_t::has_nearby_car_on_road(), except it only considers one lane of the road
+	// since we don't have cars split out per-city here like we do in ped_mgr, we have to sort by city and then road
+	car_base_t ref_car; ref_car.cur_city = cur_city; ref_car.cur_road = road_ix; ref_car.max_speed = 1.0; // so that it isn't treated as parked
+	auto range_start(std::lower_bound(cars.begin(), cars.end(), ref_car, comp_car_city_then_road())); // binary search acceleration to find the first car on the same city and road
+	auto closest_car(cars.end());
+	// Note: checking for people on the sidewalk by the driveway is too difficult, so instead the people should check for cars before crossing driveways
+
+	for (auto it = range_start; it != cars.end(); ++it) {
+		car_t const &c(*it);
+		if (c.cur_road != road_ix || c.cur_city != cur_city) break; // different road or city, done
+		if (c.dir != rdir)    continue; // car is traveling on the side of the road that we're not entering, ignore it
+		if (c.bcube == bcube) continue; // skip ourself (can occasionally get here, I think when the car is waiting for another car to pass)
+		float const val(c.bcube.d[rdim][!rdir]); // back end of the car
+		if (rdir) {if (val > far_side) break;   } // car already passed us, not a threat - done (cars are sorted in this dim)
+		else      {if (val < far_side) continue;} // car already passed us, not a threat - skip to next car
+		float const front_pos(c.bcube.d[rdim][rdir]); // front end of the car
+		if ((front_pos > near_side) == rdir) return 1; // already intersects in dimension dim, must wait
+		//if (!city_single_cube_visible_check(get_center(), c.bcube)) continue; // we could check this, but it's generally always true
+		if (closest_car == cars.end()) {closest_car = it;} // first threatening car
+		else {
+			float const val2(closest_car->bcube.d[rdim][!rdir]); // back end of the other car
+			if (rdir ? (val > val2) : (val < val2)) {closest_car = it;} // this car is closer
+		}
+		if (!rdir) break; // no cars can be closer than this (cars are sorted in this dim)
+	} // for it
+	if (closest_car == cars.end()) return 0; // no car found, safe
+	car_t const &c(*closest_car);
+	if (c.turn_dir != TURN_NONE)              return 0; // car is turning; since it's already on this road, it must be turning off this road and can be ignored
+	if (c.stopped_at_light || c.is_stopped()) return 0; // stopped, maybe at a light; we could calculate the light change time like with peds, but maybe it's okay to not wait
+	float const front_pos(c.bcube.d[rdim][rdir]); // front of the closest car
+	// moving and not turning; assume it may be accelerating, and could reach max_speed by the time it passes near_side
+	float const travel_dist(lookahead_time*CAR_SPEED_SCALE*city_params.car_speed*c.max_speed); // conservative travel dist
+	return (fabs(front_pos - near_side) < travel_dist);
+}
+bool car_t::check_for_road_clear_and_wait(vector<car_t> const &cars, driveway_t const &driveway, unsigned road_ix) {
+	if (!must_wait_entering_or_crossing_road(cars, driveway, road_ix, 2.0*TICKS_PER_SECOND)) return 0; // lookahead_time=2.0s
+	decelerate_fast(); // is this needed?
+	return 1; // wait for the path to become clear
+}
+
+bool car_t::run_enter_driveway_logic(vector<car_t> const &cars, driveway_t const &driveway) {
+	if (dim == driveway.dim) return 0; // car must be on a road perpendicular to the driveway, which may be the road connected to it
+	cube_t const turn_area(driveway.extend_across_road()); // includes driveway and the road adjacent to it
+	if (!bcube.intersects_xy(turn_area)) return 0; // not yet crossed into turn area
+
+	if (turn_dir == TURN_NONE) {
+		if (prev_bcube.intersects_xy(turn_area)) return 0; // not yet turning, and in turn area last frame - too late to turn (likely car was spawned here)
+		if (driveway.ped_count > 0) return 1; // pedestrian(s) in driveway, wait
+		bool const dw_turn_dir(dir ^ driveway.dir ^ driveway.dim); // turn into driveway: 0=left, 1=right
+		// if turning left: check for oncoming cars, wait until clear; only done at start of turn - if a car comes along mid-turn then we can't stop
+		if (!dw_turn_dir && check_for_road_clear_and_wait(cars, driveway, cur_road)) return 1;
+		turn_dir = (dw_turn_dir ? (uint8_t)TURN_RIGHT : (uint8_t)TURN_LEFT);
+		begin_turn(); // capture car centerline before the turn
+	}
+	set_target_speed(0.4); // 40% of max speed
+	float const centerline(driveway.get_center_dim(!driveway.dim));
+	maybe_apply_turn(centerline, 1); // for_driveway=1
+
+	if (turn_dir == TURN_NONE) { // turn has been completed, change to being in driveway even though we may not be onto the driveway yet
+		cur_road_type = TYPE_DRIVEWAY;
+		cur_road = (unsigned short)driveway.plot_ix; // store plot_ix in road field
+		cur_seg  = dest_driveway; // store driveway index in cur_seg
+	}
+	return 1;
+}
+void car_t::pull_into_driveway(driveway_t const &driveway, rand_gen_t &rgen) {
+	assert(dim == driveway.dim);
+	assert(dir != driveway.dir);
+	float const stop_pos(driveway.get_center_dim(driveway.dim)), car_center(bcube.get_center_dim(driveway.dim));
+
+	if ((car_center < stop_pos) == driveway.dir) { // reached the driveway center, stop
+		dest_valid     = 0;
+		dest_driveway  = -1;
+		engine_running = 0;
+		sleep(rgen, 60.0); // sleep for 60-120s rather than permanently parking
+	}
+}
+void car_t::back_or_pull_out_of_driveway(driveway_t const &driveway) {
+	assert(dim == driveway.dim);
+	// |---> driveway dir=0, car dir=1
+	in_reverse = (dir != driveway.dir); // back up if pointing away from the road
+	turn_dir   = (in_reverse ? (int)TURN_LEFT : (int)TURN_RIGHT); // always turn right when exiting the driveway/entering the road (left when backing out)
+	set_target_speed(in_reverse ? 0.2 : 0.3); // 20-30% of max speed
+	begin_turn(); // capture car centerline before the turn
+}
+// returns 1 when the exit + turn are complete
+bool car_t::exit_driveway_to_road(vector<car_t> const &cars, driveway_t const &driveway, float centerline, unsigned road_ix, rand_gen_t &rgen) {
+	if (driveway.intersects_xy(bcube)) { // partially out of the driveway/into the road
+		if (driveway.contains_cube_xy(prev_bcube)) { // was contained in driveway last frame - just entered the road
+			if (check_for_road_clear_and_wait(cars, driveway, road_ix)) {
+				bcube = prev_bcube; // hack: move back to previous position so that we trigger this check again the next time we get here
+				sleep(rgen, 1.0); // wait 1-2s and try again
+				return 0;
+			}
+		}
+	}
+	bool const is_turning(maybe_apply_turn(centerline, 1)); // for_driveway=1
+
+	if (is_turning && turn_dir == TURN_NONE) { // turn has been completed
+		if (in_reverse) {decelerate_fast();} // pause before going forward
+		driveway.in_use = 0; // Note: in_use flag is mutable
+		in_reverse      = 0;
+		return 1; // driveway exit complete, continue forward
+	}
+	set_target_speed(in_reverse ? 0.25 : 0.35); // 25-35% of max speed
+	return 0;
 }
 
 point car_base_t::get_front(float dval) const {
@@ -117,14 +315,14 @@ void car_t::honk_horn_if_close() const {
 	point const pos(get_center());
 	if (dist_less_than((pos + get_tiled_terrain_model_xlate()), get_camera_pos(), 1.0)) {gen_sound(SOUND_HORN, pos);}
 }
-
 void car_t::honk_horn_if_close_and_fast() const {
 	if (cur_speed > 0.25*max_speed) {honk_horn_if_close();}
 }
 
 void car_t::on_alternate_turn_dir(rand_gen_t &rgen) {
 	honk_horn_if_close();
-	if ((rgen.rand()&3) == 0) {dest_valid = 0;} // 25% chance of choosing a new destination rather than driving in circles; will be in current city
+	// 25% chance of choosing a new destination rather than driving in circles; will be in current city
+	if (dest_driveway < 0 && (rgen.rand()&3) == 0) {dest_valid = 0;}
 }
 
 void car_t::register_adj_car(car_t &c) {
@@ -295,7 +493,7 @@ void car_draw_state_t::add_car_headlights(vector<car_t> const &cars, vector3d co
 	for (auto i = cars.begin(); i != cars.end(); ++i) {add_car_headlights(*i, lights_bcube);}
 }
 
-void car_draw_state_t::gen_car_pts(car_t const &car, bool include_top, point pb[8], point pt[8]) const {
+/*static*/ void car_draw_state_t::gen_car_pts(car_t const &car, bool include_top, point pb[8], point pt[8]) {
 	point const center(car.get_center());
 	cube_t const &c(car.bcube);
 	float const z1(center.z - 0.5*car.height), z2(center.z + 0.5*car.height), zmid(center.z + (include_top ? 0.1 : 0.5)*car.height), length(car.get_length());
@@ -336,16 +534,14 @@ void car_draw_state_t::draw_car(car_t const &car, bool is_dlight_shadows, bool i
 		if (car.bcube.contains_pt_exp(camera_pdu.pos, 0.1*car.height)) return; // don't self-shadow
 	}
 	point const center_xlated(center + xlate);
-	float const tile_draw_dist(get_draw_tile_dist());
-	if (!shadow_only && !dist_less_than(camera_pdu.pos, center_xlated, 0.5*tile_draw_dist)) return; // check draw distance, dist_scale=0.5
+	if (!shadow_only && !dist_less_than(camera_pdu.pos, center_xlated, 0.5*draw_tile_dist)) return; // check draw distance, dist_scale=0.5
 	if (!camera_pdu.sphere_visible_test(center_xlated, 0.5f*car.height*CAR_RADIUS_SCALE) || !camera_pdu.cube_visible(car.bcube + xlate)) return;
 	begin_tile(center); // enable shadows
 	colorRGBA const &color(car.get_color());
-	float const dist_val(p2p_dist(camera_pdu.pos, center_xlated)/tile_draw_dist);
-	bool const is_truck(car.height > 1.2*city_params.get_nom_car_size().z); // hack - truck has a larger than average size
-	bool const draw_top(dist_val < 0.25 && !is_truck), dim(car.dim), dir(car.dir);
+	float const dist_val(p2p_dist(camera_pdu.pos, center_xlated)/draw_tile_dist);
+	bool const draw_top(dist_val < 0.25 && !car.is_truck), dim(car.dim), dir(car.dir);
 	bool const draw_model(car_model_loader.num_models() > 0 &&
-		(is_dlight_shadows ? dist_less_than(pre_smap_player_pos, center, 0.05*tile_draw_dist) : (shadow_only || dist_val < 0.05)));
+		(is_dlight_shadows ? dist_less_than(pre_smap_player_pos, center, 0.05*draw_tile_dist) : (shadow_only || dist_val < 0.05)));
 	float const sign((dim^dir) ? -1.0 : 1.0);
 	point pb[8], pt[8]; // bottom and top sections
 	gen_car_pts(car, draw_top, pb, pt);
@@ -389,20 +585,22 @@ void car_draw_state_t::draw_car(car_t const &car, bool is_dlight_shadows, bool i
 	vector3d const front_n(cross_product((pb[5] - pb[1]), (pb[0] - pb[1])).get_norm()*sign);
 	unsigned const lr_xor(((camera_pdu.pos[!dim] - xlate[!dim]) - center[!dim]) < 0.0f);
 	bool const brake_lights_on(car.is_almost_stopped() || car.stopped_at_light), headlights_on(car.headlights_on());
+	float const hv1(car.is_truck ? 0.8 : 0.2), hv2(1.0 - hv1); // headlights and tail lights; blend from bottom to top
+	float const sv1(car.is_truck ? 0.8 : 0.3), sv2(1.0 - hv1); // turn signals; blend from bottom to top
 
 	if (headlights_on && dist_val < 0.3) { // night time headlights
 		colorRGBA const hl_color(get_headlight_color(car));
 
 		for (unsigned d = 0; d < 2; ++d) { // L, R
 			unsigned const lr(d ^ lr_xor ^ 1);
-			point const pos((lr ? 0.2 : 0.8)*(0.2*pb[0] + 0.8*pb[4]) + (lr ? 0.8 : 0.2)*(0.2*pb[1] + 0.8*pb[5]));
+			point const pos((lr ? 0.2 : 0.8)*(hv1*pb[0] + hv2*pb[4]) + (lr ? 0.8 : 0.2)*(hv1*pb[1] + hv2*pb[5]));
 			add_light_flare(pos, front_n, hl_color, 2.0, 0.65*car.height); // pb 0,1,4,5
 		}
 	}
 	if ((brake_lights_on || headlights_on || car.in_reverse) && dist_val < 0.2) { // brake/tail/backup lights
 		for (unsigned d = 0; d < 2; ++d) { // L, R
 			unsigned const lr(d ^ lr_xor);
-			point const pos((lr ? 0.2 : 0.8)*(0.2*pb[2] + 0.8*pb[6]) + (lr ? 0.8 : 0.2)*(0.2*pb[3] + 0.8*pb[7]));
+			point const pos((lr ? 0.2 : 0.8)*(hv1*pb[2] + hv2*pb[6]) + (lr ? 0.8 : 0.2)*(hv1*pb[3] + hv2*pb[7]));
 			colorRGBA const bl_color(car.in_reverse ? colorRGBA(1.0, 0.9, 0.7, 1.0) : colorRGBA(1.0, 0.1, 0.05, 1.0)); // yellow-white/near red; pb 2,3,6,7
 			add_light_flare(pos, -front_n, bl_color, (brake_lights_on ? 1.0 : 0.5), 0.5*car.height);
 		}
@@ -416,7 +614,7 @@ void car_draw_state_t::draw_car(car_t const &car, bool is_dlight_shadows, bool i
 			vector3d const side_n(cross_product((pb[6] - pb[2]), (pb[1] - pb[2])).get_norm()*sign*(tdir ? 1.0 : -1.0));
 
 			for (unsigned d = 0; d < 2; ++d) { // B, F
-				point const pos(0.3*pb[tdir ? (d ? 1 : 2) : (d ? 0 : 3)] + 0.7*pb[tdir ? (d ? 5 : 6) : (d ? 4 : 7)]);
+				point const pos(sv1*pb[tdir ? (d ? 1 : 2) : (d ? 0 : 3)] + sv2*pb[tdir ? (d ? 5 : 6) : (d ? 4 : 7)]);
 				add_light_flare(pos, (side_n + (d ? 1.0 : -1.0)*front_n).get_norm(), colorRGBA(1.0, 0.75, 0.0, 1.0), 1.5, 0.3*car.height); // normal points out 45 degrees
 			}
 		}
@@ -501,15 +699,11 @@ void car_manager_t::add_parked_cars(vector<car_t> const &new_cars, vect_cube_t c
 	
 	for (auto i = garages.begin(); i != garages.end(); ++i) {
 		if ((rgen.rand()&3) == 0) continue; // 25% of garages have no car
-		vector3d car_sz(nom_car_size);
-		car.dim    = (i->dx() < i->dy()); // long dim
-		car.dir    = rgen.rand_bool(); // Note: ignores garage dir because some cars and backed in and some are pulled in
-		car.height = car_sz.z;
-		if (car.dim) {swap(car_sz.x, car_sz.y);}
-		car.bcube.set_from_point(i->get_cube_center());
-		car.bcube.expand_by(0.5*car_sz);
-		assert(i->contains_cube(car.bcube));
-		car.bcube.z1() = i->z1(); car.bcube.z2() = i->z1() + car.height;
+		car.dim = (i->dx() < i->dy()); // long dim
+		car.dir = rgen.rand_bool(); // Note: ignores garage dir because some cars and backed in and some are pulled in
+		point const center(i->get_cube_center());
+		car.set_bcube(point(center.x, center.y, i->z1()), nom_car_size);
+		assert(i->contains_cube_xy(car.bcube));
 		cars.push_back(car);
 		garages_bcube.assign_or_union_with_cube(car.bcube);
 	} // for i
@@ -593,7 +787,7 @@ void car_manager_t::extract_car_data(vector<car_city_vect_t> &cars_by_city) cons
 	}
 }
 
-bool car_manager_t::proc_sphere_coll(point &pos, point const &p_last, float radius, vector3d *cnorm) const {
+bool car_manager_t::proc_sphere_coll(point &pos, point const &p_last, float radius, vector3d *cnorm) const { // pos is in camera space
 	vector3d const xlate(get_camera_coord_space_xlate());
 	float const dist(p2p_dist(pos, p_last));
 
@@ -775,8 +969,8 @@ bool car_manager_t::check_car_for_ped_colls(car_t &car) const {
 	auto const &peds(peds_by_road[car.cur_road]);
 	if (peds.empty()) return 0;
 	cube_t coll_area(car.bcube);
-	coll_area.d[car.dim][!car.dir] = coll_area.d[car.dim][car.dir]; // exclude the car itself
-	coll_area.d[car.dim][car.dir] += (car.dir ? 1.25 : -1.25)*car.get_length(); // extend the front
+	coll_area.d[ car.dim][!car.dir] = coll_area.d[car.dim][car.dir]; // exclude the car itself
+	coll_area.d[ car.dim][car.dir] += (car.dir ? 1.25 : -1.25)*car.get_length(); // extend the front
 	coll_area.d[!car.dim][0] -= 0.5*car.get_width();
 	coll_area.d[!car.dim][1] += 0.5*car.get_width();
 	static rand_gen_t rgen;
@@ -805,9 +999,8 @@ void car_manager_t::next_frame(ped_manager_t const &ped_manager, float car_speed
 	}
 	entering_city.clear();
 	car_blocks.clear();
-	float const speed(CAR_SPEED_SCALE*car_speed*fticks);
+	float const speed(CAR_SPEED_SCALE*car_speed*get_clamped_fticks());
 	bool saw_parked(0);
-	//unsigned num_on_conn_road(0);
 
 	for (auto i = cars.begin(); i != cars.end(); ++i) { // move cars
 		unsigned const cix(i - cars.begin());
@@ -820,6 +1013,7 @@ void car_manager_t::next_frame(ped_manager_t const &ped_manager, float car_speed
 		}
 		if (i->is_parked()) {
 			if (!saw_parked) {car_blocks.back().first_parked = cix; saw_parked = 1;}
+			i->maybe_wake(rgen);
 			continue; // no update for parked cars
 		}
 		i->move(speed);
@@ -847,7 +1041,6 @@ void car_manager_t::next_frame(ped_manager_t const &ped_manager, float car_speed
 			for (auto ix = entering_city.begin(); ix != entering_city.end(); ++ix) {
 				if (*ix != unsigned(i - cars.begin())) {check_collision(*i, cars[*ix]);}
 			}
-			//++num_on_conn_road;
 		}
 		if (i->in_isect()) {
 			int const next_car(find_next_car_after_turn(*i)); // Note: calculates in i->car_in_front
@@ -887,7 +1080,7 @@ void car_manager_t::next_frame(ped_manager_t const &ped_manager, float car_speed
 		car_blocks_by_road.emplace_back(cars_by_road.size(), 0); // add terminator
 		cars_by_road.emplace_back(cube_t(), cars.size()); // add terminator
 	}
-	//cout << TXT(cars.size()) << TXT(entering_city.size()) << TXT(in_isects.size()) << TXT(num_on_conn_road) << endl; // TESTING
+	//cout << TXT(cars.size()) << TXT(entering_city.size()) << TXT(in_isects.size()) << endl; // TESTING
 }
 
 // calculate max zval along line for buildings and terrain; this is not intended to be fast;
@@ -925,9 +1118,9 @@ void helicopter_t::invalidate_tile_shadow_map(vector3d const &shadow_offset, boo
 void car_manager_t::helicopters_next_frame(float car_speed) {
 	if (helicopters.empty()) return;
 	//highres_timer_t timer("Helicopters Update");
-	float const elapsed_secs(fticks/TICKS_PER_SECOND);
+	float const clamp_fticks(get_clamped_fticks()), elapsed_secs(clamp_fticks/TICKS_PER_SECOND);
 	float const speed(2.0*CAR_SPEED_SCALE*car_speed); // helicopters are 2x faster than cars
-	float const takeoff_speed(0.2*speed), land_speed(0.2*speed), rotate_rate(0.02*fticks);
+	float const takeoff_speed(0.2*speed), land_speed(0.2*speed), rotate_rate(0.02*clamp_fticks);
 	float const shadow_thresh(1.0f*(X_SCENE_SIZE + Y_SCENE_SIZE)); // ~1 tile
 	point const xlate(get_camera_coord_space_xlate()), camera_bs(camera_pdu.pos - xlate);
 	vector3d const shadow_dir(-get_light_pos().get_norm()); // primary light direction (sun/moon)
@@ -988,7 +1181,7 @@ void car_manager_t::helicopters_next_frame(float car_speed) {
 				vector3d dir((helipad.bcube.get_cube_center() - i->get_landing_pt()).get_norm()); // direction to new dest helipad
 				dir.z = 0.0; // no tilt for now
 				// vertical takeoff
-				float const takeoff_dz(i->fly_zval - i->bcube.z1()), max_rise_dist(takeoff_speed*fticks), rise_dist(min(takeoff_dz, max_rise_dist));
+				float const takeoff_dz(i->fly_zval - i->bcube.z1()), max_rise_dist(takeoff_speed*clamp_fticks), rise_dist(min(takeoff_dz, max_rise_dist));
 				assert(takeoff_dz >= 0.0);
 				i->bcube += vector3d(0.0, 0.0, rise_dist);
 
@@ -1002,7 +1195,7 @@ void car_manager_t::helicopters_next_frame(float car_speed) {
 				}
 			}
 			else if (i->state == helicopter_t::STATE_LAND) {
-				float const land_dz(i->bcube.z1() - helipad.bcube.z2()), max_fall_dist(land_speed*fticks), fall_dist(min(land_dz, max_fall_dist));
+				float const land_dz(i->bcube.z1() - helipad.bcube.z2()), max_fall_dist(land_speed*clamp_fticks), fall_dist(min(land_dz, max_fall_dist));
 				assert(land_dz >= 0.0);
 				// vertical landing, no need to re-orient dir
 				i->bcube -= vector3d(0.0, 0.0, fall_dist);
@@ -1020,7 +1213,7 @@ void car_manager_t::helicopters_next_frame(float car_speed) {
 				assert(i->state == helicopter_t::STATE_FLY);
 				point const cur_pos(i->get_landing_pt()), dest_pos(helipad.bcube.get_cube_center());
 				cube_t dest(dest_pos);
-				vector3d const delta_pos(fticks*i->velocity); // distance of travel this frame
+				vector3d const delta_pos(clamp_fticks*i->velocity); // distance of travel this frame
 				dest.expand_by_xy(delta_pos.mag());
 			
 				if (dest.contains_pt_xy(cur_pos)) { // reached destination
@@ -1034,7 +1227,7 @@ void car_manager_t::helicopters_next_frame(float car_speed) {
 				}
 			}
 			if (i->velocity != zero_vector) {
-				i->blade_rot += 0.75*fticks; // rotate the blade; should this scale with velocity?
+				i->blade_rot += 0.75*clamp_fticks; // rotate the blade; should this scale with velocity?
 				if (i->blade_rot > TWO_PI) {i->blade_rot -= TWO_PI;} // keep rotation value small
 			}
 			// helicopter dynamic shadows look really neat, but significantly reduce framerate; enable with backslash key
@@ -1091,19 +1284,21 @@ void car_manager_t::draw(int trans_op_mask, vector3d const &xlate, bool use_dlig
 		translate_to(xlate);
 		dstate.pre_draw(xlate, use_dlights, shadow_only);
 		if (!shadow_only) {dstate.s.add_uniform_float("hemi_lighting_normal_scale", 0.0);} // disable hemispherical lighting normal because the transforms make it incorrect
-		float const tile_draw_dist(get_draw_tile_dist());
+		float const draw_tile_dist(dstate.draw_tile_dist);
 
 		for (auto cb = car_blocks.begin(); cb+1 < car_blocks.end(); ++cb) {
 			if (cb->is_in_building() != garages_pass) continue; // wrong pass
 			cube_t const block_bcube(get_cb_bcube(*cb) + xlate);
-			if (!shadow_only && !block_bcube.closest_dist_less_than(camera_pdu.pos, 0.5*tile_draw_dist)) continue; // check draw distance, dist_scale=0.5
+			if (!shadow_only && !block_bcube.closest_dist_less_than(camera_pdu.pos, 0.5*draw_tile_dist)) continue; // check draw distance, dist_scale=0.5
 			if (!camera_pdu.cube_visible(block_bcube)) continue; // city not visible - skip
 			unsigned const end((cb+1)->start);
 			assert(end <= cars.size());
 
 			for (unsigned c = cb->start; c != end; ++c) {
-				if (only_parked && !cars[c].is_parked()) continue; // skip non-parked cars
-				dstate.draw_car(cars[c], is_dlight_shadows, garages_pass);
+				car_t const &car(cars[c]);
+				if (only_parked && !(car.is_parked() && !car.is_sleeping())) continue; // skip non-parked cars
+				if (skip_car_draw(car)) continue;
+				dstate.draw_car(car, is_dlight_shadows, garages_pass);
 			}
 		} // for cb
 		if (!garages_pass && !is_dlight_shadows) {draw_helicopters(shadow_only);} // draw helicopters in the normal draw pass
@@ -1123,6 +1318,12 @@ void car_manager_t::draw(int trans_op_mask, vector3d const &xlate, bool use_dlig
 				draw_simple_cube(sel_car->bcube + xlate);
 
 				if (!sel_car->is_parked() && sel_car->dest_valid) { // draw destination of moving car
+					if (sel_car->cur_city != sel_car->dest_city) { // dest is in a different city
+						s.set_cur_color(RED);
+						cube_t city_bcube(get_city_bcube(sel_car->dest_city));
+						city_bcube.z2() += 10.0*city_params.road_width; // increase height to make it more easily visible
+						draw_simple_cube(city_bcube + xlate);
+					}
 					if (sel_car->dest_driveway >= 0) {
 						s.set_cur_color(CYAN);
 						cube_t dw_bcube(get_car_dest_bcube(*sel_car, 0)); // driveway

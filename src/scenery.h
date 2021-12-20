@@ -113,12 +113,14 @@ public:
 
 class wood_scenery_obj : public burnable_scenery_obj {
 protected:
-	mutable int closest_bark_tid;
-	wood_scenery_obj() : closest_bark_tid(-1) {}
+	int closest_tree_type; // cached from drawing functions
+	wood_scenery_obj() : closest_tree_type(-1) {}
 	void calc_type();
 	bool is_from_large_trees() const;
 	int get_tid() const;
 	colorRGBA get_bark_color(vector3d const &xlate=zero_vector) const;
+public:
+	void cache_closest_tree_type(tree_cont_t const &trees);
 };
 
 
@@ -189,6 +191,8 @@ public:
 
 	s_plant() : coll_id2(-1), height(1.0) {}
 	virtual float get_bsphere_radius() const {return 0.5f*(height + radius);}
+	point get_top_pt() const {return pos + point(0.0, 0.0, height);}
+	bool is_water_plant() const;
 	bool operator<(s_plant const &p) const {return (type < p.type);}
 	colorRGBA const &get_leaf_color() const;
 	colorRGBA const &get_stem_color() const;
@@ -227,6 +231,7 @@ public:
 	int create(int x, int y, int use_xy, float minz, unsigned plant_ix_);
 	void create2(point const &pos_, float radius_, int type_, int calc_z, unsigned plant_ix_);
 	unsigned num_leaves() const {return leaves.size();}
+	point get_top_pt() const {return pos + point(0.0, 0.0, radius);}
 	void gen_points(vbo_vnt_block_manager_t &vbo_manager, vector<vert_norm_tc> const &sphere_verts);
 	void add_cobjs();
 	void obj_collision(float energy) {cur_motion_energy += energy;}
@@ -267,14 +272,15 @@ public:
 	void do_rock_damage(point const &pos, float radius, float damage);
 	void add_plant(point const &pos, float height, float radius, int type, int calc_z);
 	void add_leafy_plant(point const &pos, float radius, int type, int calc_z);
-	void gen(int x1, int y1, int x2, int y2, float vegetation_, bool fixed_sz_rock_cache);
-	void post_gen_setup();
+	void gen(int x1, int y1, int x2, int y2, float vegetation_, bool fixed_sz_rock_cache, tree_cont_t const &trees);
+	void post_gen_setup(tree_cont_t const &trees);
 	void draw_plant_leaves(shader_t &s, bool shadow_only, vector3d const &xlate, bool reflection_pass=0);
 	void draw_opaque_objects(shader_t &s, shader_t &vrs, bool shadow_only, vector3d const &xlate, bool draw_pld, float scale_val=0.0, bool reflection_pass=0);
 	bool setup_voxel_rocks_shader(shader_t &vrs, bool shadow_only) const;
 	void draw(bool shadow_only, vector3d const &xlate=zero_vector);
 	void draw_fires(shader_t &s) const;
 	void leafy_plant_coll(unsigned plant_ix, float energy);
+	bool choose_butterfly_dest(point &dest, sphere_t &plant_bsphere, rand_gen_t &rgen) const;
 	void write_plants_to_cobj_file(std::ostream &out) const;
 	unsigned get_gpu_mem() const {return (plant_vbo_manager.get_gpu_mem() + rock_vbo_manager.get_gpu_mem() + leafy_vbo_manager.get_gpu_mem());} // only accounts for part of the memory
 };

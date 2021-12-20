@@ -13,6 +13,8 @@
 #include "tree_3dw.h"
 #include "shadow_map.h"
 #include "animals.h"
+#include <unordered_map>
+#include <unordered_set>
 
 
 bool const ENABLE_TREE_LOD    = 1; // faster but has popping artifacts
@@ -101,11 +103,15 @@ struct tile_xy_pair {
 
 	int x, y;
 	tile_xy_pair(int x_=0, int y_=0) : x(x_), y(y_) {}
-	bool operator<(tile_xy_pair const &t) const {return ((y == t.y) ? (x < t.x) : (y < t.y));}
+	bool operator==(tile_xy_pair const &tp) const {return (x == tp.x && y == tp.y);}
+	bool operator< (tile_xy_pair const &tp) const {return ((y == tp.y) ? (x < tp.x) : (y < tp.y));}
 	void operator+=(tile_xy_pair const &tp) {x += tp.x; y += tp.y;}
 	void operator-=(tile_xy_pair const &tp) {x -= tp.x; y -= tp.y;}
 	tile_xy_pair operator+(tile_xy_pair const &tp) const {return tile_xy_pair(x+tp.x, y+tp.y);}
 	tile_xy_pair operator-(tile_xy_pair const &tp) const {return tile_xy_pair(x-tp.x, y-tp.y);}
+};
+struct hash_tile_xy_pair {
+	uint32_t operator()(tile_xy_pair const &tp) const {return ((tp.x * 0x1F1F1F1F) ^ tp.y);}
 };
 
 tile_t *get_tile_from_xy(tile_xy_pair const &tp);
@@ -184,6 +190,7 @@ private:
 	tile_cloud_manager_t clouds;
 	vect_fish_t fish;
 	vect_bird_t birds;
+	vect_butterfly_t bflies;
 
 	struct grass_block_t {
 		unsigned ix; // 0 is unused
@@ -222,12 +229,14 @@ public:
 	bool has_pine_trees() const {return (pine_trees_generated() && !pine_trees.empty());}
 	bool has_valid_shadow_map() const {return !smap_data.empty();}
 	bool has_grass() const {return !grass_blocks.empty();}
+	bool get_checkerboard_bit() const {return (((x1/128) + (y1/128)) & 1);}
 	void invalidate_mesh_height() {mesh_height_invalid = 1;}
 	float get_avg_veg() const {return 0.25f*(params[0][0].veg + params[0][1].veg + params[1][0].veg + params[1][1].veg);}
 	void set_last_occluded(bool val) {last_occluded = val; last_occluded_frame = frame_counter;}
 	bool was_last_occluded  () const {return (last_occluded_frame == frame_counter &&  last_occluded);}
 	bool was_last_unoccluded() const {return (last_occluded_frame == frame_counter && !last_occluded);}
-	vect_bird_t &get_birds() {return birds;} // for flocking
+	vect_bird_t      &get_birds () {return birds; } // for flocking
+	vect_butterfly_t &get_bflies() {return bflies;} // for mating
 
 	// all of these are in the current camera's local coordinate space (based on xoff/yoff/xoff2/yoff2)
 	point get_center() const {
@@ -336,6 +345,7 @@ public:
 	bool mesh_sphere_intersect(point const &pos, float rradius) const;
 	bool update_range(tile_shadow_map_manager &smap_manager);
 	bool is_visible() const {return camera_pdu.sphere_and_cube_visible_test(get_center(), get_bsphere_radius_inc_water(), get_bcube());}
+	bool is_smap_bounds_visible() const {return camera_pdu.cube_visible(get_shadow_bcube());}
 	float get_dist_to_camera_in_tiles(bool xy_dist=1) const {return get_rel_dist_to_camera(xy_dist)*TILE_RADIUS;}
 	float get_scenery_thresh    (bool reflection_pass) const {return (reflection_pass ? SCENERY_THRESH_REF : SCENERY_THRESH);}
 	float get_scenery_dist_scale(bool reflection_pass) const {return tree_scale*get_dist_to_camera_in_tiles(0)/get_scenery_thresh(reflection_pass);}
@@ -375,19 +385,22 @@ public:
 	void pre_draw_grass_flowers(shader_t &s, bool use_cloud_shadows) const;
 	unsigned draw_grass(shader_t &s, vector<vector<vector2d> > *insts, bool use_cloud_shadows, bool enable_tess, int lt_loc);
 	unsigned draw_flowers(shader_t &s, bool use_cloud_shadows);
+	bool choose_butterfly_dest(point &dest, sphere_t &plant_bsphere, rand_gen_t &rgen) const;
 
 	// *** clouds ***
 	void get_cloud_draw_list(cloud_draw_list_t &clouds_to_draw) const {clouds.get_draw_list(clouds_to_draw, mzmin, mzmax);}
 	unsigned update_tile_clouds();
 
 	// *** animals ***
-	void add_animal(fish_t const &f) {fish.push_back (f);}
-	void add_animal(bird_t const &b) {birds.push_back(b);}
+	void add_animal(fish_t      const &f) {fish.push_back  (f);}
+	void add_animal(bird_t      const &b) {birds.push_back (b);}
+	void add_animal(butterfly_t const &b) {bflies.push_back(b);}
 	template<typename A> void propagate_animals_to_neighbor_tiles(animal_group_t<A> &animals);
 	void update_animals();
-	void clear_animals() {fish.clear(); birds.clear();}
-	void draw_birds(shader_t &s, bool reflection_pass) const {birds.draw_animals(s);}
-	void draw_fish (shader_t &s, bool reflection_pass) const {if (!reflection_pass) {fish.draw_animals(s);}}
+	void clear_animals() {fish.clear(); birds.clear(); bflies.clear();}
+	void draw_birds (shader_t &s) const {birds.draw_animals (s, this);}
+	void draw_fish  (shader_t &s) const {fish.draw_animals  (s, this);}
+	void draw_bflies(shader_t &s) const {bflies.draw_animals(s, this);}
 
 	// *** rendering ***
 	void pre_draw(mesh_xy_grid_cache_t &height_gen);
@@ -401,16 +414,16 @@ public:
 	void draw_water_cap(shader_t &s, bool textures_already_set) const;
 	void draw_water(shader_t &s, float z) const;
 	bool is_water_visible() const;
-	bool check_sphere_collision(point &pos, float sradius) const;
+	bool check_sphere_collision(point &pos, float sradius, bool inc_dtrees=1, bool inc_ptrees=1, bool inc_scenery=1) const;
 	int get_tid_under_point(point const &pos) const;
-	bool line_intersect_mesh(point const &v1, point const &v2, float &t, int &xpos, int &ypos) const;
+	bool line_intersect_mesh(point const &v1, point const &v2, float &t, int &xpos, int &ypos, float inc_trees) const;
 }; // tile_t
 
 
 class tile_draw_t : public indexed_vbo_manager_t {
 
-	typedef map<tile_xy_pair, std::unique_ptr<tile_t> > tile_map;
-	typedef set<tile_xy_pair> tile_set_t;
+	typedef unordered_map<tile_xy_pair, unique_ptr<tile_t>, hash_tile_xy_pair> tile_map;
+	typedef unordered_set<tile_xy_pair, hash_tile_xy_pair> tile_set_t;
 	typedef vector<pair<float, tile_t *> > draw_vect_t;
 
 	tile_map tiles;
@@ -458,6 +471,8 @@ public:
 	void draw_shadow_pass(point const &lpos, tile_t *tile, bool decid_trees_only=0);
 	void draw_decid_tree_shadows() {draw_shadow_pass(camera_pdu.pos, nullptr, 1);}
 	void draw_water(shader_t &s, float zval) const;
+	static void billboard_tree_shader_setup(shader_t &s);
+	static void tree_branch_shader_setup(shader_t &s, bool enable_shadow_maps, bool enable_opacity, bool shadow_only, bool enable_dlights=0);
 private:
 	void draw_tiles(int reflection_pass, bool enable_shadow_map) const;
 	void draw_tiles_shadow_pass(point const &lpos, tile_t const *const tile);
@@ -469,8 +484,6 @@ private:
 	void draw_pine_tree_bl(shader_t &s, bool branches, bool near_leaves, bool far_leaves, bool shadow_pass, bool reflection_pass, bool enable_smap, int xlate_loc);
 	void draw_pine_trees(bool reflection_pass, bool shadow_pass=0);
 	void draw_decid_tree_bl(shader_t &s, tree_lod_render_t &lod_renderer, bool branches, bool leaves, bool reflection_pass, bool shadow_pass, bool enable_smap);
-	static void billboard_tree_shader_setup(shader_t &s);
-	static void tree_branch_shader_setup(shader_t &s, bool enable_shadow_maps, bool enable_opacity, bool shadow_only, bool enable_dlights=0);
 	void draw_decid_trees(bool reflection_pass, bool shadow_pass=0);
 	void draw_scenery(bool reflection_pass, bool shadow_pass=0);
 	static void setup_grass_flower_shader(shader_t &s, bool enable_wind, bool use_smap, float dist_const_mult);
@@ -490,7 +503,7 @@ public:
 	bool check_sphere_collision(point &pos, float radius) const;
 	bool check_player_collision() const;
 	int get_tid_under_point(point const &pos) const;
-	bool line_intersect_mesh(point const &v1, point const &v2, float &t, tile_t *&intersected_tile, int &xpos, int &ypos) const;
+	bool line_intersect_mesh(point const &v1, point const &v2, float &t, tile_t *&intersected_tile, int &xpos, int &ypos, float inc_trees) const;
 	float get_actual_zmin() const;
 	void add_or_remove_trees_at(point const &pos, float radius, bool add_trees, int brush_shape);
 	void add_or_remove_grass_at(point const &pos, float radius, bool add_grass, int brush_shape, float brush_weight);

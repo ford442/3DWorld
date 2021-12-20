@@ -164,23 +164,6 @@ struct weighted_normal : public vector3d { // size = 16
 	bool is_valid() const {return (weight > 0.0);}
 };
 
-
-template<typename T> uint32_t jenkins_one_at_a_time_hash(const T* key, size_t length) { // T is an unsigned integer type
-
-	size_t i = 0;
-	uint32_t hash = 0;
-	while (i != length) {hash += key[i++]; hash += hash << 10; hash ^= hash >> 6;}
-	hash += hash << 3;
-	hash ^= hash >> 11;
-	hash += hash << 15;
-	return hash;
-}
-
-template<typename T> struct hash_by_bytes { // should work with all packed vertex types
-	uint32_t operator()(T const &v) const {return jenkins_one_at_a_time_hash((const uint8_t*)&v, sizeof(T));} // slower but better quality hash
-	//uint32_t operator()(T const &v) const {return jenkins_one_at_a_time_hash((const uint32_t*)&v, sizeof(T)>>2);} // faster but lower quality hash
-};
-
 //template<typename T> class vertex_map_t : public unordered_map<T, unsigned, hash_by_bytes<T>> {
 template<typename T> class vertex_map_t : public map<T, unsigned> {
 
@@ -373,21 +356,31 @@ template<typename T> struct geometry_t {
 
 
 class texture_manager {
-
+	struct tex_work_item_t {
+		unsigned tid;
+		bool is_nm;
+		tex_work_item_t(unsigned tid_, bool is_nm_) : tid(tid_), is_nm(is_nm_) {}
+		// we really shouldn't have the same tid with different is_nm; should we just ingore is_nm when comparing
+		bool operator< (tex_work_item_t const &w) const {return ((tid == w.tid) ? (is_nm < w.is_nm) : (tid < w.tid));}
+		bool operator==(tex_work_item_t const &w) const {return (tid == w.tid && is_nm == w.is_nm);}
+	};
 protected:
 	deque<texture_t> textures;
 	string_map_t tex_map; // maps texture filenames to texture indexes
-
+	vector<tex_work_item_t> to_load;
 public:
 	unsigned create_texture(string const &fn, bool is_alpha_mask, bool verbose, bool invert_alpha=0, bool wrap=1, bool mirror=0, bool force_grayscale=0);
+	bool empty() const {return textures.empty();}
 	void clear();
 	void free_tids();
 	void free_textures();
 	void free_client_mem();
-	bool ensure_texture_loaded(texture_t &t, int tid, bool is_bump);
+	bool ensure_texture_loaded(int tid, bool is_bump);
 	void bind_alpha_channel_to_texture(int tid, int alpha_tid);
-	bool ensure_tid_loaded(int tid, bool is_bump) {return ((tid >= 0) ? ensure_texture_loaded(get_texture(tid), tid, is_bump) : 0);}
+	bool ensure_tid_loaded(int tid, bool is_bump) {return ((tid >= 0) ? ensure_texture_loaded(tid, is_bump) : 0);}
 	void ensure_tid_bound(int tid) {if (tid >= 0) {get_texture(tid).check_init();}} // if allocated
+	void add_work_item(int tid, bool is_nm);
+	void load_work_items_mt();
 	void bind_texture(int tid) const {get_texture(tid).bind_gl();}
 	colorRGBA get_tex_avg_color(int tid) const {return get_texture(tid).get_avg_color();}
 	bool has_binary_alpha(int tid) const {return get_texture(tid).has_binary_alpha;}
@@ -432,13 +425,14 @@ struct material_t : public material_params_t {
 	bool use_spec_map() const;
 	unsigned get_gpu_mem() const {return (geom.get_gpu_mem() + geom_tan.get_gpu_mem());}
 	void finalize() {geom.finalize(); geom_tan.finalize();}
-	int get_render_texture() const {return ((d_tid >= 0) ? d_tid : a_tid);}
+	int get_render_texture() const {return ((d_tid >= 0 || a_tid < 0) ? d_tid : a_tid);} // return diffuse texture unless ambient texture is specified but diffuse texture is not
 	bool get_needs_alpha_test() const {return (alpha_tid >= 0 || might_have_alpha_comp);}
 	bool is_partial_transparent() const {return (alpha < 1.0 || get_needs_alpha_test());}
 	void compute_area_per_tri();
 	void simplify_indices(float reduce_target);
 	void ensure_textures_loaded(texture_manager &tmgr);
 	void init_textures(texture_manager &tmgr);
+	void queue_textures_to_load(texture_manager &tmgr);
 	void check_for_tc_invert_y(texture_manager &tmgr);
 	void render(shader_t &shader, texture_manager const &tmgr, int default_tid, bool is_shadow_pass, bool is_z_prepass,
 		int enable_alpha_mask, bool is_bmap_pass, point const *const xlate);
@@ -555,14 +549,15 @@ public:
 	}
 	void render_materials(shader_t &shader, bool is_shadow_pass, int reflection_pass, bool is_z_prepass, int enable_alpha_mask, unsigned bmap_pass_mask,
 		int trans_op_mask, base_mat_t const &unbound_mat, rotation_t const &rot, point const *const xlate=nullptr, xform_matrix const *const mvm=nullptr,
-		bool force_lod=0, float model_lod_mult=1.0, float fixed_lod_dist=0.0, bool skip_cull_face=0);
+		bool force_lod=0, float model_lod_mult=1.0, float fixed_lod_dist=0.0, bool skip_cull_face=0, bool is_scaled=0);
 	void render_material(shader_t &shader, unsigned mat_id, bool is_shadow_pass, bool is_z_prepass=0, int enable_alpha_mask=0, bool is_bmap_pass=0, point const *const xlate=nullptr);
 	void render_with_xform(shader_t &shader, model3d_xform_t &xf, xform_matrix const &mvm, bool is_shadow_pass,
 		int reflection_pass, bool is_z_prepass, int enable_alpha_mask, unsigned bmap_pass_mask, int reflect_mode, int trans_op_mask);
 	void render(shader_t &shader, bool is_shadow_pass, int reflection_pass, bool is_z_prepass, int enable_alpha_mask,
 		unsigned bmap_pass_mask, int reflect_mode, int trans_op_mask, vector3d const &xlate);
 	material_t *get_material_by_name(string const &name);
-	void set_color_for_material(unsigned mat_id, colorRGBA const &color);
+	colorRGBA set_color_for_material(unsigned mat_id, colorRGBA const &color);
+	int set_texture_for_material(unsigned mat_id, int tid);
 	void ensure_reflection_cube_map();
 	cube_t get_single_transformed_bcube(vector3d const &xlate=zero_vector) const;
 	void setup_shadow_maps();
@@ -570,6 +565,7 @@ public:
 	bool has_any_transforms() const {return !transforms.empty();}
 	cube_t const &get_bcube() const {return bcube;}
 	cube_t calc_bcube_including_transforms();
+	void union_bcube_with(cube_t const &c) {bcube.union_with_cube(c);}
 	void build_cobj_tree(bool verbose);
 	bool check_coll_line_cur_xf(point const &p1, point const &p2, point &cpos, vector3d &cnorm, colorRGBA &color, bool exact);
 	bool check_coll_line(point const &p1, point const &p2, point &cpos, vector3d &cnorm, colorRGBA &color, bool exact, bool build_bvh_if_needed=0);

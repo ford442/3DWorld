@@ -1537,7 +1537,7 @@ void translocator_death(int player_id) {
 
 bool try_use_translocator(int player_id) {
 
-	// TODO: Smileys shoot enemy translocator
+	// Should smileys shoot enemy translocators?
 	assert(sstates != NULL); // shouldn't get here in this case
 	assert(player_id >= CAMERA_ID && player_id < num_smileys);
 	obj_group &objg(obj_groups[coll_id[XLOCATOR]]);
@@ -2135,7 +2135,7 @@ point projectile_test(point const &pos, vector3d const &vcf_, float firing_error
 
 	if (world_mode == WMODE_INF_TERRAIN) {
 		point const pos2(pos + vcf*range);
-		intersect = line_intersect_tiled_mesh(pos, pos2, coll_pos); // check terrain
+		intersect = line_intersect_tiled_mesh(pos, pos2, coll_pos, 1); // check terrain; inc_trees=1
 		point p_int;
 		
 		if (line_intersect_city(pos, pos2, p_int)) { // check city (buildings and cars)
@@ -2267,7 +2267,7 @@ point projectile_test(point const &pos, vector3d const &vcf_, float firing_error
 				}
 				if (decal_tid >= 0) {gen_decal(decal_pos, decal_radius, coll_norm, decal_tid, cindex, dcolor, is_glass, 1);} // inherit partial glass color
 
-				if (coll_norm.z > -0.5 && !is_glass && ((is_laser & (rand()&1)) || wtype == W_M16)) { // create small dust clouds/smoke at hit locations
+				if (coll_norm.z > -0.5 && !is_glass && ((is_laser && (rand()&1)) || wtype == W_M16)) { // create small dust clouds/smoke at hit locations
 					point const smoke_pos(coll_pos + decal_radius*coll_norm);
 					vector3d const smoke_vel(vector3d(0.1*coll_norm.x, 0.1*coll_norm.y, 0.1));
 					gen_arb_smoke(smoke_pos, WHITE, smoke_vel, 0.2*decal_radius, 1.0, (is_laser ? 1.0 : 0.5), 0.0, shooter, SMOKE, 0, 0.01);
@@ -2774,6 +2774,7 @@ void player_state::update_sstate_game_frame(int i) {
 	}
 	fire_frame = max(0,    (fire_frame - iticks));
 	shields    = max(0.0f, (shields    - 0.01f*fticks));
+	if (world_mode != WMODE_GROUND) return;
 
 	// check temperature for too hot/too cold
 	obj_group const &objg(obj_groups[coll_id[SMILEY]]);
