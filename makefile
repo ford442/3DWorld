@@ -14,7 +14,10 @@ JPEGt=dependencies/libjpeg-turbo
 GLUT=dependencies/freeglut-2.8.1/include 
 MESH=dependencies/meshoptimizer/src
 ALUT=dependencies/freealut/include
-INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT) -I$(MESH) -I$(JPEG) -I$(ALUT) -I$(JPEGt) -I$(PNG)
+GLEW=dependencies/glew-2.0.0/include
+TIFF=dependencies/tiff-4.3.0/libtiff
+
+INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT) -I$(MESH) -I$(JPEG) -I$(ALUT) -I$(JPEGt) -I$(PNG) -I$(GLEW) -I$(TIFF)
 DEFINES=-DENABLE_JPEG -DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS
 CXXFLAGS=
 
