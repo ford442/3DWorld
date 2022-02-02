@@ -8,7 +8,8 @@ CXX=em++ -g -O3 -sUSE_WEBGL2=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
 TARGA=Targa
 GLI=dependencies/gli
 GLM=dependencies/glm
-INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc 
+GLUT=dependencies/freeglut-2.8.1/include/GL
+INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT)
 DEFINES=-DENABLE_JPEG -DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS
 CXXFLAGS=
 
