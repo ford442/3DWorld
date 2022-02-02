@@ -9,11 +9,12 @@ TARGA=Targa
 GLI=dependencies/gli
 GLM=dependencies/glm
 JPEG=dependencies/jpeg-9a
-JPEG=dependencies/libpng-1.2.20
+PNG=dependencies/libpng-1.2.20
+JPEGt=dependencies/libjpeg-turbo
 GLUT=dependencies/freeglut-2.8.1/include 
 MESH=dependencies/meshoptimizer/src
 ALUT=dependencies/freealut/include/
-INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT) -I$(MESH) -I$(JPEG) -I$(ALUT)
+INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT) -I$(MESH) -I$(JPEG) -I$(ALUT) -I$(JPEGt) -I$(PNG)
 DEFINES=-DENABLE_JPEG -DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS
 CXXFLAGS=
 
