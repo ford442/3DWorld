@@ -11,8 +11,8 @@ GLM=dependencies/glm
 JPEG=dependencies/jpeg-9a
 GLUT=dependencies/freeglut-2.8.1/include 
 MESH=dependencies/meshoptimizer/src
-
-INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT) -I$(MESH) -I$(JPEG)
+ALUT=dependencies/freealut/include/AL
+INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT) -I$(MESH) -I$(JPEG) -I$(ALUT)
 DEFINES=-DENABLE_JPEG -DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS
 CXXFLAGS=
 
