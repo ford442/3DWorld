@@ -9,6 +9,7 @@ TARGA=Targa
 GLI=dependencies/gli
 GLM=dependencies/glm
 JPEG=dependencies/jpeg-9a
+JPEG=dependencies/libpng-1.2.20
 GLUT=dependencies/freeglut-2.8.1/include 
 MESH=dependencies/meshoptimizer/src
 ALUT=dependencies/freealut/include/
