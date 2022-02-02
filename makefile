@@ -3,7 +3,7 @@ BUILD=obj
 VPATH=$(BUILD) src src/texture_tile_blend
 CXX=em++ -g -O3 -sUSE_WEBGL2=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
 -sFORCE_FILESYSTEM=1  -sFULL_ES2=1 -sFULL_ES3=1 --closure 0 -sGL_TESTING=1 \
--fopenmp $(INCLUDES) $(DEFINES) -Wextra -Wno-unused-parameter -Wno-implicit-fallthrough \
+$(INCLUDES) $(DEFINES) -Wextra -Wno-unused-parameter -Wno-implicit-fallthrough \
 -sALLOW_MEMORY_GROWTH=0 -sINITIAL_MEMORY=1400mb
 TARGA=Targa
 GLI=dependencies/gli
@@ -13,7 +13,7 @@ PNG=dependencies/libpng-1.2.20
 JPEGt=dependencies/libjpeg-turbo
 GLUT=dependencies/freeglut-2.8.1/include 
 MESH=dependencies/meshoptimizer/src
-ALUT=dependencies/freealut/include/
+ALUT=dependencies/freealut/include
 INCLUDES=-Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Isrc -I$(GLUT) -I$(MESH) -I$(JPEG) -I$(ALUT) -I$(JPEGt) -I$(PNG)
 DEFINES=-DENABLE_JPEG -DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS
 CXXFLAGS=
