@@ -4,7 +4,7 @@ VPATH=$(BUILD) src src/texture_tile_blend
 CXX=em++ -g -O3 -sUSE_WEBGL2=1 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
 -sFORCE_FILESYSTEM=1  -sFULL_ES2=1 -sFULL_ES3=1 --closure 0 -sGL_TESTING=1 \
 $(INCLUDES) $(DEFINES) -Wextra -Wno-unused-parameter -Wno-implicit-fallthrough \
--sALLOW_MEMORY_GROWTH=0 -sINITIAL_MEMORY=1400mb
+-sALLOW_MEMORY_GROWTH=0 -sINITIAL_MEMORY=1400mb -ffast-math
 TARGA=Targa
 GLI=dependencies/gli
 GLM=dependencies/glm
