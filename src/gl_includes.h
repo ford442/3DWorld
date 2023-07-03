@@ -16,7 +16,7 @@
 #include <freeglut.h>
 #undef FAR // undefine conflicting defines picked up from windows headers
 #else // linux
-#include <GL/freeglut.h> // standard glut
+#include "usr/include/GL/freeglut.h" // standard glut
 #endif
 
 #include <GL/glu.h>
