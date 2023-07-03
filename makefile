@@ -5,7 +5,7 @@ VPATH=$(BUILD) src src/texture_tile_blend
 TARGA=Targa
 GLI=dependencies/gli
 GLM=dependencies/glm
-INCLUDES=-I/usr/include -Isrc -Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Idependencies/meshoptimizer/src -Idependencies/stb
+INCLUDES=-I/usr/include/GL -Isrc -Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) -Idependencies/meshoptimizer/src -Idependencies/stb
 DEFINES=-DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS -DENABLE_STB_IMAGE -DENABLE_ASSIMP
 # Note: extra warnings can be useful, but GLI and Targa generate too many warnings
 CXXFLAGS=-g -Wall -O3 $(INCLUDES) $(DEFINES) -Wextra -Wno-unused-parameter -Wno-implicit-fallthrough \
