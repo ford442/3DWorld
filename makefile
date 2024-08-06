@@ -49,12 +49,12 @@ all: $(TARGET)
 # Link the target
 $(TARGET): $(OBJS)
 	@echo "Linking $<"
-	$(Q)cd $(BUILD) && $(CXX) $(INCLUDES) -o $(TARGET) $(OBJS) $(LDFLAGS)
+	$(Q)cd $(BUILD) && emcc $(INCLUDES) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
 # Compile source files
 %.o : %.cpp $(BUILD)/%.d
 	@echo "Compiling $<"
-	$(Q)$(CXX) $(DEPFLAGS) $(CXXFLAGS) $(INCLUDES) $(DEFINES) -c $(abspath $<) -o $(abspath $(BUILD)/$@)
+	$(Q)em++ $(DEPFLAGS) $(CXXFLAGS) $(INCLUDES) $(DEFINES) -c $(abspath $<) -o $(abspath $(BUILD)/$@)
 	@$(POSTCOMPILE)
 
 # Delete compiled files
