@@ -8,16 +8,24 @@
 #include "model3d.h"
 
 
-enum {ANIM_ID_WALK=0, ANIM_ID_IDLE, ANIM_ID_ATTACK, NUM_ANIM_IDS};
-string const animation_names[NUM_ANIM_IDS] = {"walking", "idle", "attack"};
+float const SKELETAL_ANIM_TIME_CONST = 32.0; // maybe should rework these constants; this should be for people only, not all models
+
+enum {ANIM_ID_NONE=0, ANIM_ID_WALK, ANIM_ID_BHOP, ANIM_ID_FLIP, ANIM_ID_TWIRL, ANIM_ID_MARCH, ANIM_ID_ALIEN,
+	  ANIM_ID_RAT, ANIM_ID_SPIDER, ANIM_ID_SKELETAL, ANIM_ID_HCOPTER, ANIM_ID_SWINGS, ANIM_ID_FISH_TAIL};
+// Note: MODEL_ANIM_STAIRS is for future use when walking up and down stairs; MODEL_ANIM_ATTACK is for future use with zombies
+enum {MODEL_ANIM_WALK=0, MODEL_ANIM_IDLE, MODEL_ANIM_STAIRS_UP, MODEL_ANIM_STAIRS_DOWN, MODEL_ANIM_ATTACK, MODEL_ANIM_CROUCH, NUM_MODEL_ANIMS};
+string const animation_names[NUM_MODEL_ANIMS] = {"walking", "idle", "stairs_up", "stairs_down", "attack", "crouch"};
 
 struct animation_state_t {
-	bool enabled=0, fixed_anim_speed=0;
+	bool enabled=0, fixed_anim_speed=0, cache_animations=0;
 	unsigned anim_id=0, model_anim_id=0, model_anim_id2=0;
 	float anim_time=0.0, anim_time2=0.0, blend_factor=0.0;
+	bone_transform_data_t *cached=nullptr;
 
-	animation_state_t(bool enabled_=0, unsigned anim_id_=0, float anim_time_=0.0, unsigned model_anim_id_=0) :
+	animation_state_t(bool enabled_=0, unsigned anim_id_=ANIM_ID_NONE, float anim_time_=0.0, unsigned model_anim_id_=MODEL_ANIM_WALK) :
 		enabled(enabled_), anim_id(anim_id_), model_anim_id(model_anim_id_), model_anim_id2(model_anim_id_), anim_time(anim_time_) {}
+	int get_anim_id_for_setup_bone_transforms () const;
+	int get_anim_id2_for_setup_bone_transforms() const;
 	void set_animation_id_and_time(shader_t &s, bool has_bone_animations=0, float anim_speed=1.0) const;
 	void clear_animation_id(shader_t &s) const;
 };
@@ -30,7 +38,9 @@ struct city_model_t {
 	int body_mat_id=-1, fixed_color_id=-1, recalc_normals=1, centered=0; // recalc_normals: 0=no, 1=yes, 2=face_weight_avg
 	int blade_mat_id=-1; // for helicopters
 	int model3d_id=-1; // index into model3ds vector; -1 is not set
-	float xy_rot=0.0, lod_mult=1.0, scale=1.0, anim_speed=1.0; // xy_rot in degrees
+	uint64_t rev_winding_mask=0;
+	float xy_rot=0.0, lod_mult=1.0, scale=1.0, model_anim_scale=1.0, anim_speed=1.0; // xy_rot in degrees
+	point rotate_about;
 	colorRGBA custom_color;
 	string default_anim_name;
 	vector<unsigned> shadow_mat_ids;
@@ -69,9 +79,11 @@ public:
 	bool model_filename_contains(unsigned id, string const &str, string const &str2="") const;
 	bool is_model_valid(unsigned id);
 	void load_model_id(unsigned id);
+	bool check_anim_wrapped(unsigned model_id, unsigned model_anim_id, float old_time, float new_time);
+	float get_anim_duration(unsigned model_id, unsigned model_anim_id);
 	void draw_model(shader_t &s, vector3d const &pos, cube_t const &obj_bcube, vector3d const &dir, colorRGBA const &color,
-		vector3d const &xlate, unsigned model_id, bool is_shadow_pass, bool low_detail=0, animation_state_t *anim_state=nullptr,
-		unsigned skip_mat_mask=0, bool untextured=0, bool force_high_detail=0, bool upside_down=0, bool emissive=0);
+		vector3d const &xlate, unsigned model_id, bool is_shadow_pass=0, bool low_detail=0, animation_state_t *anim_state=nullptr,
+		unsigned skip_mat_mask=0, bool untextured=0, bool force_high_detail=0, bool upside_down=0, bool emissive=0, bool do_local_rotate=0);
 	static void rotate_model_from_plus_x_to_dir(vector3d const &dir);
 };
 

@@ -44,13 +44,13 @@ unsigned const AO_RAY_LEN(NUM_AO_STEPS*(NUM_AO_STEPS+1)/2); // 36
 
 enum {FM_NONE, FM_INC_MESH, FM_DEC_MESH, FM_FLATTEN, FM_REM_TREES, FM_ADD_TREES, FM_REM_GRASS, FM_ADD_GRASS, NUM_FIRE_MODES};
 
-struct clear_area_t : public sphere_t {
+struct clear_area_t : public cube_t {
 	bool clear_next_frame;
-	clear_area_t(point const &pos_, float radius_, bool cnf) : sphere_t(pos_, radius_), clear_next_frame(cnf) {}
+	clear_area_t(cube_t const &region, bool cnf) : cube_t(region), clear_next_frame(cnf) {}
 };
 
 
-bool tt_lightning_enabled(0), check_tt_mesh_occlusion(1);
+bool tt_lightning_enabled(0), check_tt_mesh_occlusion(1), shadow_maps_disabled(0);
 unsigned inf_terrain_fire_mode(0); // none, increase height, decrease height
 string read_hmap_modmap_fn, write_hmap_modmap_fn("heightmap.mod");
 hmap_brush_param_t cur_brush_param;
@@ -58,18 +58,20 @@ tile_offset_t model3d_offset;
 vector<clear_area_t> tile_smaps_to_clear;
 
 extern bool inf_terrain_scenery, enable_tiled_mesh_ao, underwater, fog_enabled, volume_lighting, combined_gu, enable_depth_clamp, tt_triplanar_tex, use_grass_tess;
-extern bool use_instanced_pine_trees, enable_tt_model_reflect, water_is_lava, tt_fire_button_down, flashlight_on, camera_in_building, player_in_attic;
+extern bool use_instanced_pine_trees, enable_tt_model_reflect, water_is_lava, tt_fire_button_down, flashlight_on, camera_in_building, rotate_trees;
+extern bool player_in_int_elevator;
 extern unsigned grass_density, max_unique_trees, shadow_map_sz, erosion_iters_tt, num_rnd_grass_blocks, tiled_terrain_gen_heightmap_sz;
-extern unsigned num_birds_per_tile, num_fish_per_tile, num_bflies_per_tile;
+extern unsigned num_birds_per_tile, num_fish_per_tile, num_bflies_per_tile, room_geom_mem;
 extern int DISABLE_WATER, display_mode, tree_mode, leaf_color_changed, ground_effects_level, animate2, iticks, num_trees, window_width, window_height, player_in_basement;
-extern int invert_mh_image, is_cloudy, camera_surf_collide, show_fog, mesh_gen_mode, mesh_gen_shape, cloud_model, precip_mode, auto_time_adv, draw_model, player_in_elevator;
+extern int invert_mh_image, is_cloudy, camera_surf_collide, show_fog, mesh_gen_mode, mesh_gen_shape, cloud_model, precip_mode, auto_time_adv, draw_model;
+extern int player_in_elevator, player_in_attic;
 extern float zmax, zmin, water_plane_z, mesh_scale, mesh_scale_z, vegetation, relh_adj_tex, grass_length, grass_width, fticks, cloud_height_offset, clouds_per_tile;
-extern float ocean_wave_height, sm_tree_density, tree_density_thresh, atmosphere, cloud_cover, temperature, flower_density, FAR_CLIP, shadow_map_pcf_offset, biome_x_offset;
-extern float smap_thresh_scale, tt_grass_scale_factor;
+extern float ocean_wave_height, sm_tree_density, tree_density_thresh, atmosphere, cloud_cover, temperature, flower_density, FAR_CLIP, biome_x_offset;
+extern float smap_thresh_scale, tt_grass_scale_factor, pond_max_depth;
 extern double tfticks;
 extern point sun_pos, moon_pos, surface_pos;
 extern vector3d wind;
-extern cube_t grass_exclude1, grass_exclude2;
+extern cube_t grass_exclude1, grass_exclude2, building_occluder;
 extern water_params_t water_params;
 extern char *mh_filename_tt;
 extern float h_dirt[];
@@ -87,9 +89,16 @@ bool no_grass_under_buildings();
 bool check_buildings_no_grass(point const &pos);
 colorRGBA get_avg_color_for_landscape_tex(unsigned id); // defined later in this file
 void building_gameplay_action_key(int mode, bool mouse_wheel);
+bool player_cant_see_outside_building();
+bool check_cube_occluded(cube_t const &cube, vect_cube_t const &occluders, point const &viewer);
+void get_city_grass_coll_cubes(cube_t const &region, vect_cube_t &out, vect_cube_t &out_bt);
+int check_city_contains_overlaps(cube_t const &query);
+bool check_inside_city(point const &pos, float radius);
+cube_t get_city_bcube_overlapping(cube_t const &c);
+void show_gpu_mem_info();
 
 
-float get_inf_terrain_fog_dist() {return FOG_DIST_TILES*get_scaled_tile_radius();}
+float get_inf_terrain_fog_dist() {return FOG_DIST_TILES*get_scaled_tile_radius()*(is_cloudy ? 0.25 : 1.0);} // lower fog distance when rainy/cloudy
 float get_draw_tile_dist  () {return DRAW_DIST_TILES*get_scaled_tile_radius();}
 float get_grass_thresh    () {return GRASS_THRESH*tt_grass_scale_factor*get_tile_width();}
 float get_grass_blend_dist() {return tt_grass_scale_factor/GRASS_DIST_SLOPE;}
@@ -129,6 +138,7 @@ vector3d get_camera_coord_space_xlate () {return vector3d((world_mode == WMODE_I
 
 bool enable_instanced_pine_trees() {
 	if (use_instanced_pine_trees) return 1;
+	if (have_cities())            return 0; // disable if there are cities because then we can't create custom pine trees for cities
 	float const ntrees_mult(vegetation*sm_tree_density*tree_density_thresh*tree_scale*tree_scale);
 	return (ENABLE_INST_PINE && (tree_mode & 2) && ntrees_mult >= ((tree_mode == 3) ? 3 : 4) && max_unique_trees > 0); // enable when there are lots of pine/palm trees
 }
@@ -170,11 +180,11 @@ void update_tiled_grass_colors() {grass_tile_manager.clear();} // regenerate gra
 
 class tiled_terrain_hmap_manager_t : public terrain_hmap_manager_t {
 
-	tile_t *cur_tile;
+	tile_t *cur_tile=nullptr;
 	bool modified[3][3];
 
 public:
-	tiled_terrain_hmap_manager_t() : cur_tile(NULL) {clear_modified();}
+	tiled_terrain_hmap_manager_t() {clear_modified();}
 	void clear_modified() {for (unsigned i = 0; i < 3; ++i) {UNROLL_3X(modified[i][i_] = 0;)}}
 
 	void apply_brush(tex_mod_map_manager_t::hmap_brush_t brush, tile_t *tile, bool cache) { // Note: brush is copied and may be modified
@@ -205,9 +215,15 @@ public:
 		// Note: assumes unscaled mesh (mesh_scale == 1)
 		int const x1(floor((cube.x1() + X_SCENE_SIZE)*DX_VAL_INV)), y1(floor((cube.y1() + Y_SCENE_SIZE)*DY_VAL_INV));
 		int const x2(ceil ((cube.x2() + X_SCENE_SIZE)*DX_VAL_INV)), y2(ceil ((cube.y2() + Y_SCENE_SIZE)*DY_VAL_INV));
-		int cx1(x1), cy1(y1), cx2(x2+1), cy2(y2+1); // Note: cx2 and cy2 are one past the end; this is needed for proper mirror clamping and empty range early termination optimization
-		if (!clamp_xy(cx1, cy1, 0.0, 0.0, 0) || !clamp_xy(cx2, cy2, 0.0, 0.0, 0)) return; // off the texture, skip
-		assert(cx1 >= 0 && cy1 >= 0 && cx1 <= cx2 && cy1 <= cy2);
+		int cx1(x1), cy1(y1), cx2(x2+1), cy2(y2+1); // Note: cx2/cy2 are one past the end; this is needed for proper mirror clamping and empty range early termination optimization
+		bool const allow_wrap(0); // while this mostly works with buildings, it ruins roads and can cause mesh seams
+		if (!clamp_xy(cx1, cy1, 0.0, 0.0, allow_wrap) || !clamp_xy(cx2, cy2, 0.0, 0.0, allow_wrap)) return; // off the texture, skip
+		
+		if (allow_wrap) { // handle swapping due to X/Y mirroring
+			if (cx2 < cx1) {swap(cx1, cx2);}
+			if (cy2 < cy1) {swap(cy1, cy2);}
+		}
+		else {assert(cx1 >= 0 && cy1 >= 0 && cx1 <= cx2 && cy1 <= cy2);}
 		if (cx1 == cx2 || cy1 == cy2) return; // empty range optimization
 		point const center(cube.get_cube_center());
 		float xc((center.x + X_SCENE_SIZE)*DX_VAL_INV + 0.5), yc((center.y + Y_SCENE_SIZE)*DY_VAL_INV + 0.5); // convert from real to index space
@@ -262,16 +278,10 @@ bool write_default_hmap_modmap() {
 
 // *** tile_t ***
 
-tile_t::tile_t() : x1(0), y1(0), x2(0), y2(0), wx1(0), wy1(0), wx2(0), wy2(0),
-	last_occluded_frame(0), weight_tid(0), height_tid(0), normal_tid(0), shadow_tid(0), size(0), stride(0), zvsize(0), base_tsize(0), gen_tsize(0), smap_lod_level(0),
-	radius(0), mzmin(0), mzmax(0), mesh_dz(0), ptzmax(0), dtzmax(0), trmax(0), xstart(0), ystart(0), min_normal_z(0.0), deltax(0.0), deltay(0.0),
-	sun_shadows_invalid(1), moon_shadows_invalid(1), recalc_tree_grass_weights(1), mesh_height_invalid(0), in_queue(0), last_occluded(0), has_any_grass(0),
-	is_distant(0), no_trees(0), just_cleared(0), has_tunnel(0), decid_trees(tree_data_manager) {}
+tile_t::tile_t() : decid_trees(tree_data_manager) {}
 
-tile_t::tile_t(unsigned size_, int x, int y) : last_occluded_frame(0), weight_tid(0), height_tid(0), normal_tid(0), shadow_tid(0),
-	size(size_), stride(size+1), zvsize(stride+1), gen_tsize(0), smap_lod_level(0), mesh_dz(0.0), trmax(0.0), min_normal_z(0.0), deltax(DX_VAL), deltay(DY_VAL),
-	sun_shadows_invalid(1), moon_shadows_invalid(1), recalc_tree_grass_weights(1), mesh_height_invalid(0), in_queue(0), last_occluded(0), has_any_grass(0),
-	is_distant(0), no_trees(0), just_cleared(0), has_tunnel(0), mesh_off(xoff-xoff2, yoff-yoff2), decid_trees(tree_data_manager)
+tile_t::tile_t(unsigned size_, int x, int y) : size(size_), stride(size+1), zvsize(stride+1),
+	deltax(DX_VAL), deltay(DY_VAL), mesh_off(xoff-xoff2, yoff-yoff2), decid_trees(tree_data_manager)
 {
 	assert(size > 0);
 	x1 = x*size;
@@ -362,14 +372,12 @@ unsigned tile_t::get_gpu_mem() const {
 }
 
 unsigned tile_t::get_smap_mem() const {
-	
 	unsigned mem(0);
 	for (unsigned i = 0; i < smap_data.size(); ++i) {mem += smap_data[i].get_gpu_mem();}
 	return mem;
 }
 
 unsigned tile_t::count_shadow_maps() const {
-
 	unsigned num(0);
 	for (unsigned i = 0; i < smap_data.size(); ++i) {num += smap_data[i].is_allocated();}
 	return num;
@@ -435,6 +443,7 @@ bool setup_height_gen(mesh_xy_grid_cache_t &height_gen, float x0, float y0, floa
 bool tile_t::create_zvals(mesh_xy_grid_cache_t &height_gen, bool no_wait) {
 
 	//timer_t timer("Create Zvals");
+	inside_city = check_city_contains_overlaps(get_mesh_bcube_global());
 	if (enable_terrain_env) {update_terrain_params();}
 	zvals.resize(zvsize*zvsize);
 	mzmin =  FAR_DISTANCE;
@@ -881,14 +890,6 @@ void tile_t::upload_shadow_map_texture(bool tid_is_valid) {
 	create_or_update_texture(shadow_tid, tid_is_valid, stride, shadow_data);
 }
 
-
-unsigned calc_max_smap_lod() {
-	unsigned const min_smap_sz(have_buildings() ? 1024U : 512U); // 1024x1024 seems to be required to prevent shadow artifacts on the sides of buildings
-	unsigned lod_level(0);
-	for (unsigned smap_sz = shadow_map_sz; (smap_sz > min_smap_sz && lod_level+1 < NUM_SMAP_LODS); ++lod_level) {smap_sz >>= 1;}
-	return lod_level;
-}
-
 tile_smap_data_t tile_shadow_map_manager::new_smap_data(unsigned tu_id, tile_t *tile, unsigned light, unsigned lod_level) {
 	assert(tile != nullptr);
 	assert(light < NUM_LIGHT_SRC);
@@ -919,13 +920,15 @@ void tile_shadow_map_manager::clear_context() {
 	}
 }
 
+unsigned get_smap_bytes_per_pixel();
+
 unsigned tile_shadow_map_manager::get_free_list_mem_usage() const {
 	unsigned mem(0);
 
 	for (unsigned l = 0; l < NUM_LIGHT_SRC; ++l) {
 		for (unsigned L = 0; L < NUM_SMAP_LODS; ++L) {
 			unsigned const tex_size(shadow_map_sz >> L);
-			mem += 4*tex_size*tex_size*free_list[l][L].size();
+			mem += get_smap_bytes_per_pixel()*tex_size*tex_size*free_list[l][L].size();
 		}
 	}
 	return mem;
@@ -939,6 +942,20 @@ cube_t tile_t::get_shadow_bcube() const {
 	return cube_t(xv1-x_ext, xv1+(x2-x1)*deltax+x_ext, yv1-y_ext, yv1+(y2-y1)*deltay+y_ext, mzmin-BCUBE_ZTOLER, max(get_tile_zmax()+BCUBE_ZTOLER, mzmax+b_ext.z));
 }
 
+void tile_t::draw_smap_debug_vis(shader_t &s) const {
+	if (smap_data.empty()) return; // no active shadow maps
+	colorRGBA const lod_colors[6] = {RED, ORANGE, YELLOW, GREEN, BLUE, PURPLE}; // rainbow
+	s.set_cur_color(lod_colors[min(smap_lod_level, 5U)]);
+	draw_simple_cube(get_shadow_bcube(), 0);
+	cout << (shadow_map_sz >> smap_lod_level) << " ";
+}
+
+unsigned calc_max_smap_lod() {
+	unsigned const min_smap_sz(have_buildings() ? 1024U : 512U); // 1024x1024 seems to be required to prevent shadow artifacts on the sides of buildings
+	unsigned lod_level(0);
+	for (unsigned smap_sz = shadow_map_sz; (smap_sz > min_smap_sz && lod_level+1 < NUM_SMAP_LODS); ++lod_level) {smap_sz >>= 1;}
+	return lod_level;
+}
 void tile_t::setup_shadow_maps(tile_shadow_map_manager &smap_manager, bool cleanup_only) {
 
 	if (!shadow_map_enabled()) return; // disabled
@@ -949,8 +966,14 @@ void tile_t::setup_shadow_maps(tile_shadow_map_manager &smap_manager, bool clean
 	if (smap_dist_scale < 1.0) { // allocate new shadow maps or change shadow map LOD levels
 		unsigned const max_lod_level(calc_max_smap_lod());
 		float const lod_level_f(min(5.0f*smap_dist_scale, float(max_lod_level))); // clamp to max supported LOD
-		unsigned const lod_level(floor(lod_level_f));
-		if (floor(lod_level_f - 0.1) > smap_lod_level) {clear_shadow_map(&smap_manager);} // LOD decrease with hysteresis
+		unsigned lod_level(floor(lod_level_f)), lod_level_reduce(floor(max(0.0f, (lod_level_f - 0.1f)))); // add hysteresis
+		
+		// for very large shadow maps, limit LOD 0 to only the tile containing the camera
+		if (shadow_map_sz >= 8192 && !get_mesh_bcube().contains_pt_xy(get_camera_pos())) {
+			if (lod_level == 0) {lod_level_reduce = 1;} // no hysteresis for LOD 0
+			lod_level = min(lod_level+1, max_lod_level);
+		}
+		if (lod_level_reduce > smap_lod_level) {clear_shadow_map(&smap_manager);} // LOD decrease
 		if (cleanup_only) return; // done
 		if (lod_level < smap_lod_level) {clear_shadow_map(&smap_manager);} // LOD increase
 
@@ -1018,9 +1041,15 @@ void get_texture_ixs(int &sand_tex_ix, int &dirt_tex_ix, int &grass_tex_ix, int 
 }
 
 
+bool check_region_int(cube_t const &region, vect_cube_t const &cubes) { // has_bcube_int_xy(), but without pad
+	for (cube_t const &c : cubes) {
+		if (c.intersects_xy(region)) return 1;
+	}
+	return 0;
+}
 void tile_t::create_texture(mesh_xy_grid_cache_t &height_gen) {
 
-	//timer_t timer("Create Tile Weights Texture");
+	//highres_timer_t timer("Create Tile Weights Texture"); // 1.38ms base, 1.5ms with buildings/roads/driveways/porches/doorsteps
 	assert(zvals.size() == zvsize*zvsize);
 	unsigned const tsize(stride), num_texels(tsize*tsize);
 	int sand_tex_ix(-1), dirt_tex_ix(-1), grass_tex_ix(-1), rock_tex_ix(-1), snow_tex_ix(-1);
@@ -1047,10 +1076,11 @@ void tile_t::create_texture(mesh_xy_grid_cache_t &height_gen) {
 		height_gen.build_arrays(MESH_NOISE_FREQ*get_xval(x1), MESH_NOISE_FREQ*get_yval(y1), MESH_NOISE_FREQ*deltax,
 			MESH_NOISE_FREQ*deltay, tsize, tsize, 0, 1); // force_sine_mode=1
 		vector<float> rand_vals(tsize*tsize);
-		//bool const same_dirt(params[0][1].dirt == params[0][0].dirt && params[1][0].dirt == params[0][0].dirt && params[1][1].dirt == params[0][0].dirt);
-		vector<cube_t> exclude_cubes, allow_cubes; // in camera space
-		get_city_sphere_coll_cubes(query_pos, radius, 1, 1, exclude_cubes, &allow_cubes);
-		has_tunnel |= tile_contains_tunnel(get_mesh_bcube());
+		bool row_ec_valid(0);
+		vect_cube_t exclude_cubes, row_exclude_cubes, allow_cubes; // in camera space
+		cube_t const mesh_bcube(get_mesh_bcube());
+		get_city_grass_coll_cubes(mesh_bcube, exclude_cubes, allow_cubes);
+		has_tunnel |= tile_contains_tunnel(mesh_bcube);
 
 #pragma omp parallel for schedule(static,1) num_threads(2)
 		for (int y = 0; y < (int)tsize-DEBUG_TILE_BOUNDS; ++y) {
@@ -1059,24 +1089,28 @@ void tile_t::create_texture(mesh_xy_grid_cache_t &height_gen) {
 			}
 		}
 		for (unsigned y = 0; y < tsize-DEBUG_TILE_BOUNDS; ++y) { // not threadsafe
-			float const yv(float(y)*xy_mult);
+			float const yv(float(y)*xy_mult), ry(get_yval(y + llc_y + yoff)), radius_y(0.75*DY_VAL), ry1(ry - radius_y), ry2(ry + radius_y);
+			row_ec_valid = 0;
 
 			for (unsigned x = 0; x < tsize-DEBUG_TILE_BOUNDS; ++x) {
 				unsigned const ix_val(y*tsize + x), off(4*ix_val);
-
-				if (check_mesh_mask && check_mesh_disable(point(get_xval(x + llc_x)+0.5*DX_VAL, get_yval(y + llc_y)+0.5*DY_VAL, 0.0), HALF_DXY)) {
-					mesh_weight_data[off+0] = mesh_weight_data[off+1] = 255; // set invalid values to flag as transparent
-					mesh_weight_data[off+2] = mesh_weight_data[off+3] = 0;   // make sure grass is disabled
-					has_tunnel = 1; // Note: should be covered by the tile_contains_tunnel(), but we include this case for safety
-					continue;
+				
+				if (check_mesh_mask || inside_city == 1) { // have tunnels, or partially inside a city
+					point const query_pos(get_xval(x + llc_x)+0.5*DX_VAL, get_yval(y + llc_y)+0.5*DY_VAL, 0.0); // global space
+					
+					if ((check_mesh_mask && check_mesh_disable(query_pos, HALF_DXY)) || (inside_city == 1 && check_inside_city(query_pos, HALF_DXY))) {
+						mesh_weight_data[off+0] = mesh_weight_data[off+1] = 255; // set invalid values to flag as transparent
+						mesh_weight_data[off+2] = mesh_weight_data[off+3] = 0;   // make sure grass is disabled
+						has_tunnel = 1; // Note: should be covered by the tile_contains_tunnel(), but we include this case for safety
+						continue;
+					}
 				}
 				float weights[NTEX_DIRT] = {0};
 				unsigned const ix(y*zvsize + x);
 				float const mh00(zvals[ix]), mh01(zvals[ix+1]), mh10(zvals[ix+zvsize]), mh11(zvals[ix+zvsize+1]);
 				float const mhmin(min(min(mh00, mh01), min(mh10, mh11))), mhmax(max(max(mh00, mh01), max(mh10, mh11)));
 				float const rand_offset(rand_vals[y*tsize + x]);
-				float const relh1(relh_adj_tex + (mhmin - zmin)*dz_inv + rand_offset);
-				float const relh2(relh_adj_tex + (mhmax - zmin)*dz_inv + rand_offset);
+				float const relh1(relh_adj_tex + (mhmin - zmin)*dz_inv + rand_offset), relh2(relh_adj_tex + (mhmax - zmin)*dz_inv + rand_offset);
 				get_tids(relh1, k1, k2);
 				get_tids(relh2, k3, k4);
 				bool const same_tid(k1 == k4);
@@ -1131,11 +1165,23 @@ void tile_t::create_texture(mesh_xy_grid_cache_t &height_gen) {
 					bool replace_grass_with_dirt(0);
 
 					if (grass_scale > 0.0 && !exclude_cubes.empty()) { // exclude bridges and tunnels here
-						point const test_pt(get_xval(x + llc_x + xoff)+0.5*DX_VAL, get_yval(y + llc_y + yoff)+0.5*DY_VAL, 0.0); // in camera space
-						replace_grass_with_dirt = (check_bcubes_sphere_coll(exclude_cubes, test_pt, HALF_DXY, 1) && !check_bcubes_sphere_coll(allow_cubes, test_pt, HALF_DXY, 1));
+						if (!row_ec_valid) { // optimization: calculate exclude cubes for the current yval row; not needed for allow_cubes because they're sparse
+							cube_t const row_region(mesh_bcube.x1(), mesh_bcube.x2(), ry1, ry2, 0.0, 0.0);
+							row_exclude_cubes.clear();
+
+							for (cube_t const &c : exclude_cubes) {
+								if (c.intersects_xy(row_region)) {row_exclude_cubes.push_back(c);}
+							}
+							row_ec_valid = 1;
+						}
+						if (!row_exclude_cubes.empty()) {
+							float const rx(get_xval(x + llc_x + xoff)), radius_x(0.75*DX_VAL), rx1(rx - radius_x), rx2(rx + radius_x);
+							cube_t const grass_region(rx1, rx2, ry1, ry2, 0.0, 0.0);
+							replace_grass_with_dirt = (check_region_int(grass_region, row_exclude_cubes) && !check_region_int(grass_region, allow_cubes));
+						}
 					}
 					if (!replace_grass_with_dirt && check_buildings && grass_scale > 0.0 && mh01 == mh00 && mh10 == mh00 && mh11 == mh00) { // look for area flattened under a building
-						point const test_pt(get_xval(x + llc_x + xoff)+0.5*DX_VAL, get_yval(y + llc_y + yoff)+0.5*DY_VAL, mh00); // in camera space
+						point const test_pt(get_xval(x + llc_x + xoff), ry, mh00); // in camera space
 						replace_grass_with_dirt = check_buildings_no_grass(test_pt); // xy_only 1.61 => 1.76
 					}
 					if (replace_grass_with_dirt) {
@@ -1438,7 +1484,6 @@ unsigned tile_t::draw_grass(shader_t &s, vector<vector<vector2d> > *insts, bool 
 	float const grass_thresh(get_grass_thresh_pad());
 	point const camera(get_camera_pos());
 	if (get_min_dist_to_pt(camera) > grass_thresh) return 0; // too far away to draw
-	//highres_timer_t timer("Draw Grass"); // 0.075
 	pre_draw_grass_flowers(s, use_cloud_shadows);
 	bind_texture_tu(weight_tid, 3);
 	unsigned const grass_block_dim(get_grass_block_dim());
@@ -1758,7 +1803,6 @@ unsigned tile_t::get_lod_level(bool reflection_pass) const {
 	return lod_level;
 }
 
-
 void disable_shadow_maps(shader_t &s) { // Note: uses different TUs compared to bind_default_sun_moon_smap_textures()
 	for (unsigned l = 0; l < NUM_LIGHT_SRC; ++l) {
 		if (!light_valid_and_enabled(l)) continue;
@@ -1767,19 +1811,31 @@ void disable_shadow_maps(shader_t &s) { // Note: uses different TUs compared to 
 	}
 }
 
-void tile_t::shader_shadow_map_setup(shader_t &s, xform_matrix const *const mvm) const {
+void tile_t::shader_shadow_map_setup(shader_t &s) const {
 	// Note: some part of this call is shared across all tiles; however, in the case where more than one smap light is enabled,
 	// the tu_id and enables may alternate between values for each tile, requiring every uniform to be reset per tile anyway
-	if (smap_data.empty()) {disable_shadow_maps(s);} // disable shadow map lookup when shadow map textures are unavailable
-	else {smap_data.set_for_all_lights(s, mvm);}
+	if (smap_data.empty()) { // disable shadow map lookup when shadow map textures are unavailable
+		if (!shadow_maps_disabled) {disable_shadow_maps(s);} // optimization: skip if already disabled (using a global variable)
+		shadow_maps_disabled = 1;
+	}
+	else {
+		smap_data.set_for_all_lights(s, nullptr); // no MVM
+		shadow_maps_disabled = 0;
+	}
 }
 void tile_t::bind_and_setup_shadow_map(shader_t &s) const {
 	if (shadow_map_enabled()) {shader_shadow_map_setup(s);}
 }
-bool tile_t::try_bind_shadow_map(shader_t &s, bool check_only) const {
+bool tile_t::try_bind_shadow_map(shader_t &s, bool check_only, unsigned *lod_level) const {
 	if (!shadow_map_enabled() || smap_data.empty()) return 0;
 	if (get_dist_to_camera_in_tiles(1) > SMAP_FADE_THRESH*smap_thresh_scale) return 0; // too far to need smap, even if it exists
 	if (!check_only) {smap_data.set_for_all_lights(s, nullptr);}
+	
+	if (lod_level) { // return lod_level of first enabled shadow map
+		for (unsigned i = 0; i < smap_data.size(); ++i) {
+			if (is_light_enabled(i)) {*lod_level = smap_data[i].lod_level; break;}
+		}
+	}
 	return 1;
 }
 
@@ -1846,6 +1902,7 @@ void tile_t::draw_mesh_vbo(indexed_vbo_manager_t const &vbo_mgr, unsigned const 
 	vbo_mgr.pre_render();
 	vert_wrap_t::set_vbo_arrays(0); // normals are stored in normal_tid, tex coords come from texgen, color is constant
 	glDrawRangeElements(GL_TRIANGLE_STRIP, 0, stride*stride, num_ixs, GL_UNSIGNED_INT, (void *)(ivbo_ixs[lod_level]*sizeof(unsigned)));
+	++num_frame_draw_calls;
 }
 
 void tile_t::draw(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned const ivbo_ixs[NUM_LODS+1], crack_ibuf_t const &crack_ibuf, int reflection_pass, int shader_locs[2]) const {
@@ -1853,6 +1910,7 @@ void tile_t::draw(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned co
 	//timer_t timer("Draw Tile Mesh");
 	// check if the tile was visible in the building mirror reflection but not in normal view (so wasn't setup)
 	//if (get_checkerboard_bit()) return; // checkerboard drawing, for debugging
+	if (inside_city == 2) return; // don't need to draw terrain if fully inside a city, but still need to draw trees, etc.
 	if (!(weight_tid > 0 && height_tid > 0 && normal_tid > 0 && shadow_tid > 0)) return; // textures not yet created
 	fgPushMatrix();
 	vector3d const xlate(get_mesh_xlate());
@@ -1884,6 +1942,7 @@ void tile_t::draw(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned co
 			ix_sz_pair const &ixsz(crack_ibuf.lookup(crack_ibuf.get_index(dim, dir, lod_level, adj->get_lod_level(reflection_pass))));
 			if (ixsz.sz == 0) continue;
 			glDrawRangeElements(GL_TRIANGLES, 0, stride*stride, ixsz.sz, GL_UNSIGNED_INT, (void *)(ixsz.ix*sizeof(unsigned)));
+			++num_frame_draw_calls;
 		} // for dir
 	} // for dim
 	bind_vbo(0, 0); // unbind vertex buffer
@@ -1891,16 +1950,15 @@ void tile_t::draw(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned co
 	if (draw_near_water) {draw_water_cap(s, 1);}
 }
 
-void tile_t::draw_shadow_pass(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned const ivbo_ixs[NUM_LODS+1]) { // not const because creates height_tid
+void tile_t::draw_shadow_pass(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned const ivbo_ixs[NUM_LODS+1], int xlate_loc) { // not const because creates height_tid
 
+	if (inside_city == 2) return; // don't need to draw terrain if fully inside a city
 	ensure_height_tid();
-	fgPushMatrix();
-	translate_to(get_mesh_xlate());
+	s.set_uniform_vector3d(xlate_loc, get_mesh_xlate());
 	assert(height_tid > 0);
 	bind_texture_tu(height_tid, 12);
 	draw_mesh_vbo(vbo_mgr, ivbo_ixs, 0); // LOD is always 0
 	bind_vbo(0, 0); // unbind vertex buffer
-	fgPopMatrix();
 }
 
 
@@ -1978,6 +2036,11 @@ bool tile_t::check_sphere_collision(point &pos, float sradius, bool inc_dtrees, 
 		pos  += scenery_off.get_xlate();
 	}
 	return coll;
+}
+
+bool tile_t::check_cube_int_trees(cube_t const &c) const { // cube is in camera space; deciduous trees only for now
+	if (decid_trees.empty()) return 0;
+	return decid_trees.check_cube_int(c - dtree_off.get_xlate());
 }
 
 
@@ -2113,7 +2176,7 @@ void lightning_strike_t::end_draw() const {
 // *** tile_draw_t ***
 
 
-tile_draw_t::tile_draw_t() : buildings_valid(0), tiles_gen_prev_frame(0), terrain_zmin(0.0), lod_renderer(USE_TREE_BILLBOARDS) {
+tile_draw_t::tile_draw_t() : lod_renderer(USE_TREE_BILLBOARDS) {
 	assert(MESH_X_SIZE == MESH_Y_SIZE && X_SCENE_SIZE == Y_SCENE_SIZE);
 }
 
@@ -2175,7 +2238,6 @@ float tile_draw_t::update(float &min_camera_dist) { // view-independent updates;
 	// Note: we may want to calculate distant low-res or larger tiles when the camera is high above the mesh
 
 	if (!to_gen_zvals.empty()) {
-		//ostringstream oss; oss << "Gen " << to_gen_zvals.size() << " tiles (wait)"; timer_t timer(oss.str());
 		assert(to_gen_zvals.size() <= height_gens.size());
 
 		for (unsigned i = 0; i < to_gen_zvals.size(); ++i) { // tiles were waiting on zval generation (async)
@@ -2187,6 +2249,7 @@ float tile_draw_t::update(float &min_camera_dist) { // view-independent updates;
 	}
 	for (tile_map::iterator i = tiles.begin(); i != tiles.end(); ) { // update tiles and free old tiles (Note: no ++i)
 		if (!i->second->update_range(smap_manager)) { // delete this tile
+			remove_buildings_tile(i->first.x, i->first.y); // required to avoid memory leak when player teleports to a new location
 			i->second->clear();
 			tiles.erase(i++);
 			++num_erased;
@@ -2233,7 +2296,6 @@ float tile_draw_t::update(float &min_camera_dist) { // view-independent updates;
 		int const prev_mesh_gen_mode(mesh_gen_mode);
 		if (gpu_mode && gen_this_frame <= max_cpu_tiles) {mesh_gen_mode = MGEN_SIMPLEX;} // GPU simplex => CPU simplex
 		if (gen_this_frame < num_to_gen) {sort(to_gen_zvals.begin(), to_gen_zvals.end());} // sort by priority if not all generated
-		//ostringstream oss; oss << "Gen " << gen_this_frame << " tiles"; timer_t timer(oss.str());
 
 		for (unsigned i = 0; i < num_to_gen; ++i) {
 			tile_t *tile(to_gen_zvals[i].second);
@@ -2317,8 +2379,8 @@ colorRGBA get_avg_color_for_landscape_tex(unsigned id) {
 		int const nm_tid((disable_for_grass[i] && is_grass_enabled()) ? FLAT_NMAP_TEX : normal_tids_dirt[i]);
 		float const tscale(mesh_tex_scale[i]*float(base_tsize)/float(get_texture_size(tid, 0))); // assumes textures are square
 		unsigned const tu_id(start_tu_id + i), nm_tu_id(i + 16); // tu_id 16-20 for normal maps
-		select_multitex(tid, tu_id);
-		select_multitex(nm_tid, nm_tu_id);
+		select_texture(tid, tu_id);
+		select_texture(nm_tid, nm_tu_id);
 		assert(tu_id <= 9); // must map to a single character
 		string tu_id_str;
 		tu_id_str.push_back('0' + tu_id);
@@ -2390,7 +2452,6 @@ void setup_tile_shader_shadow_map(shader_t &s) {
 	}
 	s.add_uniform_float("smap_atten_cutoff", get_smap_atten_val());
 	s.add_uniform_float("z_bias", DEF_Z_BIAS);
-	s.add_uniform_float("pcf_offset", 10.0*shadow_map_pcf_offset);
 }
 
 void set_smap_enable_for_shader(shader_t &s, bool enable_smap, int shader_type) {
@@ -2436,12 +2497,10 @@ void tile_draw_t::setup_mesh_draw_shaders(shader_t &s, bool reflection_pass, boo
 
 	if (has_water) {
 		set_water_plane_uniforms(s);
-		s.add_uniform_float("water_atten",    WATER_COL_ATTEN*mesh_scale);
-		s.add_uniform_color("uw_atten_max",   uw_atten_max);
-		s.add_uniform_color("uw_atten_scale", uw_atten_scale);
+		setup_shader_underwater_atten(s, WATER_COL_ATTEN*mesh_scale);
 
 		if (water_caustics) {
-			select_multitex(WATER_CAUSTIC_TEX, 10);
+			select_texture(WATER_CAUSTIC_TEX, 10);
 			s.add_uniform_int("caustic_tex", 10);
 			s.add_uniform_float("caustics_weight", (1.5 - water_params.alpha));
 		}
@@ -2455,7 +2514,7 @@ void tile_draw_t::setup_mesh_draw_shaders(shader_t &s, bool reflection_pass, boo
 }
 
 
-bool tile_draw_t::can_have_reflection_recur(tile_t const *const tile, point const corners[3], tile_set_t &tile_set, unsigned dim_ix) {
+bool tile_draw_t::can_have_reflection_recur(tile_t const *const tile, point const corners[3], unsigned dim_ix) {
 
 	point const camera(get_camera_pos());
 	cube_t bcube(tile->get_bcube());
@@ -2472,7 +2531,9 @@ bool tile_draw_t::can_have_reflection_recur(tile_t const *const tile, point cons
 			if (water_plane_z + z_over_xy*p2p_dist_xy(corners[2], closest_pt) < corners[2].z) return 1;
 		}
 	}
-	if (!tile_set.insert(tile->get_tile_xy_pair()).second) return 0; // already seen
+	if (tile->vis_ref_call) return 0; // already seen
+	tile->vis_ref_call = 1;
+	bool ret(0);
 		
 	for (unsigned d = 0; d < 2; ++d) {
 		int delta[2] = {0,0};
@@ -2481,20 +2542,21 @@ bool tile_draw_t::can_have_reflection_recur(tile_t const *const tile, point cons
 		else                                {continue;}
 		tile_t const *const adj(get_tile_from_xy(tile->get_tile_xy_pair(delta[0], delta[1])));
 		if (!adj || !adj->is_visible()) continue;
-		if (can_have_reflection_recur(adj, corners, tile_set, d)) return 1;
+		if (can_have_reflection_recur(adj, corners, d)) {ret = 1; break;}
 	}
-	return 0;
+	tile->vis_ref_call = 0;
+	return ret;
 }
 
 
-bool tile_draw_t::can_have_reflection(tile_t const *const tile, tile_set_t &tile_set) {
+bool tile_draw_t::can_have_reflection(tile_t const *const tile) {
 
-	if (tile->all_water()) return 0;
-	if (tile->has_water()) return 1;
+	if (!is_water_enabled()) return 0;
+	if (tile->all_water  ()) return 0;
+	if (tile->has_water  ()) return 1;
 	// return 1 if the camera's tile contains water?
-	point const camera(get_camera_pos());
 	cube_t bcube(tile->get_bcube());
-	point const center(bcube.get_cube_center());
+	point const camera(get_camera_pos()), center(bcube.get_cube_center());
 	point corners[3]; // {x, y, closest}
 
 	for (unsigned d = 0; d < 2; ++d) {
@@ -2504,7 +2566,52 @@ bool tile_draw_t::can_have_reflection(tile_t const *const tile, tile_set_t &tile
 	}
 	corners[2]   = bcube.closest_pt(camera);
 	corners[2].z = tile->get_zmax();
-	return can_have_reflection_recur(tile, corners, tile_set, 2);
+	return can_have_reflection_recur(tile, corners, 2);
+}
+
+
+unsigned get_building_models_gpu_mem();
+unsigned get_dlights_smap_gpu_mem();
+unsigned get_vbo_ring_buffers_size();
+unsigned get_quad_ix_buffer_size();
+
+uint64_t tile_draw_t::show_debug_stats(bool calc_mem_only) const {
+	unsigned num_trees(0), num_smaps(0);
+	uint64_t mem(0), tree_mem(0), smap_mem(0);
+
+	for (tile_map::const_iterator i = tiles.begin(); i != tiles.end(); ++i) {
+		tile_t *const tile(i->second.get());
+		mem       += tile->get_gpu_mem (); // Note: includes smap_mem
+		tree_mem  += tile->get_tree_mem();
+		smap_mem  += tile->get_smap_mem();
+		num_smaps += tile->count_shadow_maps();
+		num_trees += tile->num_pine_trees() + tile->num_decid_trees();
+	}
+	unsigned const dtree_mem(tree_data_manager.get_gpu_mem()), ptree_mem(get_tree_inst_gpu_mem()), grass_mem(grass_tile_manager.get_gpu_mem());
+	unsigned const smap_free_list_mem(smap_manager.get_free_list_mem_usage()), dlights_smap_mem(get_dlights_smap_gpu_mem());
+	unsigned const texture_mem( get_loaded_textures_gpu_mem());
+	unsigned const building_mem(get_buildings_gpu_mem_usage());
+	unsigned const models_mem(get_city_model_gpu_mem() + get_loaded_models_gpu_mem() + get_building_models_gpu_mem());
+	unsigned const frame_buf_mem(13*window_width*window_height); // RGB8 (as 32 bits?) front buffer + RGB8 back buffer + 32-bit depth buffer + 8 bit stencil buffer
+	unsigned const ring_buf_mem(get_vbo_ring_buffers_size()), quad_ix_buf_mem(get_quad_ix_buffer_size()); // these should be small (8/16MB, ~5MB)
+
+	if (vbo) {
+		unsigned const tile_size(get_tile_size());
+		mem += 2ULL*tile_size*(tile_size+1ULL)*sizeof(point);
+		for (unsigned i = 0; i < NUM_LODS; ++i) {mem += 4ULL*(tile_size>>i)*(tile_size>>i)*sizeof(unsigned);} // approximate
+	}
+	uint64_t const tot_mem(mem + dtree_mem + ptree_mem + grass_mem + smap_free_list_mem + dlights_smap_mem + texture_mem + building_mem + models_mem +
+		frame_buf_mem + room_geom_mem + ring_buf_mem + quad_ix_buf_mem);
+	if (calc_mem_only) return tot_mem;
+
+	cout << "tiles drawn: " << to_draw.size() << " of " << tiles.size() << ", trees drawn: " << num_trees << ", shadow maps: " << num_smaps
+		<< ", GPU MB: " << in_mb(tot_mem)
+		<< ", tile MB: " << in_mb(mem - smap_mem) << ", tree CPU MB: " << in_mb(tree_mem) << ", tree GPU MB: " << in_mb((unsigned long long)dtree_mem + ptree_mem)
+		<< ", grass MB: " << in_mb(grass_mem) << ", smap MB: " << in_mb(smap_mem) << ", smap free list MB: " << in_mb(smap_free_list_mem)
+		<< ", dlights smap mem MB: " << in_mb(dlights_smap_mem) << ", frame buf MB: " << in_mb(frame_buf_mem) << ", texture MB: " << in_mb(texture_mem)
+		<< ", building MB: " << in_mb(building_mem) << ", room_geom MB: " << in_mb(room_geom_mem) << ", model MB: " << in_mb(models_mem) << endl;
+	//show_gpu_mem_info(); // shows total and available video memory
+	return tot_mem;
 }
 
 
@@ -2518,9 +2625,9 @@ void tile_draw_t::pre_draw() { // view-dependent updates/GPU uploads
 	// handle clearing of tile shadow maps
 	vector<clear_area_t> to_clear_next_frame;
 
-	for (auto i = tile_smaps_to_clear.begin(); i != tile_smaps_to_clear.end(); ++i) {
-		invalidate_tile_smap_at_pt(i->pos, i->radius);
-		if (i->clear_next_frame) {to_clear_next_frame.push_back(*i); to_clear_next_frame.back().clear_next_frame = 0;}
+	for (clear_area_t const &i : tile_smaps_to_clear) {
+		invalidate_tile_smap_in_region(i);
+		if (i.clear_next_frame) {to_clear_next_frame.emplace_back(i, 0);} // insert again with clear_next_frame=0
 	}
 	tile_smaps_to_clear = to_clear_next_frame;
 	
@@ -2604,9 +2711,6 @@ void tile_draw_t::occluder_pts_t::calc_cube_top_points(cube_t const &bcube) { //
 	}
 }
 
-
-unsigned in_mb(unsigned long long v) {return v/1024/1024;}
-
 tile_draw_t::occluder_cubes_t::occluder_cubes_t(tile_t const *const tile_) : tile(tile_), bcube(tile->get_mesh_bcube()) {
 	for (unsigned s = 0; s < 16; ++s) {
 		cube_t &sub_cube(sub_cubes[s]);
@@ -2619,21 +2723,16 @@ tile_draw_t::occluder_cubes_t::occluder_cubes_t(tile_t const *const tile_) : til
 
 void tile_draw_t::draw(int reflection_pass) { // reflection_pass: 0=none, 1=water plane Z, 2=building mirror
 
-	if (player_in_basement >= 3) return; // no need to draw tiles if player in extended basement
+	if (player_cant_see_outside_building()) return; // no need to draw tiles if player in extended basement or parking garage
 	//timer_t timer("TT Draw");
-	unsigned num_trees(0), num_smaps(0);
-	unsigned long long mem(0), tree_mem(0), smap_mem(0);
+	shadow_maps_disabled = 0; // reset for this frame
 	to_draw.clear();
 	occluded_tiles.clear();
 
-	if (DEBUG_TILES && vbo) {
-		unsigned const tile_size(get_tile_size());
-		mem += 2ULL*tile_size*(tile_size+1ULL)*sizeof(point);
-		for (unsigned i = 0; i < NUM_LODS; ++i) {mem += 4ULL*(tile_size>>i)*(tile_size>>i)*sizeof(unsigned);} // approximate
-	}
-
 	// determine potential occluders
 	point const camera(get_camera_pos());
+	occluder_cubes.clear();
+	if (!building_occluder.is_all_zeros()) {occluder_cubes.push_back(building_occluder);}
 
 	if ((display_mode & 0x08) && (display_mode & 0x01) && check_tt_mesh_occlusion) { // check occlusion when occlusion culling and mesh are enabled
 		for (tile_map::const_iterator i = tiles.begin(); i != tiles.end(); ++i) {
@@ -2643,18 +2742,11 @@ void tile_draw_t::draw(int reflection_pass) { // reflection_pass: 0=none, 1=wate
 	}
 	for (tile_map::const_iterator i = tiles.begin(); i != tiles.end(); ++i) {
 		tile_t *const tile(i->second.get());
-
-		if (DEBUG_TILES) {
-			mem       += tile->get_gpu_mem (); // Note: includes smap_mem
-			tree_mem  += tile->get_tree_mem();
-			smap_mem  += tile->get_smap_mem();
-			num_smaps += tile->count_shadow_maps();
-		}
 		float const dist(tile->get_rel_dist_to_camera());
 		if (dist > DRAW_DIST_TILES || !tile->is_visible()) continue;
 		if (tile->was_last_occluded()) continue; // occluded in the shadow pass
-		tile_set_t tile_set;
-		if (reflection_pass == 1 && !can_have_reflection(tile, tile_set)) continue; // check for water plane Z reflections only
+		if (reflection_pass == 1 && !can_have_reflection(tile)) continue; // check for water plane Z reflections only
+		if (!occluder_cubes.empty() && check_cube_occluded(tile->get_bcube(), occluder_cubes, camera)) continue; // building wall/floor/ceiling occlusion
 
 		if (!occluders.empty() && !tile->was_last_unoccluded()) {
 			occluder_pts_t tile_os, sub_tile_os;
@@ -2665,10 +2757,7 @@ void tile_draw_t::draw(int reflection_pass) { // reflection_pass: 0=none, 1=wate
 			for (auto j = occluders.begin(); j != occluders.end(); ++j) {
 				if (j->tile == tile) continue; // no self-occlusion
 				bool intersected(0); // will always be true for the camera's current tile
-
-				for (unsigned d = 0; d < 4 && !intersected; ++d) {
-					intersected |= check_line_clip(tile_os.cube_pts[d], camera, j->bcube.d);
-				}
+				for (unsigned d = 0; d < 4 && !intersected; ++d) {intersected |= check_line_clip(tile_os.cube_pts[d], camera, j->bcube.d);}
 				if (intersected) {occluder_ixs.push_back(j - occluders.begin());}
 			} // for j
 			for (unsigned t = 0; t < 16; ++t) {
@@ -2697,40 +2786,29 @@ void tile_draw_t::draw(int reflection_pass) { // reflection_pass: 0=none, 1=wate
 			if (tile_occluded) {occluded_tiles.push_back(tile); continue;}
 		} // check_occlusion
 		to_draw.emplace_back(dist, tile);
-		num_trees += tile->num_pine_trees() + tile->num_decid_trees();
 	} // for i
 	//cout << TXT(occluders.size()) << TXT(tiles.size()) << TXT(to_draw.size()) << TXT(occluded_tiles.size()) << endl; // 5, 341, 63, 34
 	occluders.clear();
 	occluder_ixs.clear();
+	building_occluder.set_to_zeros(); // was used, may be reset during the next frame
 	sort(to_draw.begin(), to_draw.end()); // sort front to back to improve draw time through depth culling
 
 	if (display_mode & 0x01) { // draw visible tiles
 		if (shadow_map_enabled()) {draw_tiles(reflection_pass, 1);} // shadow map pass
 		draw_tiles(reflection_pass, 0); // non-shadow map pass
 	}
-	if (DEBUG_TILES) {
-		unsigned const dtree_mem(tree_data_manager.get_gpu_mem()), ptree_mem(get_tree_inst_gpu_mem()), grass_mem(grass_tile_manager.get_gpu_mem());
-		unsigned const smap_free_list_mem(smap_manager.get_free_list_mem_usage());
-		unsigned const texture_mem(get_loaded_textures_gpu_mem());
-		unsigned const building_mem(get_buildings_gpu_mem_usage());
-		unsigned const models_mem(get_city_model_gpu_mem() + get_loaded_models_gpu_mem());
-		unsigned const frame_buf_mem(13*window_width*window_height); // RGB8 (as 32 bits?) front buffer + RGB8 back buffer + 32-bit depth buffer + 8 bit stencil buffer
-		cout << "tiles drawn: " << to_draw.size() << " of " << tiles.size() << ", trees drawn: " << num_trees << ", shadow maps: " << num_smaps
-			 << ", gpu MB: " << in_mb(mem + dtree_mem + ptree_mem + grass_mem + smap_free_list_mem + texture_mem + building_mem + models_mem + frame_buf_mem)
-			 << ", tile MB: " << in_mb(mem - smap_mem) << ", tree CPU MB: " << in_mb(tree_mem)
-			 << ", tree GPU MB: " << in_mb((unsigned long long)dtree_mem + ptree_mem) << ", grass MB: " << in_mb(grass_mem)
-			 << ", smap MB: " << in_mb(smap_mem) << ", smap free list MB: " << in_mb(smap_free_list_mem) << ", frame buf MB: " << in_mb(frame_buf_mem)
-			 << ", texture MB: " << in_mb(texture_mem) << ", building MB: " << in_mb(building_mem) << ", model MB: " << in_mb(models_mem) << endl;
-	}
-	if (player_in_basement < 3 && !player_in_attic) { // trees not visible when player is in the extended basement or attic
+	if (!player_cant_see_outside_building()) { // trees/scenerg/grass not visible when player is in the extended basement, parking garage, or attic
 		if (pine_trees_enabled ()) {draw_pine_trees (reflection_pass);}
 		if (decid_trees_enabled()) {draw_decid_trees(reflection_pass);}
+	
+		// vegetation/scenery/animals not visible when player is fully inside the basement, windowless attic, or closed elevator
+		if (player_in_basement < 2 && player_in_attic < 2 && player_in_elevator < 2) {
+			if (scenery_enabled    ()) {draw_scenery    (reflection_pass);}
+			if (is_grass_enabled   ()) {draw_grass      (reflection_pass);}
+			if (ENABLE_ANIMALS)        {draw_animals    (reflection_pass);}
+		}
 	}
-	if (player_in_basement < 2 && !player_in_attic) { // vegetation/scenery/animals not visible when player is fully inside the basement or attic
-		if (scenery_enabled    ()) {draw_scenery    (reflection_pass);}
-		if (is_grass_enabled   ()) {draw_grass      (reflection_pass);}
-		if (ENABLE_ANIMALS)        {draw_animals    (reflection_pass);}
-	}
+	if (DEBUG_TILES) {show_debug_stats(0);} // calc_mem_only=0
 	//if ((GET_TIME_MS() - timer1) > 100) {PRINT_TIME("Draw Tiled Terrain");}
 }
 
@@ -2764,7 +2842,7 @@ void tile_draw_t::draw_tiles(int reflection_pass, bool enable_shadow_map) const 
 	if ((display_mode & 0x01) && !enable_shadow_map && !reflection_pass && draw_distant_water() && water_plane_z > terrain_zmin) {
 		bind_2d_texture(BLACK_TEX); // all snow? at least it's set to something valid
 		bind_texture_tu(WHITE_TEX, 15); // shadow_map texture, use something determinsitic (not that it matters visually)
-		select_multitex(FLAT_NMAP_TEX, 7); // normal_map texture
+		select_texture(FLAT_NMAP_TEX, 7); // normal_map texture
 		disable_shadow_maps(s);
 		int const loc(s.get_uniform_loc("htex_scale"));
 		if (loc >= 0) {s.set_uniform_float(loc, 0.0);} // disable height texture
@@ -2772,11 +2850,15 @@ void tile_draw_t::draw_tiles(int reflection_pass, bool enable_shadow_map) const 
 		if (loc >= 0) {s.set_uniform_float(loc, 1.0);} // enable height texture
 	}
 	s.end_shader();
+	//if (display_mode & 0x10) {draw_smap_debug_vis();} // TESTING
 }
+
+vector4d vec4_from_cube_xy(cube_t const &c) {return vector4d(c.x1(), c.y1(), c.x2(), c.y2());}
 
 void tile_draw_t::draw_tiles_shadow_pass(point const &lpos, tile_t const *const tile) { // not const because creates height_tid
 
 	//timer_t timer("Draw Shadow Pass");
+	assert(tile != nullptr); // must have a valid dest tile
 	shader_t s;
 	s.set_vert_shader("tiled_mesh_shadow");
 	s.set_frag_shader("color_only");
@@ -2784,13 +2866,24 @@ void tile_draw_t::draw_tiles_shadow_pass(point const &lpos, tile_t const *const 
 	set_tile_xy_vals(s);
 	s.add_uniform_int("height_tex", 12);
 	s.add_uniform_float("delta_z", -0.5*grass_length); // move mesh down by half the grass length so that the bottoms of the grass blades aren't shadowed
+
+	if (pond_max_depth > 0.0 && tile->is_inside_city()) { // exclude city area so that ponds aren't shadowed
+		cube_t const city_bcube(get_city_bcube_overlapping(tile->get_mesh_bcube_global())); // should be nonzero
+		s.add_uniform_vector4d("exclude_box", vec4_from_cube_xy(city_bcube + get_camera_coord_space_xlate())); // global to camera space
+		s.add_uniform_float("exclude_dz", -2.0*pond_max_depth);
+	}
+	else { // no exclude
+		s.add_uniform_vector4d("exclude_box", vector4d());
+		s.add_uniform_float("exclude_dz", 0.0);
+	}
 	s.enable_vnct_atribs(1, 0, 0, 0);
 	glEnable(GL_PRIMITIVE_RESTART);
 	glPrimitiveRestartIndex(PRIMITIVE_RESTART_IX);
-	assert(tile != nullptr);
 	float const recv_dist_sq(p2p_dist_xy_sq(lpos, tile->get_center()));
 	cube_t const shadow_bcube(tile->get_shadow_bcube());
 	bool const inc_adj_smap(get_buildings_max_extent() != zero_vector || get_road_max_len().x > 0.0);
+	int const xlate_loc(s.get_uniform_loc("translate"));
+	assert(xlate_loc >= 0);
 
 	for (unsigned i = 0; i < to_draw.size(); ++i) {
 		tile_t *const t(to_draw[i].second);
@@ -2798,7 +2891,7 @@ void tile_draw_t::draw_tiles_shadow_pass(point const &lpos, tile_t const *const 
 		if (p2p_dist_xy_sq(lpos, t->get_center()) <= recv_dist_sq || // check if this tile is closer to the light than the recv tile
 		   (inc_adj_smap && t->get_bcube().intersects_xy(shadow_bcube))) // check for tile overlap when buildings/cities are involved
 		{
-			t->draw_shadow_pass(s, *this, ivbo_ixs);
+			t->draw_shadow_pass(s, *this, ivbo_ixs, xlate_loc);
 		}
 	}
 	bind_vbo(0, 1); // unbind index buffer
@@ -2845,23 +2938,19 @@ void tile_draw_t::draw_shadow_pass(point const &lpos, tile_t *tile, bool decid_t
 }
 
 
-bool tile_draw_t::find_and_bind_any_valid_shadow_map(shader_t &s) const {
-
-	// if shadow maps are enabled, we need to find some tile with a valid shadow map to use as the initial value,
-	// so that the tu_id(s) aren't bound to garbage, even if the texture lookup value is discarded (multiplied by 0 or skipped) in the shader
-	if (!shadow_map_enabled()) return 1;
-	
-	for (tile_map::const_iterator i = tiles.begin(); i != tiles.end(); ++i) {
-		if (!i->second->has_valid_shadow_map()) continue; // shadow map not valid
-		i->second->shader_shadow_map_setup(s); // starting value of shadow map, used for the first few tiles that don't have a shadow map
-		return 1; // done
-	}
-	return 0; // no shadow maps found
+void tile_draw_t::draw_smap_debug_vis() const {
+	cout << "smap sizes: ";
+	shader_t s;
+	s.begin_color_only_shader();
+	ensure_outlined_polygons();
+	for (auto const &i : to_draw) {i.second->draw_smap_debug_vis(s);}
+	s.end_shader();
+	set_fill_mode();
+	cout << endl;
 }
 
 
 void tile_draw_t::draw_water(shader_t &s, float zval) const {
-	find_and_bind_any_valid_shadow_map(s);
 	for (tile_map::const_iterator i = tiles.begin(); i != tiles.end(); ++i) {i->second->draw_water(s, zval);}
 }
 
@@ -2873,7 +2962,7 @@ colorRGBA get_color_scale(float mag=1.0, float cloud_cover_factor=0.0) {
 
 
 /*static*/ void tile_draw_t::set_noise_tex(shader_t &s, unsigned tu_id) {
-	select_multitex(DITHER_NOISE_TEX, tu_id, 1);
+	select_texture(DITHER_NOISE_TEX, tu_id);
 	s.add_uniform_int("noise_tex", tu_id);
 }
 /*static*/ void tile_draw_t::set_tree_dither_noise_tex(shader_t &s, unsigned tu_id) {
@@ -2915,7 +3004,7 @@ void tile_draw_t::draw_pine_trees(bool reflection_pass, bool shadow_pass) { // a
 		s.set_geom_shader("pine_tree_billboard"); // point => 1 quad
 		set_pine_tree_shader(s, "pine_tree_billboard_gs", 0); // doesn't need texture_gen.part
 		//set_pine_tree_shader(s, "pine_tree_billboard_auto_orient");
-		find_and_bind_any_valid_shadow_map(s); // will apply to all shaders below
+		disable_shadow_maps(s); // bind a valid shadow map
 		s.add_uniform_float("radius_scale", calc_tree_size());
 		s.add_uniform_float("ambient_scale", 1.5);
 		s.set_specular(0.2, 8.0);
@@ -2996,15 +3085,7 @@ void tile_draw_t::billboard_tree_shader_setup(shader_t &s) {
 	shared_shader_lighting_setup(s, 1);
 	s.begin_shader();
 	setup_tt_fog_post(s);
-#ifdef USE_TREE_BB_TEX_ATLAS
-	s.add_uniform_vector2d("normal_tc_off",   vector2d(0.5, 0.0));
-	s.add_uniform_vector2d("normal_tc_scale", vector2d(0.5, 1.0));
-	s.add_uniform_int("normal_map", 0);
-#else
-	s.add_uniform_vector2d("normal_tc_off",   vector2d(0.0, 0.0));
-	s.add_uniform_vector2d("normal_tc_scale", vector2d(1.0, 1.0));
 	s.add_uniform_int("normal_map", 1);
-#endif
 	s.add_uniform_int("color_map",   0);
 	s.add_uniform_int("tc_start_ix", 0);
 	set_tree_dither_noise_tex(s, 2); // TU=2
@@ -3019,14 +3100,16 @@ void tile_draw_t::tree_branch_shader_setup(shader_t &s, bool enable_shadow_maps,
 		lights_bcube = get_city_lights_bcube();
 		if (lights_bcube.is_all_zeros()) {enable_dlights = 0;}
 	}
-	if (enable_opacity) {s.set_prefix("#define ENABLE_OPACITY", 1);} // FS
+	if (enable_opacity) {s.set_prefix("#define ENABLE_OPACITY",        1);} // FS
 	if (enable_dlights) {s.set_prefix("#define ENABLE_DYNAMIC_LIGHTS", 1);} // FS
+	if (rotate_trees && enable_dlights) {s.set_prefix("#define ENABLE_ROTATIONS", 0);} // VS
 	s.setup_enabled_lights(3, 2); // FS; sun, moon, and lightning
 	set_dlights_booleans(s, enable_dlights, 1, 1); // no_dl_smap=1
 	if (!shadow_only) {setup_tt_fog_pre(s);}
 	set_smap_enable_for_shader(s, enable_shadow_maps, 1); // FS
-	s.set_vert_shader(enable_dlights ? "tiled_tree_branches" : "per_pixel_lighting");
-	s.set_frag_shader(string("linear_fog.part+ads_lighting.part*+") + (enable_dlights ? "dynamic_lighting.part*+" : "") + "noise_dither.part+shadow_map.part*+tiled_shadow_map.part*+tiled_tree_branches");
+	s.set_vert_shader(enable_dlights ? "world_space_offset_rot.part+tiled_tree_branches" : "per_pixel_lighting");
+	s.set_frag_shader(string("linear_fog.part+ads_lighting.part*+") + (enable_dlights ? "dynamic_lighting.part*+" : "") +
+		"noise_dither.part+shadow_map.part*+tiled_shadow_map.part*+tiled_tree_branches");
 	s.begin_shader();
 	s.add_uniform_int("tex0", 0);
 	//s.add_uniform_int("shadow_tex", 6);
@@ -3082,7 +3165,7 @@ void tile_draw_t::draw_decid_trees(bool reflection_pass, bool shadow_pass) {
 		if (!shadow_pass) {set_tree_dither_noise_tex(bs, 1);} // TU=1 (for opacity)
 		if (enable_billboards) {lod_renderer.branch_opacity_loc = bs.get_uniform_loc("opacity");}
 		draw_decid_tree_bl(bs, lod_renderer, 1, 0, reflection_pass, shadow_pass, enable_shadow_maps);
-		bs.add_uniform_vector3d("world_space_offset", zero_vector); // reset
+		bs.add_uniform_vector4d("world_space_offset", vector4d()); // reset
 		bs.end_shader();
 	}
 	lod_renderer.finalize();
@@ -3143,8 +3226,6 @@ void tile_draw_t::draw_scenery(bool reflection_pass, bool shadow_pass) {
 	s.end_shader();
 }
 
-vector4d vec4_from_cube_xy(cube_t const &c) {return vector4d(c.x1(), c.y1(), c.x2(), c.y2());}
-
 void tile_draw_t::setup_grass_flower_shader(shader_t &s, bool enable_wind, bool use_smap, float dist_const_mult) {
 
 	s.begin_shader();
@@ -3172,8 +3253,8 @@ void tile_draw_t::draw_grass(bool reflection_pass) {
 
 	if (reflection_pass)    return; // no grass reflections (yet)
 	if (player_in_basement) return; // grass can sometimes appear in a building basement, so disable it when the player is in the basement
+	//highres_timer_t timer("Draw Grass"); // 0.13/0.38ms
 	bool const use_cloud_shadows(GRASS_CLOUD_SHADOWS && cloud_shadows_enabled());
-	vector<vector<vector2d> > insts[NUM_GRASS_LODS];
 	unsigned num_grass_drawn(0), num_flowers_drawn(0);
 	if (use_grass_tess && !check_for_tess_shader()) {use_grass_tess = 0;} // disable tess - not supported
 
@@ -3219,7 +3300,7 @@ void tile_draw_t::draw_grass(bool reflection_pass) {
 				if (!tile->has_grass()) continue;
 				if (tile->using_shadow_maps() != (spass == 0)) continue;
 				if ((tile->get_dist_to_camera_in_tiles(0) > 0.5*tt_grass_scale_factor) != (int)wpass) continue; // xyz dist
-				num_grass_drawn += tile->draw_grass(s, insts, use_cloud_shadows, enable_tess, lt_loc);
+				num_grass_drawn += tile->draw_grass(s, grass_insts, use_cloud_shadows, enable_tess, lt_loc);
 			}
 			disable_instancing_for_shader_loc(lt_loc);
 			grass_tile_manager.end_draw();
@@ -3229,7 +3310,7 @@ void tile_draw_t::draw_grass(bool reflection_pass) {
 
 	// draw flowers
 	for (unsigned spass = 0; spass < 2; ++spass) { // shadow maps, no shadow maps
-		if (flower_density == 0.0 || (display_mode & 0x10)) continue; // no flowers
+		if (flower_density == 0.0) continue; // no flowers
 		if (spass == 0 && !shadow_map_enabled()) continue;
 		shader_t s;
 		lighting_with_cloud_shadows_setup(s, 1, use_cloud_shadows);
@@ -3278,10 +3359,10 @@ void tile_draw_t::draw_animals(bool reflection_pass) {
 	disable_blend(); // for distance fog
 }
 
-void tile_draw_t::draw_tile_clouds(bool reflection_pass) { // 0.15ms
+void tile_draw_t::draw_tile_clouds(bool reflection_pass) { // reflection_pass is unused
 
 	if (!clouds_enabled() || atmosphere < 0.5) return; // only for high atmosphere
-	//timer_t timer("Draw Clouds");
+	//timer_t timer("Draw Clouds"); // 0.15ms on old computer
 	to_draw_clouds.clear();
 	unsigned num(0);
 	for (tile_map::const_iterator i = tiles.begin(); i != tiles.end(); ++i) {num += i->second->update_tile_clouds();}
@@ -3327,11 +3408,14 @@ tile_t *tile_draw_t::get_tile_from_xy(tile_xy_pair const &tp) const {
 	tile_map::const_iterator it(tiles.find(tp));
 	return ((it != tiles.end()) ? it->second.get() : nullptr);
 }
+tile_xy_pair get_tile_pair_at_point(point const &pos) {
+	return tile_xy_pair(round_fp(0.5f*(pos.x - (xoff - xoff2)*DX_VAL)/X_SCENE_SIZE), round_fp(0.5f*(pos.y - (yoff - yoff2)*DY_VAL)/Y_SCENE_SIZE));
+}
 tile_t *tile_draw_t::get_tile_containing_point(point const &pos) const {
-	return get_tile_from_xy(tile_xy_pair(round_fp(0.5f*(pos.x - (xoff - xoff2)*DX_VAL)/X_SCENE_SIZE), round_fp(0.5f*(pos.y - (yoff - yoff2)*DY_VAL)/Y_SCENE_SIZE)));
+	return get_tile_from_xy(get_tile_pair_at_point(pos));
 }
 uint64_t get_tile_id_containing_point(point const &pos) {
-	tile_xy_pair const tp(round_fp(0.5f*(pos.x - (xoff - xoff2)*DX_VAL)/X_SCENE_SIZE), round_fp(0.5f*(pos.y - (yoff - yoff2)*DY_VAL)/Y_SCENE_SIZE));
+	tile_xy_pair const tp(get_tile_pair_at_point(pos));
 	return (tp.x + (uint64_t(tp.y) << 32));
 }
 uint64_t get_tile_id_containing_point_no_xyoff(point const &pos) {
@@ -3339,18 +3423,20 @@ uint64_t get_tile_id_containing_point_no_xyoff(point const &pos) {
 	return (tp.x + (uint64_t(tp.y) << 32));
 }
 
-bool tile_draw_t::try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only) const {
+bool tile_draw_t::try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only, unsigned *lod_level) const {
 	tile_t const *const tile(get_tile_containing_point(pos));
-	return (tile != nullptr && tile->try_bind_shadow_map(s, check_only));
+	return (tile != nullptr && tile->try_bind_shadow_map(s, check_only, lod_level));
 }
 
-void tile_draw_t::invalidate_tile_smap_at_pt(point const &pos, float radius) {
+// Note: region should be less than one tile in size
+void tile_draw_t::invalidate_tile_smap_in_region(cube_t region) {
 	vector3d const b_ext(get_buildings_max_extent());
-	radius += max(0.5f*get_road_max_len().get_max_val(), max(b_ext.x, b_ext.y)); // expand by city tile overlap (should also include trees?)
+	float const road_len_exp(0.5f*get_road_max_len().get_max_val());
+	for (unsigned d = 0; d < 2; ++d) {region.expand_in_dim(d, max(road_len_exp, b_ext[d]));} // expand by city tile overlap (should also include trees?)
 
 	for (int y = 0; y < 2; ++y) { // try 4 corners, needed to handle objects that overlap more than one tile
 		for (int x = 0; x < 2; ++x) {
-			tile_t *const tile(get_tile_containing_point(pos + vector3d((x ? radius : -radius), (y ? radius : -radius), 0.0)));
+			tile_t *const tile(get_tile_containing_point(point(region.d[0][x], region.d[1][y], 0.0)));
 			if (tile) {tile->clear_shadow_map(&smap_manager);}
 		}
 	}
@@ -3365,6 +3451,10 @@ bool tile_draw_t::check_player_collision() const {
 	if (!check_sphere_collision(camera, CAMERA_RADIUS)) return 0;
 	surface_pos = camera; // write modified camera pos back to the scene state
 	return 1;
+}
+bool tile_draw_t::check_cube_int_trees(cube_t const &c) const {
+	tile_t const *const tile(get_tile_containing_point(c.get_cube_center())); // assumes cube is contained in one tile
+	return (tile ? tile->check_cube_int_trees(c) : 0);
 }
 
 int tile_draw_t::get_tid_under_point(point const &pos) const {
@@ -3424,6 +3514,8 @@ bool tile_smap_data_t::needs_update(point const &lpos) {
 tile_t *get_tile_from_xy  (tile_xy_pair const &tp) {return terrain_tile_draw.get_tile_from_xy(tp);}
 float update_tiled_terrain(float &min_camera_dist) {return terrain_tile_draw.update(min_camera_dist);}
 void pre_draw_tiled_terrain() {terrain_tile_draw.pre_draw();}
+void show_tiled_terrain_debug_stats() {terrain_tile_draw.show_debug_stats(0);} // calc_mem_only=0
+uint64_t get_tiled_terrain_gpu_mem() {return terrain_tile_draw.show_debug_stats(1);} // calc_mem_only=1
 
 
 colorRGBA get_inf_terrain_mod_color() {
@@ -3466,14 +3558,19 @@ void render_tt_models(int reflection_pass, bool transparent_pass) {
 void draw_tiled_terrain(int reflection_pass) {
 
 	//RESET_TIME;
-	if (player_in_elevator == 2) return; // skip terrain draw if the player is in a closed elevator so that we don't see the terrain when crossing the ground
-	bool const disable_depth_clamp(enable_depth_clamp && !reflection_pass && camera_in_building); // helps with terrain covering basement stairs entrance
-	if (disable_depth_clamp) {glDisable(GL_DEPTH_CLAMP);}
+	// skip terrain draw if the player is in a closed elevator so that we don't see the terrain when crossing the ground;
+	// but the terrain may be visible through tw window through the crack between the doors, though this isn't too much of an issue
+	if (player_in_elevator >= 2 && player_in_int_elevator) return;
+	bool const disable_dclamp(enable_depth_clamp &&  camera_in_building && !reflection_pass   ); // helps with terrain covering basement stairs entrance
+	bool const enable_dclamp(!enable_depth_clamp && !camera_in_building && camera_surf_collide); // helps prevent camera clipping through the terrain
+	if (disable_dclamp) {glDisable(GL_DEPTH_CLAMP);}
+	if (enable_dclamp ) {glEnable (GL_DEPTH_CLAMP);}
 	// don't need to draw the bottom of the terrain when in the basement; for some reason the faces are backwards
 	if (player_in_basement)  {glEnable (GL_CULL_FACE); glCullFace(GL_FRONT);}
 	terrain_tile_draw.draw(reflection_pass);
 	if (player_in_basement)  {glDisable(GL_CULL_FACE); glCullFace(GL_BACK);}
-	if (disable_depth_clamp) {glEnable (GL_DEPTH_CLAMP);} // restore
+	if (disable_dclamp) {glEnable (GL_DEPTH_CLAMP);} // restore
+	if (enable_dclamp)  {glDisable(GL_DEPTH_CLAMP);} // restore
 	//glFinish(); PRINT_TIME("Tiled Terrain Draw"); //exit(0);
 	if (reflection_pass) return; // nothing else to do
 
@@ -3522,11 +3619,20 @@ void clear_tiled_terrain_shaders() {terrain_tile_draw.free_compute_shader();}
 void draw_tiled_terrain_water(shader_t &s, float zval) {terrain_tile_draw.draw_water(s, zval);}
 bool check_player_tiled_terrain_collision() {return terrain_tile_draw.check_player_collision();}
 bool sphere_int_tiled_terrain(point &pos, float radius) {return terrain_tile_draw.check_sphere_collision(pos, radius);}
+bool cube_int_tiled_terrain_trees(cube_t const &c) {return terrain_tile_draw.check_cube_int_trees(c);}
 float get_tiled_terrain_water_level() {return (is_water_enabled() ? water_plane_z : terrain_tile_draw.get_actual_zmin());}
-bool try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only) {return terrain_tile_draw.try_bind_tile_smap_at_point(pos, s, check_only);}
-// defer update until tile draw (if called from non-drawing thread)
-void invalidate_tile_smap_at_pt(point const &pos, float radius, bool repeat_next_frame) {tile_smaps_to_clear.emplace_back(pos, radius, repeat_next_frame);}
 
+bool try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only, unsigned *lod_level) {
+	return terrain_tile_draw.try_bind_tile_smap_at_point(pos, s, check_only, lod_level);
+}
+// defer update until tile draw (if called from non-drawing thread); region and pos are in camera space
+void invalidate_tile_smap_in_region(cube_t const &region, bool repeat_next_frame) {tile_smaps_to_clear.emplace_back(region, repeat_next_frame);}
+
+void invalidate_tile_smap_at_pt(point const &pos, float radius, bool repeat_next_frame) {
+	cube_t region;
+	region.set_from_sphere(pos, radius);
+	invalidate_tile_smap_in_region(region, repeat_next_frame);
+}
 
 // *** tree/grass addition/removal ***
 
@@ -3819,7 +3925,7 @@ void inf_terrain_undo_hmap_mod() {
 	tex_mod_map_manager_t::hmap_brush_t brush;
 	if (!terrain_hmap_manager.pop_last_brush(brush)) return;
 	if (brush.is_flatten_brush()) return; // can't undo this brush since it's lossy
-	// FIXME: won't work if clamping to min/max height occurred when applying the brush the first time
+	// Note: won't work if clamping to min/max height occurred when applying the brush the first time
 	brush.delta = -brush.delta; // invert
 	terrain_hmap_manager.apply_brush(brush, get_tile_for_xy(brush.x, brush.y), 0); // don't cache
 }

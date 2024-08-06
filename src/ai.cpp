@@ -250,7 +250,7 @@ void player_state::smiley_fire_weapon(int smiley_id) {
 	float const target_dist(p2p_dist(tpos, pos));
 
 	if (smiley_acc > 0.0 && smiley_acc < 1.0) { // add firing error (should this be before or after the range test?)
-		vadd_rand(orient, 0.1*((game_mode == 2) ? 0.5 : 1.0)*(1.0 - smiley_acc)/max(0.2f, min(1.0f, target_dist)));
+		vadd_rand(orient, 0.1*((game_mode == GAME_MODE_DODGEBALL) ? 0.5 : 1.0)*(1.0 - smiley_acc)/max(0.2f, min(1.0f, target_dist)));
 	}
 	if (target == CAMERA_ID && weapon == W_LASER) {
 		// less accurate when shooting at the player, to make it more fair?
@@ -458,7 +458,7 @@ int player_state::find_nearest_obj(point const &pos, pos_dir_up const &pdu, poin
 							if (sstates != nullptr && i != smiley_id && sstates[i].last_waypoint >= 0) {wps_used.insert(sstates[i].last_waypoint);}
 						}
 #endif
-						// FIXME: skip path waypoints that are in unreachable[1]?
+						// skip path waypoints where unreachable[1].cant_reach(p) is true?
 						curw = next_path_wpt = find_optimal_next_waypoint(curw, goal, wps_used); // can return -1
 
 						for (unsigned i = 0; i < next.size(); ++i) {
@@ -615,7 +615,7 @@ void player_state::drop_pack(point const &pos) {
 	if (weapon == W_XLOCATOR) return; // translocator isn't dropped
 	int const ammo(p_ammo[weapon]);
 	if (!weapons[weapon].need_weapon && (!weapons[weapon].need_ammo || ammo == 0)) return; // no weapon/ammo
-	bool const dodgeball(game_mode == 2 && weapon == W_BALL); // drop their balls
+	bool const dodgeball(game_mode == GAME_MODE_DODGEBALL && weapon == W_BALL); // drop their balls
 	if (dodgeball) {assert(ammo == (int)balls.size());}
 	unsigned const num(dodgeball ? ammo : 1);
 	int const type(dodgeball ? (int)BALL : (int)WA_PACK), cid(coll_id[type]);
@@ -636,7 +636,7 @@ void player_state::drop_pack(point const &pos) {
 
 int player_state::drop_weapon(vector3d const &coll_dir, vector3d const &nfront, point const &pos, int index, float energy, int type) {
 
-	if (game_mode != 1) return 0;
+	if (game_mode != GAME_MODE_FPS) return 0;
 	if (type == BEAM || type == BLAST_RADIUS || (type >= DROWNED && type <= CRUSHED)) return 0;
 
 	if (((player_rgen.rand()%31) == 0) && energy > 25.0 && (weapons[weapon].need_weapon || (weapons[weapon].need_ammo && p_ammo[weapon] > 0))) {
@@ -707,7 +707,7 @@ void player_state::smiley_select_target(dwobject &obj, int smiley_id) {
 	int const orig_display_mode(display_mode);
 	display_mode |= 0x08; // enable occlusion culling if it was off - required for smileys
 
-	if (game_mode == 2 && !UNLIMITED_WEAPONS) { // want the ball
+	if (game_mode == GAME_MODE_DODGEBALL && !UNLIMITED_WEAPONS) { // want the ball
 		if (p_ammo[W_BALL] > 0) { // already have a ball
 			min_ie = find_nearest_enemy(obj.pos, pdu, avoid_dir, smiley_id, target_pos, target_visible, diste);
 		}
@@ -940,7 +940,7 @@ int player_state::smiley_motion(dwobject &obj, int smiley_id) {
 
 			// check if movement was valid
 			pos_dir_up const pdu(get_smiley_pdu(obj.pos, obj.orientation));
-			float const start_cost(using_dest_mark ? 0.0 : get_pos_cost(smiley_id, obj.pos, opos, pdu, radius, step_height, 0));
+			float const start_cost(using_dest_mark ? 0.0 : get_pos_cost(smiley_id, obj.pos, opos, pdu, radius, step_height, 0)); // higher is worse
 		
 			if (start_cost > 0.0) {
 				unsigned const ndirs(16);
@@ -953,7 +953,7 @@ int player_state::smiley_motion(dwobject &obj, int smiley_id) {
 					dir_cost_t const cur(cost, dir, stepv);
 					if (i == 0 || cur < best) best = cur;
 				}
-				if (best.cost > 0.0) {} // FIXME: still not good, what to do?
+				if (best.cost > 0.0) {} // still not good, but we don't want to get stuck, so move anyway
 				obj.pos = opos + step_dist_scale(obj, best.dir)*step_dist;
 			}
 		}
@@ -1234,7 +1234,7 @@ void init_smiley(int smiley_id) {
 	obj_group &objg(obj_groups[cid]);
 	if (!objg.enabled) return;
 	init_smiley_texture(smiley_id);
-	init_sstate(smiley_id, (game_mode == 1), 1); // show_appear_effect=1
+	init_sstate(smiley_id, (game_mode == GAME_MODE_FPS), 1); // show_appear_effect=1
 	sstates[smiley_id].check_switch_weapon(smiley_id);
 	dwobject &obj(objg.get_obj(smiley_id));
 	obj.direction     = 0;
@@ -1256,9 +1256,9 @@ void init_smiley(int smiley_id) {
 void player_state::check_switch_weapon(int smiley_id) { // called by smileys
 
 	assert(smiley_id >= 0 && smiley_id < num_smileys);
-	wmode = ((player_rgen.rand()&3) == 0);
+	wmode = (game_mode == GAME_MODE_FPS && (player_rgen.rand()&3) == 0);
 
-	if (game_mode == 2) { // dodgeball mode
+	if (game_mode == GAME_MODE_DODGEBALL) { // dodgeball mode
 		weapon     = ((UNLIMITED_WEAPONS || p_ammo[W_BALL] > 0) ? (int)W_BALL : (int)W_UNARMED);
 		fire_frame = 0;
 		return;
@@ -1526,7 +1526,7 @@ void player_state::init(bool w_start) {
 	kill_time     = 100*TICKS_PER_SECOND;
 	last_teleporter = NO_SOURCE;
 
-	if (game_mode == 1 && enable_init_shields) {
+	if (game_mode == GAME_MODE_FPS && enable_init_shields) {
 		shields       = INIT_SHIELDS;
 		powerup       = ((INIT_PU_SH_TIME > 0) ? (int)PU_SHIELD : (int)PU_NONE);
 		powerup_time  = INIT_PU_SH_TIME;
@@ -1592,6 +1592,6 @@ void player_state::jump(point const &pos) {
 
 
 void player_state::verify_wmode() {
-	if (weapon == W_GRENADE && (wmode&1) && p_ammo[weapon] < int(weapons[W_CGRENADE].def_ammo) && !UNLIMITED_WEAPONS) wmode = 0;
+	if (weapon == W_GRENADE && (wmode&1) && p_ammo[weapon] < int(weapons[W_CGRENADE].def_ammo) && !UNLIMITED_WEAPONS) {wmode = 0;}
 }
 

@@ -114,6 +114,7 @@ void init_water_springs(int nws);
 void process_water_springs();
 void add_waves();
 void update_accumulation(int xpos, int ypos);
+bool update_depth_if_underwater(point const &pos, float &depth);
 
 void add_hole_in_landscape_texture(int xpos, int ypos, float blend);
 void setup_mesh_and_water_shader(shader_t &s, bool use_detail_normal_map, bool is_water);
@@ -327,6 +328,7 @@ public:
 		return is_new_vertex;
 	}
 	void end_strip() {indices.push_back(RESERVED_IX);}
+	
 	void draw() {
 		if (verts.empty()) {assert(indices.empty()); return;} // nothing to do
 		create_and_upload(verts, indices, 2);
@@ -334,6 +336,7 @@ public:
 		glEnable(GL_PRIMITIVE_RESTART);
 		glPrimitiveRestartIndex(RESERVED_IX);
 		glDrawRangeElements(GL_TRIANGLE_STRIP, 0, verts.size(), indices.size(), GL_UNSIGNED_INT, NULL);
+		++num_frame_draw_calls;
 		glDisable(GL_PRIMITIVE_RESTART);
 		post_render();
 	}
@@ -473,9 +476,8 @@ void draw_water(bool no_update, bool draw_fast) {
 		int const xend(MESH_X_SIZE-1), yend(MESH_Y_SIZE-1);
 
 		if (use_foam) { // use sea foam texture
-			select_multitex(FOAM_TEX, 1, 0);
+			select_texture(FOAM_TEX, 1);
 			setup_texgen(20.0*tx_scale, 20.0*ty_scale, 0.0, 0.0, 0.0, s, 0);
-			set_active_texture(0);
 			s.add_uniform_float("detail_tex_scale", 1.0);
 		}
 		static water_strip_drawer wsdraw;
@@ -1662,8 +1664,12 @@ bool is_underwater(point const &pos, int check_bottom, float *depth) { // or und
 	if (DISABLE_WATER || !(display_mode & 0x04)) return 0; // water disabled
 
 	if (world_mode == WMODE_INF_TERRAIN) {
-		if (depth) {*depth = max(0.0f, (water_plane_z - pos.z));}
-		return (pos.z < water_plane_z);
+		if (pos.z < water_plane_z) {
+			if (depth) {*depth = water_plane_z - pos.z;}
+			return 1;
+		}
+		if (check_bottom && depth && update_depth_if_underwater(pos, *depth)) return 1; // check for player in city swimming pools and ponds
+		return 0;
 	}
 	assert(water_matrix && mesh_height);
 	if (!is_over_mesh(pos) || pos.z < zmin || pos.z > max_water_height) return 0;

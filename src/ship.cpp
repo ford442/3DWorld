@@ -968,13 +968,13 @@ void setup_ship_draw_shader(shader_t &s) {
 	s.add_uniform_float("lum_offset", 0.0);
 	set_sane_light_atten(&s);
 	// burn mask stuff
-	select_multitex(DISINT_TEX, 1);
+	select_texture(DISINT_TEX, 1);
 	s.add_uniform_int ("burn_mask", 1); // used instead of alpha_mask_tex
 	s.add_uniform_float("burn_offset",   -1.0);
 	s.add_uniform_float("burn_tex_scale", 1.0);
 
 	if (ship_cube_map_reflection) {
-		bind_texture_tu(univ_reflection_tid, 14, 1);
+		bind_texture_tu(univ_reflection_tid, 14);
 		s.add_uniform_int("reflection_tex", 14);
 		upload_mvm_to_shader(s, "fg_ViewMatrix");
 		s.add_uniform_vector3d("camera_pos", get_camera_pos());
@@ -1011,7 +1011,7 @@ void setup_shield_shader(shader_t &shader, int noise_tu_id) {
 	shader.add_uniform_float("min_alpha", 0.001);
 	shader.add_uniform_int("tex0", 0);
 	shader.add_uniform_int("noise_tex", noise_tu_id);
-	set_3d_texture_as_current(get_noise_tex_3d(64, 1), noise_tu_id); // grayscale noise
+	bind_texture_tu(get_noise_tex_3d(64, 1), noise_tu_id); // grayscale noise
 	static float shields_time(0.0);
 	if (animate2) {shields_time += fticks; if (shields_time > 1.0E4) {shields_time = 0.0;}} // reset when large to avoid FP error
 	shader.add_uniform_float("time", shields_time);
@@ -1072,7 +1072,6 @@ void draw_univ_objects() {
 	enable_blend(); // doesn't hurt
 
 	// setup emissive shader, which is used for ship shields and EMP (will be disabled by ship draw shader)
-	//emissive_shader.begin_simple_textured_shader(0.001); // textured, no lighting
 	setup_shield_shader(emissive_shader, 1);
 
 	// draw ubojs

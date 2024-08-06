@@ -7,6 +7,7 @@
 #include "gl_ext_arb.h"
 #include "shaders.h"
 #include "binary_file_io.h"
+#include "profiler.h"
 #include <functional>
 
 using std::cerr;
@@ -34,7 +35,7 @@ llv_vect local_light_volumes;
 indir_dlight_group_manager_t indir_dlight_group_manager;
 
 
-extern int animate2, display_mode, frame_counter, camera_coll_id, scrolling, read_light_files[], write_light_files[];
+extern int animate2, display_mode, camera_coll_id, scrolling, read_light_files[], write_light_files[];
 extern unsigned create_voxel_landscape;
 extern bool disable_dlights;
 extern float czmin, czmax, fticks, zbottom, ztop, XY_SCENE_SIZE, FAR_CLIP, CAMERA_RADIUS, indir_light_exp, light_int_scale[], force_czmin, force_czmax;
@@ -167,7 +168,7 @@ void r_profile::clear_within(float const c[2]) {
 	copy(pend.begin(), pend.end(), back_inserter(rects));
 	pend.resize(0);
 	if (removed) filled = 0;
-	//avg_alpha = 1.0; // FIXME: recalculate?
+	//avg_alpha = 1.0; // recalculate?
 }
 
 
@@ -883,21 +884,21 @@ void setup_2d_texture(unsigned &tid) {
 // 15: dlight bounding cubes (optionally enabled)
 void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { // 0.21ms => 0.05ms with dlights_enabled
 
-	//RESET_TIME;
 	if (disable_dlights) return;
 	static bool last_dlights_empty(0);
 	bool const cur_dlights_empty(dl_sources.empty());
 	if (cur_dlights_empty && last_dlights_empty && dl_tid != 0 && elem_tid != 0 && gb_tid != 0) return; // no updates
 	last_dlights_empty = cur_dlights_empty;
+	//highres_timer_t timer("Dlight Texture Upload"); // 0.083ms
 
 	// step 1: the light sources themselves
 	unsigned const max_dlights           = 1024;
 	unsigned const base_floats_per_light = 12; // XYZ pos, radius, RGBA color, XYZ dir/pos2, beamwidth
 	unsigned const max_floats_per_light  = base_floats_per_light + 1; // add one for shadow map index
 	//unsigned const max_floats_per_light      = base_floats_per_light + dl_smap_enabled;
-	unsigned const ysz((max_floats_per_light+3)/4); // round up to nearest multiple of 4
-	unsigned const data_sz(max_dlights*(4*ysz));
-	vector<float> dl_data(data_sz, 0);
+	unsigned const ysz((max_floats_per_light+3)/4), stride(4*ysz); // round up to nearest multiple of 4
+	static vector<float> dl_data;
+	dl_data.resize(max_dlights*stride, 0.0); // 16k floats / 64KB data
 	float *dl_data_ptr(dl_data.data());
 	if (dl_sources.size() > max_dlights) {cerr << "Warning: Exceeded max lights of " << max_dlights << endl;}
 	unsigned const ndl(min(max_dlights, (unsigned)dl_sources.size()));
@@ -908,15 +909,15 @@ void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { /
 
 	for (unsigned i = 0; i < ndl; ++i) {
 		bool const line_light(dl_sources[i].is_line_light());
-		float *data(dl_data_ptr + 4*i*ysz); // stride is texel RGBA
-		dl_sources[i].pack_to_floatv(data); // {center,radius, color, dir,beamwidth}
+		float *data(dl_data_ptr + i*stride); // stride is texel RGBA
+		dl_sources[i].pack_to_floatv(data); // {center,radius, color, dir,beamwidth, [smap_index]}
 		UNROLL_3X(data[i_] = (data[i_] - poff[i_])*pscale[i_];) // scale pos to [0,1] range
 		UNROLL_3X(data[i_+4] *= 0.1;) // scale color down
 		if (line_light) {UNROLL_3X(data[i_+8] = (data[i_+8] - poff[i_])*pscale[i_];)} // scale to [0,1] range
-		data[3] *= radius_scale;
+		data[3] *= radius_scale; // radius field
 		has_spotlights  |= dl_sources[i].is_directional();
 		has_line_lights |= line_light;
-	}
+	} // for i
 	if (dl_tid == 0) {
 		setup_2d_texture(dl_tid);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16, ysz, max_dlights, 0, GL_RGBA, GL_FLOAT, dl_data_ptr);
@@ -925,11 +926,12 @@ void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { /
 		bind_2d_texture(dl_tid);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ysz, ndl, GL_RGBA, GL_FLOAT, dl_data_ptr);
 	}
+	std::fill(dl_data.begin(), dl_data.begin()+ndl*stride, 0.0); // zero fill the data
 
 	// step 1b: optionally setup dlights bcubes texture
 	if (enable_dlight_bcubes) {
-		unsigned const bc_data_sz(6*max_dlights); // we need 2 RGB values to store 6 bcube floats
-		vector<float> dl_bc_data(bc_data_sz, 0);
+		static vector<float> dl_bc_data;
+		dl_bc_data.resize(6*max_dlights, 0.0); // we need 2 RGB values to store 6 bcube floats; 6k floats / 24KB data
 		float *bc_data_ptr(dl_bc_data.data());
 
 		for (unsigned i = 0; i < ndl; ++i) {
@@ -937,9 +939,7 @@ void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { /
 			float *data(bc_data_ptr + 6*i); // stride is texel RGB, encoded as {x1, y1, z1, x2, y2, z2}
 
 			for (unsigned dir = 0; dir < 2; ++dir) {
-				for (unsigned dim = 0; dim < 3; ++dim) {
-					*(data++) = (bcube.d[dim][dir] - poff[dim])*pscale[dim]; // scale to [0,1] range
-				}
+				for (unsigned dim = 0; dim < 3; ++dim) {*(data++) = (bcube.d[dim][dir] - poff[dim])*pscale[dim];} // scale to [0,1] range
 			}
 		}
 		if (dl_bc_tid == 0) {
@@ -950,6 +950,7 @@ void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { /
 			bind_2d_texture(dl_bc_tid);
 			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, ndl, GL_RGB, GL_FLOAT, bc_data_ptr);
 		}
+		std::fill(dl_bc_data.begin(), dl_bc_data.begin()+ndl*6, 0.0); // zero fill the data
 	}
 
 	// step 2: grid bag entries
@@ -960,11 +961,11 @@ void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { /
 	unsigned const elem_tex_y = (1<<10); // larger = slower, but more lights/higher quality
 	unsigned const max_gb_entries(elem_tex_x*elem_tex_y), gbx(get_grid_xsize()), gby(get_grid_ysize());
 	assert(max_gb_entries <= (1<<24)); // gb_data low bits allocation
-	elem_data.resize(0);
+	elem_data.clear();
 	gb_data.resize(gbx*gby, 0);
 
-	for (unsigned y = 0; y < gby && elem_data.size() < max_gb_entries; ++y) {
-		for (unsigned x = 0; x < gbx && elem_data.size() < max_gb_entries; ++x) {
+	for (unsigned y = 0; y < gby; ++y) {
+		for (unsigned x = 0; x < gbx; ++x) {
 			unsigned const gb_ix(x + y*gbx); // {start, end, unused}
 			gb_data[gb_ix] = elem_data.size(); // 24 low bits = start_ix
 			if (!ldynamic_enabled[gb_ix]) continue; // no lights for this grid
@@ -981,8 +982,10 @@ void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { /
 			unsigned const num_ix(elem_data.size() - gb_data[gb_ix]);
 			assert(num_ix < (1<<8));
 			gb_data[gb_ix] += (num_ix << 24); // 8 high bits = num_ix
-		}
-	}
+			if (elem_data.size() >= max_gb_entries) break;
+		} // for x
+		if (elem_data.size() >= max_gb_entries) break;
+	} // for y
 	if (elem_data.size() > 0.9*max_gb_entries) {
 		if (elem_data.size() >= max_gb_entries && num_warnings < 100) {
 			std::cerr << "Warning: Exceeded max # indexes (" << max_gb_entries << ") in dynamic light texture upload" << endl;
@@ -1009,14 +1012,17 @@ void upload_dlights_textures(cube_t const &bounds, float &dlight_add_thresh) { /
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gbx, gby, GL_RED_INTEGER, GL_UNSIGNED_INT, &gb_data.front());
 	}
 	check_gl_error(440);
-	//PRINT_TIME("Dlight Texture Upload");
 	//cout << "ndl: " << ndl << ", elix: " << elem_data.size() << ", gb_sz: " << gb_data.size() << endl;
 }
 
 
+void setup_and_bind_shadow_matrix_ubo();
+
 void setup_dlight_shadow_maps(shader_t &s) {
 	bool arr_tex_set(0); // required to only bind texture arrays once
+	setup_and_bind_shadow_matrix_ubo();
 	for (auto i = dl_sources.begin(); i != dl_sources.end(); ++i) {i->setup_and_bind_smap_texture(s, arr_tex_set);}
+	ubo_wrap_t::post_render(); // unbind the UBO
 }
 
 
@@ -1028,21 +1034,18 @@ void setup_dlight_textures(shader_t &s, bool enable_dlights_smap) {
 	set_one_texture(s, elem_tid, 3, "dlelm_tex");
 	set_one_texture(s, gb_tid,   4, "dlgb_tex");
 	if (enable_dlight_bcubes) {set_one_texture(s, dl_bc_tid, 15, "dlbcube_tex");} // TU_ID 15 is shared with ripples texture, hopefully we won't have a situation where we need both
-	set_active_texture(0);
 	if (enable_dlights_smap && shadow_map_enabled()) {setup_dlight_shadow_maps(s);}
 	s.add_uniform_float("LT_DIR_FALLOFF", LT_DIR_FALLOFF);
 }
 
 
 colorRGBA gen_fire_color(float &cval, float &inten, float rate) {
-
 	inten = max(0.6f, min(1.0f, (inten + 0.04f*rate*fticks*signed_rand_float())));
 	cval  = max(0.0f, min(1.0f, (cval  + 0.02f*rate*fticks*signed_rand_float())));
 	colorRGBA color(1.0, 0.9, 0.7);
 	blend_color(color, color, colorRGBA(1.0, 0.6, 0.2), cval, 0);
 	return color;
 }
-
 
 point get_camera_light_pos() {
 	return (get_camera_pos() + 0.1*CAMERA_RADIUS*cview_dir); // slightly in front of the camera to avoid zero length light_dir vector in dynamic lighting
@@ -1055,8 +1058,7 @@ void add_camera_candlelight() {
 
 void add_camera_flashlight() {
 
-	point const lpos(get_camera_light_pos());
-	//add_dynamic_light(FLASHLIGHT_RAD, lpos, get_flashlight_color(), cview_dir, FLASHLIGHT_BW);
+	//add_dynamic_light(FLASHLIGHT_RAD, get_camera_light_pos(), get_flashlight_color(), cview_dir, FLASHLIGHT_BW);
 	flashlight_on = 1;
 
 	if (world_mode == WMODE_GROUND && (display_mode & 0x0100)) { // add one bounce of indirect lighting
@@ -1065,6 +1067,7 @@ void add_camera_flashlight() {
 		float const rad_per_len(0.95*tan(theta));
 		vector3d vab[2];
 		get_ortho_vectors(cview_dir, vab);
+		point const lpos(get_camera_light_pos());
 
 		for (unsigned i = 0; i < NUM_VPLS; ++i) {
 			float const a(TWO_PI*i/NUM_VPLS);
@@ -1180,7 +1183,7 @@ void calc_spotlight_pdu(light_source const &ls, pos_dir_up &pdu) {
 
 void add_dynamic_lights_ground(float &dlight_add_thresh) {
 
-	//RESET_TIME;
+	//highres_timer_t timer("Dynamic Light Add");
 	sync_flashlight();
 	if (!animate2) return;
 	if (disable_dlights) {dl_sources.clear(); return;}
@@ -1257,13 +1260,10 @@ void add_dynamic_lights_ground(float &dlight_add_thresh) {
 			} // for x
 		} // for y
 	} // for ix (light index)
-	//PRINT_TIME("Dynamic Light Add");
 }
 
+void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh, float falloff) {
 
-void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh) {
-
-	//RESET_TIME;
 	if (disable_dlights) {dl_sources.clear(); return;}
 	assert(DL_GRID_BS == 0); // not supported
 	unsigned const ndl((unsigned)dl_sources.size()), gbx(MESH_X_SIZE), gby(MESH_Y_SIZE);
@@ -1271,6 +1271,7 @@ void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh
 	if (!has_dl_sources) return; // nothing else to do
 	dlight_add_thresh *= 0.99;
 	if (!scene_bcube.is_strictly_normalized()) {cerr << "Invalid scene_bcube: " << scene_bcube.str() << endl;}
+	//highres_timer_t timer("Dynamic Light Add"); // 0.18ms start, 0.37ms in office building
 	assert(scene_bcube.dx() > 0.0 && scene_bcube.dy() > 0.0);
 	point const scene_llc(scene_bcube.get_llc()); // Note: zval ignored
 	vector3d const scene_sz(scene_bcube.get_size()); // Note: zval ignored
@@ -1284,10 +1285,10 @@ void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh
 
 		for (++ix; ix < ndl; ++ix) { // determine range of stacked lights with the same X/Y value
 			light_source const &ls2(dl_sources[ix]);
-			if (ls2.get_pos().x != lpos.x || ls2.get_pos().y != lpos.y || ls2.get_radius() != ls.get_radius()) break;
+			if (ls2.get_pos().x != lpos.x || ls2.get_pos().y != lpos.y || ls2.get_radius() != ls.get_radius() || ls2.get_dir() != ls.get_dir()) break;
 		}
 		int const xcent((lpos.x - scene_llc.x)*grid_dx_inv + 0.5f), ycent((lpos.y - scene_llc.y)*grid_dy_inv + 0.5f);
-		cube_t bcube(ls.calc_bcube(0, sqrt_dlight_add_thresh)); // padded below
+		cube_t bcube(ls.calc_bcube(0, sqrt_dlight_add_thresh, 0, falloff)); // padded below
 
 		if (ls.is_very_directional() && (ls.get_dir().x != 0.0 || ls.get_dir().y != 0.0)) {
 			bcube.expand_by(vector3d(grid_dx, grid_dy, 0.0)); // add one grid unit for spotlights not pointed up/down
@@ -1298,7 +1299,7 @@ void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh
 			bnds[0][e] = max(0, min((int)gbx-1, int((bcube.d[0][e] - scene_llc.x)*grid_dx_inv)));
 			bnds[1][e] = max(0, min((int)gby-1, int((bcube.d[1][e] - scene_llc.y)*grid_dy_inv)));
 		}
-		int const radius(ls.get_radius()*max(grid_dx_inv, grid_dy_inv) + 2), rsq(radius*radius);
+		int const radius(max(1, round_fp(ls.get_radius()*max(grid_dx_inv, grid_dy_inv))) + 2), rsq(radius*radius);
 
 		if (ix - start_ix == 1) { // single light case
 			for (int y = bnds[1][0]; y <= bnds[1][1]; ++y) { // add lights to ldynamic
@@ -1319,7 +1320,6 @@ void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh
 			} // for y
 		}
 	} // for ix (light index)
-	//PRINT_TIME("Dynamic Light Add"); // 0.33ms
 }
 
 

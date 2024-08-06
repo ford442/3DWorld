@@ -412,7 +412,7 @@ public:
 			else if (s == "map_aat") {unhandled(s, mat_in);} // toggle antialiasing
 			else if (s == "decal"  ) {unhandled(s, mat_in);} // modifies color
 			else if (s == "disp"   ) {unhandled(s, mat_in);} // displacement
-			// PBR parameters, mostly unsupported, see http://exocortex.com/blog/extending_wavefront_mtl_to_support_pbr
+			// PBR parameters, mostly unsupported
 			else if (s == "metalness" || s == "pm") {
 				// Note: metalness has been added for 3DWorld and is not in the original obj file format;
 				assert(cur_mat);
@@ -424,7 +424,7 @@ public:
 			else if (s == "pcr"   ) {unhandled(s, mat_in);} // clearcoat roughness
 			else if (s == "aniso" ) {unhandled(s, mat_in);} // anisotropy
 			else if (s == "anisor") {unhandled(s, mat_in);} // anisotropy rotation
-			else if (s == "refl"  ) {unhandled(s, mat_in);} // reflection?
+			else if (s == "refl"  ) {unhandled(s, mat_in);} // reflection? seen in mailbox OBJ file
 			// PBR maps
 			else if (s == "map_pr") {unhandled(s, mat_in);} // metallic
 			else if (s == "map_pm") {unhandled(s, mat_in);} // roughness
@@ -712,6 +712,7 @@ public:
 			polygon_t poly;
 			vntc_map_t vmap[2]; // {triangles, quads}
 			vntct_map_t vmap_tan[2]; // {triangles, quads}
+			colorRGBA color;
 
 			for (vector<poly_header_t>::const_iterator j = pd.polys.begin(); j != pd.polys.end(); ++j) {
 				poly.resize(j->npts);
@@ -739,9 +740,10 @@ public:
 					}
 					else {tcoord = tc[V.tix];}
 					poly[p] = vert_norm_tc(v[V.vix], normal, tcoord.x, tcoord.y);
-					if (!colors.empty()) {assert(V.vix < colors.size()); poly.color += colors[V.vix];}
+					if (!colors.empty()) {assert(V.vix < colors.size()); color += colors[V.vix];}
 				} // for p
-				if (!colors.empty()) {poly.color = poly.color/j->npts; poly.color.A = 1.0;} // uses average vertex color for each face/polygon, with alpha=1.0
+				if (!colors.empty()) {color = color/j->npts; color.A = 1.0;} // uses average vertex color for each face/polygon, with alpha=1.0
+				// TODO: use color; model3d doesn't support per-vertex colors
 				num_faces += model.add_polygon(poly, vmap, vmap_tan, j->mat_id, j->obj_id);
 				pix += j->npts;
 			} // for j
@@ -791,11 +793,11 @@ bool const ALWAYS_USE_ASSIMP = 0;
 
 // recalc_normals: 0=no, 1=yes, 2=face_weight_avg
 bool load_model_file(string const &filename, model3ds &models, geom_xform_t const &xf, string const &anim_name, int def_tid, colorRGBA const &def_c,
-	int reflective, float metalness, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose)
+	int reflective, float metalness, float lod_scale, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose, uint64_t rev_winding_mask)
 {
 	if (filename.empty()) return 0; // can't be loaded
 	string const ext(get_file_extension(filename, 0, 1));
-	models.push_back(model3d(filename, models.tmgr, def_tid, def_c, reflective, metalness, recalc_normals, group_cobjs_level));
+	models.push_back(model3d(filename, models.tmgr, def_tid, def_c, reflective, metalness, lod_scale, recalc_normals, group_cobjs_level));
 	model3d &cur_model(models.back());
 
 	if (!ALWAYS_USE_ASSIMP && ext == "3ds") {
@@ -813,22 +815,24 @@ bool load_model_file(string const &filename, model3ds &models, geom_xform_t cons
 		if (write_file && !write_model3d_file(filename, cur_model)) return 0; // don't need to pop the model
 	}
 	else { // not a built-in supported format, try using assimp if compiled in
-		if (!read_assimp_model(filename, cur_model, xf, anim_name, recalc_normals, verbose)) return 0;
+		if (!read_assimp_model(filename, cur_model, xf, anim_name, recalc_normals, verbose)) {models.pop_back(); return 0;}
 	}
 	if (model_mat_lod_thresh > 0.0) {cur_model.compute_area_per_tri();} // used for TT LOD/distance culling
+	cur_model.reverse_winding_order(rev_winding_mask);
 	return 1;
 }
 
 // Note: assimp reader not supported in this flow
 bool read_model_file(string const &filename, vector<coll_tquad> *ppts, geom_xform_t const &xf, int def_tid, colorRGBA const &def_c,
-	int reflective, float metalness, bool load_models, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose)
+	int reflective, float metalness, float lod_scale, bool load_models, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose)
 {
 	setlocale(LC_ALL, "C"); // optimization for obj file reading?
 
 	if (load_models) {
 		// anim_name is used for debugging and general model loading; loaders that expect custom named animations don't call this function
 		string const anim_name(enable_model_animations ? "default" : "");
-		if (!load_model_file(filename, all_models, xf, anim_name, def_tid, def_c, reflective, metalness, recalc_normals, group_cobjs_level, write_file, verbose)) return 0;
+		if (!load_model_file(filename, all_models, xf, anim_name, def_tid, def_c, reflective, metalness,
+			lod_scale, recalc_normals, group_cobjs_level, write_file, verbose)) return 0;
 		if (ppts) {get_cur_model_polygons(*ppts);}
 		return 1;
 	}

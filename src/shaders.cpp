@@ -36,9 +36,7 @@ extern gl_light_params_t gl_light_params[MAX_SHADER_LIGHTS];
 
 
 void set_one_texture(shader_t &s, unsigned tid, unsigned tu_id, const char *const name) {
-
-	set_active_texture(tu_id); // texture unit
-	bind_2d_texture(tid);
+	bind_texture_tu(tid, tu_id);
 	s.add_uniform_int(name, tu_id);
 }
 
@@ -467,10 +465,10 @@ void shader_t::set_material(base_mat_t const &mat) {
 
 
 struct program_t {
-	unsigned p, sixs[NUM_SHADER_TYPES] = {0};
-	bool valid;
+	unsigned p=0, sixs[NUM_SHADER_TYPES] = {0};
+	bool valid=0;
 
-	program_t() : p(0), valid(0) {}
+	program_t() {}
 	program_t(unsigned p_, unsigned sixs_[NUM_SHADER_TYPES]) : p(p_), valid(1) {}
 };
 
@@ -490,9 +488,9 @@ public:
 
 
 struct ix_valid_t {
-	unsigned ix;
-	bool valid;
-	ix_valid_t() : ix(0), valid(0) {}
+	unsigned ix=0;
+	bool valid=0;
+	ix_valid_t() {}
 	ix_valid_t(unsigned const ix_) : ix(ix_), valid(1) {}
 };
 
@@ -552,11 +550,16 @@ public:
 			if (line.size() > 8) { // look for include directive
 				istringstream iss(line);
 				if ((iss >> str) && str == "#include") {
+					// Note: it may help with MSVS syntax highlighting to add "#extension GL_ARB_shading_language_include : enable" to the shader,
+					// though it likely doesn't understand the shaders directory system or ".part" rather than ".vert", ".frag" extensions
+					// alternatively, there appears to be an ARB extension for shader includes:
+					//glNamedStringARB(GL_SHADER_INCLUDE_ARB, -1, "header.glsl", -1, header_str);
+					//glCompileShaderIncludeARB(shader, inc_dirs, _countof(inc_dirs), NULL);
 					if (!(iss >> str)) {cerr << "Error: empty shader include" << endl; return 0;}
 					// does this need to handle quoted string with spaces?
 					if      (check_strip_wrapper_chars(str, '<',  '>' )) {str = "shaders/" + str;} // strip off the angle brackets (include from shader directory)
 					else if (check_strip_wrapper_chars(str, '\"', '\"')) {} // strip off the quotes (include from local directory)
-					if (str == fname) {cerr << "Error: recusrive include of shader file '" << fname << "'" << endl; return 0;}
+					if (str == fname) {cerr << "Error: recursive include of shader file '" << fname << "'" << endl; return 0;}
 					// load the contents of this shader directly into the file contents of the including shader (inline it)
 					if (!load_shader_file(str, file_contents, all_fns)) {cerr << "Error: Failed to load included shader file '" << str << "'" << endl; return 0;}
 					file_contents += '\n';
@@ -615,40 +618,16 @@ public:
 		for (unsigned i = 0; i < NUM_SHADER_TYPES; ++i) {shader_id_str += shader_names[i] + ',';} // unique program identifier
 		return get_program_by_name(shader_id_str);
 	}
+	void print_stats() const {
+		cout << "Loaded shader files: " << loaded_files.size() << endl;
+		cout << "Shader counts:";
+		for (unsigned n = 0; n < NUM_SHADER_TYPES; ++n) {cout << " " << loaded_shaders[n].size();}
+		cout << endl;
+		cout << "Shader programs: " << loaded_programs.size() << endl;
+	}
 };
 
 shader_manager_t shader_manager;
-
-
-class vao_cache_t {
-
-	typedef map<pair<unsigned, unsigned>, unsigned> vao_map_t;
-	vao_map_t vao_map; // maps {VBO, program} to VAO
-
-public:
-	unsigned get_vao_for_vbo(unsigned vbo, shader_t const *shader=nullptr) {
-		assert(vbo); // vbo must be valid
-		if (shader == nullptr) {shader = cur_shader;} // if shader is left as null, we use the current shader
-		pair<unsigned, unsigned> const key(make_pair(vbo, shader->get_program()));
-		vao_map_t::const_iterator it(vao_map.find(key));
-		if (it != vao_map.end()) {return it->second;}
-		unsigned const vao(create_vao());
-		vao_map[key] = vao;
-		return vao;
-	}
-	void bind_vao_for_vbo(unsigned vbo, shader_t const *shader=nullptr) {
-		check_bind_vao(get_vao_for_vbo(vbo, shader));
-	}
-	void clear() {
-		for (vao_map_t::iterator i = vao_map.begin(); i != vao_map.end(); ++i) {delete_vao(i->second);}
-		vao_map.clear();
-	}
-};
-
-vao_cache_t vao_cache;
-
-unsigned get_vao_for_vbo(unsigned vbo, shader_t const *shader) {return vao_cache.get_vao_for_vbo(vbo, shader);}
-void bind_vao_for_vbo(unsigned vbo, shader_t const *shader) {vao_cache.bind_vao_for_vbo(vbo, shader);}
 
 
 bool setup_shaders() {
@@ -675,22 +654,19 @@ bool setup_shaders() {
 
 
 void clear_shaders() {
-
 	clear_cached_shaders();
 	shader_manager.clear();
-	vao_cache.clear();
 }
 
-
 void reload_all_shaders() { // clears and reloads *everything*
-
 	// Note: do we want/need some function called every frame that check if shader files have been modified and calls this?
 	cout << "Reloading all shaders" << endl;
 	clear_cached_shaders();
 	shader_manager.clear_and_reload();
-	vao_cache.clear();
 	clear_tiled_terrain_shaders();
 }
+
+void print_shader_stats() {shader_manager.print_stats();}
 
 
 bool yes_no_query(string const &query_str) {
@@ -728,6 +704,7 @@ unsigned shader_t::get_shader(string const &name, unsigned type) const {
 	
 	//RESET_TIME;
 	if (name.empty()) return 0; // none selected
+	//if (has_extension("GL_NV_mesh_shader")) {} // future work; use with glDrawMeshTasksNV()
 	assert(type < NUM_SHADER_TYPES);
 	string const lookup_name(name + prepend_string[type]);
 	ix_valid_t &ixv(shader_manager.get_shader_by_name(lookup_name, type));
@@ -937,7 +914,6 @@ void shader_t::clear() {
 
 
 void shader_t::make_current() {
-
 	assert(program);
 	glUseProgram(program);
 	restore_subroutines();
@@ -945,16 +921,13 @@ void shader_t::make_current() {
 }
 
 void shader_t::enable() {
-	
 	make_current();
 	upload_all_light_sources();
 	upload_pjm();
 	upload_mvm();
 	mvm_changed = 0;
 }
-
 void shader_t::disable() {
-	
 	cur_shader = NULL; // must be done first to prevent check_mvm_update() from trying to upload a new MVM in enable_vnct_atribs()
 	if (is_setup()) {enable_vnct_atribs(0, 0, 0, 0);} // disable all
 	glUseProgram(0);
@@ -966,14 +939,12 @@ bool shader_is_active() {return (cur_shader != nullptr);}
 // Note 1: We don't handle the case where the projection matrix is updated while a shader is active because this currently doesn't occur.
 // Note 2: We assume we only need to update the MVM in at most one active shader, and once updated we can clear the changed flag
 void check_mvm_update() {
-
 	if (!mvm_changed) return; // nothing to update
 	if (cur_shader) {cur_shader->upload_mvm();}
 	mvm_changed = 0;
 }
 
 void shader_t::cache_matrix_locs() {
-
 	pm_loc   = get_uniform_loc("fg_ProjectionMatrix"); // okay if returns -1
 	mvm_loc  = get_uniform_loc("fg_ModelViewMatrix");
 	mvmi_loc = get_uniform_loc("fg_ModelViewMatrixInverse");
@@ -1009,7 +980,6 @@ void shader_t::upload_mvm() { // and everything that depends on the mvm
 
 // built-in attribute setup/enable/binding
 void shader_t::cache_vnct_locs() { // Note: program need not be enabled
-
 	assert(is_setup());
 	// Note: locations will generally be {0,1,2,3} as assigned in the vertex shader, but if unused they can be -1
 	const char *loc_strs[4] = {"fg_Vertex", "fg_Normal", "fg_Color", "fg_TexCoord"};
@@ -1056,16 +1026,46 @@ void shader_t::set_cur_normal(vector3d const &normal) const {
 
 // some simple shared shaders
 void shader_t::begin_color_only_shader() {
-
 	set_vert_shader("vert_xform_only");
 	set_frag_shader("color_only");
 	begin_shader();
 }
-
 void shader_t::begin_color_only_shader(colorRGBA const &color) {
-
 	begin_color_only_shader();
 	set_cur_color(color);
+}
+
+bool is_csm_active();
+void shader_csm_render_setup(shader_t &s);
+
+void shader_t::begin_shadow_map_shader(bool use_alpha_mask, bool enable_xlate_scale) {
+	bool const use_csm(is_csm_active());
+
+	if (use_alpha_mask) {
+		if (use_csm) {
+			set_vert_shader("shadow_map_csm_tc");
+			set_geom_shader("csm_layers_tc");
+		}
+		else {
+			set_vert_shader("pos_only");
+		}
+		set_frag_shader("alpha_mask_shadow");
+		begin_shader();
+		add_uniform_float("min_alpha", MIN_SHADOW_ALPHA);
+		add_uniform_int("tex0", 0);
+	}
+	else {
+		if (use_csm) {
+			set_vert_shader(enable_xlate_scale ? "shadow_map_csm_xlate_scale" : "shadow_map_csm");
+			set_geom_shader("csm_layers");
+		}
+		else {
+			set_vert_shader(enable_xlate_scale ? "vertex_xlate_scale" : "shadow_map");
+		}
+		set_frag_shader("empty_shader");
+		begin_shader();
+	}
+	if (use_csm) {shader_csm_render_setup(*this);}
 }
 
 void shader_t::begin_simple_textured_shader(float min_alpha, bool include_2_lights, bool use_texgen, colorRGBA const *const color) {
@@ -1087,7 +1087,6 @@ void shader_t::begin_simple_textured_shader(float min_alpha, bool include_2_ligh
 }
 
 void shader_t::begin_untextured_lit_glcolor_shader() {
-
 	begin_simple_textured_shader(0.0, 1); // lighting (not actually textured)
 	select_texture(WHITE_TEX); // untextured
 }
@@ -1219,7 +1218,8 @@ void compute_shader_t::read_pixels(vector<float> &vals, bool is_last) {
 
 	assert(pbo); bind_pbo(pbo);
 	void *ptr = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, get_pbo_size(), GL_MAP_READ_BIT); // Note: blocks until data is ready
-	memcpy((void *)&vals.front(), ptr, get_pbo_size());
+	assert(ptr != nullptr);
+	memcpy((void *)vals.data(), ptr, get_pbo_size());
 	glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
 
 	if (is_last) {
@@ -1288,6 +1288,7 @@ void compute_shader_comp_t::read_float_vals(vector<float> &vals, bool is_last, b
 	assert(is_running);
 	is_running = 0;
 	vals.resize(xsize*ysize*zsize);
+	glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
 	glGetTexImage((is_3d() ? GL_TEXTURE_3D : GL_TEXTURE_2D), 0, GL_RED, GL_FLOAT, &vals.front());
 
 	if (xsize != xsize_req || ysize != ysize_req || zsize != zsize_req) { // need to copy a smaller sub-range from a larger texture
@@ -1314,7 +1315,6 @@ void compute_shader_comp_t::gen_matrix_R32F(vector<float> &vals, unsigned &tid, 
 
 
 void upload_mvm_to_shader(shader_t &s, char const *const var_name) {
-
 	s.add_uniform_matrix_4x4(var_name, fgGetMVM().get_ptr(), 0);
 }
 
@@ -1336,6 +1336,7 @@ void instance_render_t::draw_and_clear(int prim_type, unsigned count, unsigned c
 		assert(indices == nullptr);
 		glDrawArraysInstanced(prim_type, first, count, inst_xforms.size());
 	}
+	++num_frame_draw_calls;
 	shader_float_matrix_uploader<4,4>::disable(loc);
 	inst_xforms.clear();
 }

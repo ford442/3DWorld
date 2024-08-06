@@ -157,6 +157,8 @@ template<typename T> inline void max_eq(T &A, T const B) {A = max(A, B);}
 
 enum {CAM_FILT_DAMAGE=0, CAM_FILT_FOG, CAM_FILT_BURN, CAMERA_FILT_BKG, CAM_FILT_UWATER, CAM_FILT_TELEPORT, CAM_FILT_FROZEN, CAM_FILT_END};
 enum {FG_PROJECTION=0, FG_MODELVIEW};
+enum {GAME_MODE_NONE=0, GAME_MODE_FPS, GAME_MODE_DODGEBALL};
+unsigned const GAME_MODE_BUILDINGS = 2; // same as GAME_MODE_DODGEBALL
 
 
 template<typename T> struct point2d { // size = 8
@@ -370,6 +372,11 @@ template<typename T> struct hash_by_bytes { // should work with all packed verte
 };
 inline unsigned hash_point(point const &p) {return hash_by_bytes<point>()(p);}
 
+inline void hash_mix_point(point const &p, unsigned &hv) {
+	hv += hash_point(p);
+	hv += hv << 10;
+	hv ^= hv >> 6;
+}
 template<typename T> unsigned hash_vect_as_int(vector<T> const &v) {
 	assert((sizeof(T) % sizeof(int)) == 0); // must be a multiple of 4 bytes
 	return jenkins_one_at_a_time_hash((int const*)v.data(), sizeof(T)*v.size()/sizeof(int));
@@ -411,12 +418,11 @@ struct sphere_t {
 };
 
 
-struct cube_t { // size = 24
+struct cube_t { // size = 24; Note: AABB, not actually a cube
 
 	float d[3][2]; // {x,y,z},{min,max}
 
 	cube_t() {set_to_zeros();}
-	//cube_t() {x1() = 1; x2() = 0; y1() = 1; y2() = 0; z1() = 1; z2() = 0;} // initialize to invalid values for testing purposes
 	
 	cube_t(float x1_, float x2_, float y1_, float y2_, float z1_, float z2_) {
 		x1() = x1_; x2() = x2_; y1() = y1_; y2() = y2_; z1() = z1_; z2() = z2_;
@@ -551,9 +557,16 @@ struct cube_t { // size = 24
 		UNROLL_2X(if (cube.d[i_][0] < d[i_][0] || cube.d[i_][1] > d[i_][1]) return 0;)
 		return 1;
 	}
+	bool contains_cube_xy_exp(const cube_t &cube, float exp) const {
+		UNROLL_2X(if (cube.d[i_][0]-exp < d[i_][0] || cube.d[i_][1]+exp > d[i_][1]) return 0;)
+			return 1;
+	}
 	bool contains_cube_xy_no_adj(const cube_t &cube) const {
 		UNROLL_2X(if (cube.d[i_][0] <= d[i_][0] || cube.d[i_][1] >= d[i_][1]) return 0;)
 		return 1;
+	}
+	bool contains_cube_xy_overlaps_z(const cube_t &cube) const { // no adj in Z
+		return (contains_cube_xy(cube) && cube.z1() < z2() && cube.z2() > z1());
 	}
 	bool contains_pt(point const &pt) const { // includes points on the edge
 		UNROLL_3X(if (pt[i_] < d[i_][0] || pt[i_] > d[i_][1]) return 0;)
@@ -607,7 +620,7 @@ struct cube_t { // size = 24
 	unsigned get_split_dim(float &max_sz, float &sval, unsigned skip_dims) const;
 	bool cube_intersection(const cube_t &cube, cube_t &res) const;
 	float get_overlap_volume(const cube_t &cube) const;
-	vector3d closest_side_dir(point const &pos) const;
+	vector3d closest_side_dir(point const &pos, unsigned skip_dims=0) const;
 	bool closest_dist_less_than(point const &pos, float dist) const;
 	bool closest_dist_xy_less_than(point const &pos, float dist) const;
 	
@@ -621,6 +634,8 @@ struct cube_t { // size = 24
 		UNROLL_3X(mextent = max(mextent, max(-d[i_][0], d[i_][1]));)
 		return mextent;
 	}
+	float get_max_dim_sz() const {return std::max(dz(), std::max(dx(), dy()));}
+
 	float furthest_dist_to_pt(point const &pos) const {
 		vector3d dmax;
 		UNROLL_3X(dmax[i_] = max((pos[i_] - d[i_][0]), (d[i_][1] - pos[i_]));)
@@ -700,6 +715,8 @@ struct pos_dir_up { // defines a view frustum
 	bool cube_visible_for_light_cone(cube_t const &c) const;
 	bool projected_cube_visible(cube_t const &cube, point const &proj_pt) const;
 	bool sphere_and_cube_visible_test(point const &pos_, float radius, cube_t const &cube) const;
+	void get_frustum_corners(point pts[8]) const;
+	point get_frustum_center() const;
 	void draw_frustum() const;
 	void translate(vector3d const &tv) {pos += tv;}
 	void scale(float s) {pos *= s; near_ *= s; far_ *= s;}
@@ -889,10 +906,12 @@ template <typename T> void unset_ptr_state(T const *const verts) {
 	if (verts) {unbind_temp_vbo();}
 }
 
+extern unsigned num_frame_draw_calls;
 template <typename T> void draw_verts(T const *const verts, unsigned count, int gl_type, unsigned start_ix=0, bool set_array_client_state=1) {
 	assert(count > 0);
 	set_ptr_state(verts, count, start_ix, set_array_client_state);
 	glDrawArrays(gl_type, start_ix, count);
+	++num_frame_draw_calls;
 	unset_ptr_state(verts);
 }
 template <typename T> void draw_verts(vector<T> const &verts, int gl_type, unsigned start_ix=0, bool set_array_client_state=1) {
@@ -941,6 +960,15 @@ template <typename T> void tri_strip_push(vector<T> &v) {
 	v.push_back(v[v.size()-2]);
 	v.push_back(v[v.size()-2]);
 }
+
+
+class draw_call_counter {
+	std::string name;
+	unsigned start_num_draw_calls;
+public:
+	draw_call_counter(std::string const &name_) : name(name_), start_num_draw_calls(num_frame_draw_calls) {}
+	~draw_call_counter() {std::cout << name << ": " << (num_frame_draw_calls - start_num_draw_calls) << std::endl;}
+};
 
 
 template<typename T> struct triangle_t {
@@ -1014,29 +1042,25 @@ enum {IMG_FMT_RAW_RGB=0, IMG_FMT_BMP, IMG_FMT_RAW_INVY, IMG_FMT_RAW_RGBA, IMG_FM
 class texture_t { // size >= 116
 
 public:
-	char type, format, use_mipmaps, defer_load_type;
-	bool wrap, mirror, invert_y, do_compress, has_binary_alpha, is_16_bit_gray, no_avg_color_alpha_fill, invert_alpha, normal_map;
-	int width, height, ncolors, bump_tid, alpha_tid;
-	float anisotropy, mipmap_alpha_weight;
+	char type=0, format=0, use_mipmaps=0, defer_load_type=DEFER_TYPE_NONE;
+	bool wrap=0, mirror=0, invert_y=0, do_compress=0, has_binary_alpha=0, is_16_bit_gray=0, no_avg_color_alpha_fill=0, invert_alpha=0, normal_map=0;
+	int width=0, height=0, ncolors=0, bump_tid=-1, alpha_tid=-1;
+	float anisotropy=1.0, mipmap_alpha_weight=1.0;
 	std::string name;
 
 protected:
-	unsigned char *data, *orig_data, *colored_data;
-	unsigned tid;
-	colorRGBA color;
+	unsigned char *data=nullptr, *orig_data=nullptr, *colored_data=nullptr;
+	unsigned tid=0;
+	colorRGBA color=DEF_TEX_COLOR;
 	enum {DEFER_TYPE_NONE=0, DEFER_TYPE_DDS, NUM_DEFER_TYPE};
 
 	void maybe_swap_rb(unsigned char *ptr) const;
 
 public:
-	texture_t() : type(0), format(0), use_mipmaps(0), defer_load_type(DEFER_TYPE_NONE), wrap(0), mirror(0), invert_y(0), do_compress(0), has_binary_alpha(0),
-		is_16_bit_gray(0), no_avg_color_alpha_fill(0), invert_alpha(0), normal_map(0), width(0), height(0), ncolors(0), bump_tid(-1), alpha_tid(-1),
-		anisotropy(1.0), mipmap_alpha_weight(1.0), data(0), orig_data(0), colored_data(0), tid(0), color(DEF_TEX_COLOR) {}
-
+	texture_t() {}
 	texture_t(char t, char f, int w, int h, int wrap_mir, int nc, char um, std::string const &n, bool inv=0, bool do_comp=1, float a=1.0, float maw=1.0, bool nm=0)
-		: type(t), format(f), use_mipmaps(um), defer_load_type(DEFER_TYPE_NONE), wrap(wrap_mir != 0), mirror(wrap_mir == 2), invert_y(inv), do_compress(do_comp),
-		has_binary_alpha(0), is_16_bit_gray(0), no_avg_color_alpha_fill(0), invert_alpha(0), normal_map(nm), width(w), height(h), ncolors(nc), bump_tid(-1),
-		alpha_tid(-1), anisotropy(a), mipmap_alpha_weight(maw), name(n), data(0), orig_data(0), colored_data(0), tid(0), color(DEF_TEX_COLOR) {}
+		: type(t), format(f), use_mipmaps(um), wrap(wrap_mir != 0), mirror(wrap_mir == 2), invert_y(inv), do_compress(do_comp),
+		normal_map(nm), width(w), height(h), ncolors(nc), anisotropy(a), mipmap_alpha_weight(maw), name(n) {}
 	bool is_inverted_y_type() const {return (defer_load_type == DEFER_TYPE_DDS);}
 	void set_existing_tid(unsigned tid_, colorRGBA const &color_) {tid = tid_; color = color_;}
 	void set_16_bit_grayscale();
@@ -1056,7 +1080,7 @@ public:
 	void set_to_color(colorRGBA const &c);
 	void maybe_assign_normal_map_tid(int nm_tid) {if (nm_tid >= 0 && bump_tid < 0) {bump_tid = nm_tid;}}
 	void alloc();
-	void bind_gl() const;
+	void bind_gl(unsigned tu_id=0) const;
 	GLuint64 get_bindless_handle(bool make_resident=1) const;
 	void free_client_mem();
 	void free_data() {gl_delete(); free_client_mem();}
@@ -1078,6 +1102,7 @@ public:
 	void do_invert_y();
 	void fix_word_alignment();
 	void add_alpha_channel();
+	void expand_grayscale_to_rgb();
 	void resize(int new_w, int new_h);
 	bool try_compact_to_lum();
 	void make_normal_map();
@@ -1101,6 +1126,7 @@ public:
 	unsigned bytes_per_channel() const {return (is_16_bit_gray ? 2U : 1U);}
 	unsigned get_cpu_mem() const {return (is_allocated() ? num_bytes() : 0);} // Note: ignores other data; excludes deferred load/DDS textures
 	unsigned get_gpu_mem() const;
+	unsigned get_tid() const {return tid;} // for passing into bind_texture_tu() calls
 	void set_color_alpha_to_one() {color.alpha = 1.0;} // to make has_alpha() return 0
 	bool has_alpha()    const {return (color.alpha < 1.0 || alpha_tid >= 0);}
 	bool is_bound()     const {return (tid > 0);}
@@ -1313,6 +1339,16 @@ public:
 	~timer_t() {end();}
 	void end() {if (enabled && !name.empty()) {register_timing_value(name.c_str(), GET_DELTA_TIME, no_loading_screen); name.clear();}}
 };
+
+struct status_bar_t {
+	colorRGBA color;
+	float val;
+	unsigned icon_id;
+	status_bar_t(colorRGBA const &c, float v, unsigned id=0) : color(c), val(v), icon_id(id) {}
+};
+
+// status bar icons
+enum {ICON_HEALTH=0, ICON_SHIELD, ICON_POWER, ICON_DRUNK, ICON_TOILET, ICON_WATER, ICON_OXYGEN, ICON_CARRY, NUM_ICONS};
 
 
 // world modes

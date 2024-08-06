@@ -4,20 +4,16 @@
 #include "3DWorld.h"
 #include "function_registry.h"
 #include "buildings.h"
-#include "profiler.h"
 #include "city.h" // for car_t
 #include <cfloat> // for FLT_MAX
 
 enum {PIPE_TYPE_SEWER=0, PIPE_TYPE_CW, PIPE_TYPE_HW, PIPE_TYPE_GAS, NUM_PIPE_TYPES};
 
-extern float DX_VAL_INV, DY_VAL_INV;
-extern building_params_t global_building_params;
 extern city_params_t city_params; // for num_cars
 
 car_t car_from_parking_space(room_object_t const &o);
 void subtract_cube_from_floor_ceil(cube_t const &c, vect_cube_t &fs);
 bool line_int_cubes_exp(point const &p1, point const &p2, vect_cube_t const &cubes, vector3d const &expand);
-bool using_hmap_with_detail();
 
 
 bool enable_parked_cars() {return (city_params.num_cars > 0 && !city_params.car_model_files.empty());}
@@ -52,7 +48,9 @@ void subtract_cubes_from_cube_split_in_dim(cube_t const &c, vect_cube_t const &s
 	} // for s
 }
 
-unsigned building_t::add_water_heaters(rand_gen_t &rgen, room_t const &room, float zval, unsigned room_id, float tot_light_amt, unsigned objs_start) {
+// *** Utilities ***
+
+unsigned building_t::add_water_heaters(rand_gen_t &rgen, room_t const &room, float zval, unsigned room_id, float tot_light_amt, unsigned objs_start, bool single_only) {
 	float const floor_spacing(get_window_vspace()), height(get_floor_ceil_gap());
 	float const radius((is_house ? 0.18 : 0.20)*height); // larger radius for office buildings
 	cube_t const room_bounds(get_walkable_room_bounds(room));
@@ -68,15 +66,16 @@ unsigned building_t::add_water_heaters(rand_gen_t &rgen, room_t const &room, flo
 	}
 	else { // select corners furthest from the door (back wall)
 		first_dim = (room.dy() < room.dx()); // face the shorter dim for office buildings so that we can place longer rows
-		vect_door_stack_t const &doorways(get_doorways_for_room(room, zval));
 
-		for (auto i = doorways.begin(); i != doorways.end(); ++i) {
-			bool const dir(room.get_center_dim(i->dim) < i->get_center_dim(i->dim));
-			(i->dim ? first_ydir : first_xdir) = !dir; // opposite the door
-			//first_dim = i->dim; // place against back wall; too restrictive?
+		for (door_stack_t const &ds : interior->door_stacks) {
+			if (!ds.is_connected_to_room(room_id)) continue;
+			bool const dir(room.get_center_dim(ds.dim) < ds.get_center_dim(ds.dim));
+			(ds.dim ? first_ydir : first_xdir) = !dir; // opposite the door
+			//first_dim = ds.dim; // place against back wall; too restrictive?
 		}
 	}
-	for (unsigned n = 0; n < 5; ++n) { // make 5 attempts to place a water heater - one in each corner and 1 along a random wall for variety
+	// make 5 attempts to place a water heater - one in each corner and 1 along a random wall for variety; 20 attempts for office buildings/apartments/hotels
+	for (unsigned n = 0; n < (is_house ? 5U : 20U); ++n) {
 		bool dim(0), dir(0), xdir(0), ydir(0);
 
 		if (n < 4) { // corner
@@ -94,17 +93,23 @@ unsigned building_t::add_water_heaters(rand_gen_t &rgen, room_t const &room, flo
 			center[!dim] = rgen.rand_uniform(place_area.d[!dim][0], place_area.d[!dim][1]);
 		}
 		cube_t c(get_cube_height_radius(center, radius, height));
-		if (is_cube_close_to_doorway(c, room, 0.0, 1) || interior->is_blocked_by_stairs_or_elevator(c)) continue;
+		if (is_obj_placement_blocked(c, room, 1)) continue;
 		cube_t c_exp(c);
 		c_exp.expand_by_xy(0.2*radius); // small keepout in XY
 		c_exp.d[dim][!dir] += (dir ? -1.0 : 1.0)*0.25*radius; // add more keepout in front where the controls are
 		c_exp.intersect_with_cube(room); // don't pick up objects on the other side of the wall
 		if (overlaps_other_room_obj(c_exp, objs_start)) continue; // check existing objects, in particular storage room boxes that will have already been placed
+		if (zval > ground_floor_z1 && check_if_against_window(c, room, dim, dir)) continue; // can fail for apartment and hotel utility rooms
 		unsigned const flags((is_house ? RO_FLAG_IS_HOUSE : 0) | RO_FLAG_INTERIOR);
 		objs.emplace_back(c, TYPE_WHEATER, room_id, dim, !dir, flags, tot_light_amt, SHAPE_CYLIN);
 		unsigned num_added(1);
 
-		if (!is_house && n < 4) { // office building, placed at corner; try to add additional water heaters along the wall
+		if (is_house && has_attic()) { // add rooftop vent above the water heater
+			float const attic_floor_zval(get_attic_part().z2()), vent_radius(0.15*radius);
+			point const vent_bot_center(center.x, center.y, attic_floor_zval);
+			add_attic_roof_vent(vent_bot_center, vent_radius, room_id, 1.0); // light_amt=1.0; room_id is for the basement because there's no attic room
+		}
+		if (!single_only && !is_house && n < 4) { // office building, placed at corner; try to add additional water heaters along the wall
 			vector3d step;
 			step[!dim] = 2.2*radius*((dim ? xdir : ydir) ? -1.0 : 1.0); // step in the opposite dim
 			// ideally we would iterate over all the plumbing fixtures to determine water usage, but they might not be placed yet, so instead count rooms;
@@ -117,7 +122,7 @@ unsigned building_t::add_water_heaters(rand_gen_t &rgen, room_t const &room, flo
 			for (unsigned m = 1; m < max_wh; ++m) { // one has already been placed
 				c.translate(step);
 				if (!room_bounds.contains_cube(c)) break; // went outside the room, done
-				if (is_cube_close_to_doorway(c, room, 0.0, 1) || interior->is_blocked_by_stairs_or_elevator(c)) continue; // bad placement, skip
+				if (is_obj_placement_blocked(c, room, 1)) continue; // bad placement, skip
 				c_exp.translate(step);
 				if (overlaps_other_room_obj(c_exp, objs_start)) continue; // check existing objects
 				objs.emplace_back(c, TYPE_WHEATER, room_id, dim, !dir, flags, tot_light_amt, SHAPE_CYLIN);
@@ -131,8 +136,8 @@ unsigned building_t::add_water_heaters(rand_gen_t &rgen, room_t const &room, flo
 
 bool gen_furnace_cand(cube_t const &place_area, float floor_spacing, bool near_wall, rand_gen_t &rgen, cube_t &furnace, bool &dim, bool &dir) {
 	// my furnace is 45" tall, 17.5" wide, and 21" deep, with a 9" tall duct below (total height = 54"); assume floor spacing is 96"
-	float const height(0.563*floor_spacing), hwidth(0.182*height), hdepth(0.219*height);
-	if (hdepth > 5.0*min(place_area.dx(), place_area.dy())) return 0; // place area is too small
+	float const height(0.563*floor_spacing), hwidth(0.182*height), hdepth(0.219*height), room_min_sz(min(place_area.dx(), place_area.dy()));
+	if (hdepth > 5.0*room_min_sz || 2.1*(hdepth + building_t::get_scaled_player_radius()) > room_min_sz) return 0; // place area is too small
 	dim = rgen.rand_bool();
 	point center;
 	float const lo(place_area.d[dim][0] + hdepth), hi(place_area.d[dim][1] - hdepth);
@@ -152,6 +157,38 @@ bool gen_furnace_cand(cube_t const &place_area, float floor_spacing, bool near_w
 	return 1;
 }
 
+void building_t::add_breaker_panel(rand_gen_t &rgen, cube_t const &c, float ceil_zval, bool dim, bool dir, unsigned room_id, float tot_light_amt) {
+	assert(has_room_geom());
+	auto &objs(interior->room_geom->objs);
+	objs.emplace_back(c, TYPE_BRK_PANEL, room_id, dim, dir, RO_FLAG_INTERIOR, tot_light_amt, SHAPE_CUBE, colorRGBA(0.5, 0.6, 0.7));
+	set_obj_id(objs);
+
+	if (c.z1() < ground_floor_z1) { // add conduit if in the basement
+		assert(c.z2() < ceil_zval);
+		cube_t conduit(cube_top_center(c));
+		conduit.z2() = ceil_zval;
+		float const bp_hdepth(0.5*c.get_sz_dim(dim)), conduit_radius(rgen.rand_uniform(0.38, 0.46)*bp_hdepth);
+		conduit.expand_by_xy(conduit_radius);
+		objs.emplace_back(conduit, TYPE_PIPE, room_id, 0, 1, (RO_FLAG_NOCOLL | RO_FLAG_INTERIOR), tot_light_amt, SHAPE_CYLIN, LT_GRAY); // vertical pipe
+	}
+}
+bool connect_furnace_to_breaker_panel(room_object_t const &furnace, cube_t const &bp, bool dim, bool dir, float conn_height, cube_t &conn) {
+	assert(furnace.type == TYPE_FURNACE);
+	if (furnace.dim != dim || furnace.dir == dir) return 0; // wrong orient (note that dir is backwards)
+	if (furnace.d[dim][dir] < bp.d[dim][0] || furnace.d[dim][dir] > bp.d[dim][1]) return 0; // back against the wrong wall (can't check wall_pos here)
+	float const radius(0.67*0.2*bp.get_sz_dim(dim)); // 67% of average conduit radius
+	set_wall_width(conn, conn_height, radius, 2); // set zvals
+	if (conn.z1() < furnace.z1() || conn.z2() > furnace.z2()) return 0;
+	bool const pipe_dir(furnace.get_center_dim(!dim) < bp.get_center_dim(!dim));
+	set_wall_width(conn, conn_height, radius, 2);
+	float const wall_pos(bp.d[dim][dir]);
+	conn.d[dim][ dir] = wall_pos;
+	conn.d[dim][!dir] = wall_pos + (dir ? -1.0 : 1.0)*2.0*radius; // extend outward from wall
+	conn.d[!dim][!pipe_dir] = furnace.d[!dim][ pipe_dir];
+	conn.d[!dim][ pipe_dir] = bp     .d[!dim][!pipe_dir];
+	return 1;
+}
+
 // Note: for houses
 bool building_t::add_basement_utility_objs(rand_gen_t rgen, room_t const &room, float zval, unsigned room_id, float tot_light_amt, unsigned objs_start) {
 	if (!has_room_geom()) return 0;
@@ -166,12 +203,51 @@ bool building_t::add_office_utility_objs(rand_gen_t rgen, room_t const &room, fl
 	zval       = add_flooring(room, zval, room_id, tot_light_amt, FLOORING_CONCRETE); // add concreate and move the effective floor up
 	objs_start = interior->room_geom->objs.size(); // exclude this from collision checks
 	unsigned const num_water_heaters(add_water_heaters(rgen, room, zval, room_id, tot_light_amt, objs_start));
-	if (num_water_heaters == 0) return 0;
+	if (num_water_heaters == 0 && !is_apt_or_hotel()) return 0; // apartments and hotels have utility rooms even if there's no water heater
 	// add one furnace per water heater
+	auto &objs(interior->room_geom->objs);
+	unsigned const furnaces_start(objs.size());
 	for (unsigned n = 0; n < num_water_heaters; ++n) {add_furnace_to_room(rgen, room, zval, room_id, tot_light_amt, objs_start);}
+	unsigned const furnaces_end(objs.size());
 	cube_t place_area(get_walkable_room_bounds(room));
 	place_model_along_wall(OBJ_MODEL_SINK, TYPE_SINK, room, 0.45, rgen, zval, room_id, tot_light_amt, place_area, objs_start, 0.6); // place janitorial sink
-	add_door_sign("Utility", room, zval, room_id, tot_light_amt);
+	// add breaker panel
+	float const floor_spacing(get_window_vspace()), floor_height(floor_spacing - 2.0*get_fc_thickness()), ceil_zval(zval + get_floor_ceil_gap());
+	float const bp_hwidth(rgen.rand_uniform(0.15, 0.25)*(is_house ? 0.7 : 1.0)*floor_height), bp_hdepth(rgen.rand_uniform(0.05, 0.07)*(is_house ? 0.5 : 1.0)*floor_height);
+	
+	if (bp_hwidth < 0.25*min(room.dx(), room.dy())) { // if room is large enough
+		cube_t c;
+		set_cube_zvals(c, (ceil_zval - 0.75*floor_height), (ceil_zval - rgen.rand_uniform(0.2, 0.35)*floor_height));
+
+		for (unsigned n = 0; n < 20; ++n) { // 20 tries
+			bool const dim(rgen.rand_bool()), dir(rgen.rand_bool());
+			float const dir_sign(dir ? -1.0 : 1.0), wall_pos(place_area.d[dim][dir]);
+			float const bp_center(rgen.rand_uniform(place_area.d[!dim][0]+bp_hwidth, place_area.d[!dim][1]-bp_hwidth));
+			set_wall_width(c, bp_center, bp_hwidth, !dim);
+			c.d[dim][ dir] = wall_pos;
+			c.d[dim][!dir] = wall_pos + dir_sign*2.0*bp_hdepth; // extend outward from wall
+			assert(c.is_strictly_normalized());
+			cube_t test_cube(c);
+			test_cube.d[dim][!dir] += dir_sign*2.0*bp_hwidth; // add a width worth of clearance in the front so that the door can be opened
+			test_cube.z2() = ceil_zval; // extend up to ceiling to ensure space for the conduit
+			if (is_obj_placement_blocked(test_cube, room, 1) || overlaps_other_room_obj(test_cube, objs_start)) continue;
+			if (zval > ground_floor_z1 && check_if_against_window(c, room, dim, dir)) continue; // can fail for apartment and hotel utility rooms
+			add_breaker_panel(rgen, c, ceil_zval, dim, dir, room_id, tot_light_amt);
+			// connect furnaces on the same wall to the breaker box
+			float const conn_height(c.z1() + rgen.rand_uniform(0.25, 0.75)*c.dz());
+
+			for (unsigned f = furnaces_start; f < furnaces_end; ++f) {
+				if (objs[f].type == TYPE_BLOCKER) continue; // skip blockers
+				cube_t conn;
+				if (!connect_furnace_to_breaker_panel(objs[f], c, dim, dir, conn_height, conn)) continue;
+				if (is_obj_placement_blocked(conn, room, 1) || overlaps_other_room_obj(conn, objs_start, 0, &furnaces_start)) continue; // check water heaters only
+				objs.emplace_back(conn, TYPE_PIPE, room_id, !dim, 0, RO_FLAG_NOCOLL, tot_light_amt, SHAPE_CYLIN, LT_GRAY); // horizontal
+			}
+			break; // done
+		} // for n
+	}
+	// don't add signs for interior utility rooms in apartments and hotels
+	if (!room.is_apt_or_hotel_room() || room.get_is_entryway()) {add_door_sign("Utility", room, zval, room_id, tot_light_amt);}
 	return 1;
 }
 
@@ -187,18 +263,41 @@ bool building_t::add_furnace_to_room(rand_gen_t &rgen, room_t const &room, float
 		if (!gen_furnace_cand(place_area, floor_spacing, 1, rgen, furnace, dim, dir)) break; // near_wall=1
 		cube_t test_cube(furnace);
 		test_cube.d[dim][dir] += (dir ? 1.0 : -1.0)*0.5*furnace.get_sz_dim(dim); // add clearance in front
-		if (is_cube_close_to_doorway(test_cube, room, 0.0, 1) || interior->is_blocked_by_stairs_or_elevator(test_cube) || overlaps_other_room_obj(test_cube, objs_start)) continue;
+		if (zval < ground_floor_z1) {test_cube.z2() = zval + get_floor_ceil_gap();} // basement furnace; extend to the ceiling to make sure there's space for the vent
+		if (is_obj_placement_blocked(test_cube, room, 1) || overlaps_other_room_obj(test_cube, objs_start)) continue;
+		if (zval > ground_floor_z1 && check_if_against_window(furnace, room, dim, !dir)) continue; // can fail for apartment and hotel utility rooms
 		unsigned const flags((is_house ? RO_FLAG_IS_HOUSE : 0) | RO_FLAG_INTERIOR);
 		interior->room_geom->objs.emplace_back(furnace, TYPE_FURNACE, room_id, dim, dir, flags, tot_light_amt);
+		// add a blocker for clearance to avoid placing two furnaces together at a utility room corner
+		cube_t blocker(test_cube);
+		blocker.d[dim][!dir] = furnace.d[dim][dir];
+		interior->room_geom->objs.emplace_back(blocker, TYPE_BLOCKER, room_id, 0, 0, RO_FLAG_INVIS);
+		// no room for exhaust vent, so I guess it's inside the intake vent at the top
 		return 1; // success/done
 	} // for n
 	return 0; // failed
 }
 
+// *** Parking Garages ***
+
 vector3d building_t::get_parked_car_size() const {
 	vector3d car_sz(get_nom_car_size());
 	if (car_sz.x != 0.0) return car_sz; // valid car size, use this
 	return get_window_vspace()*vector3d(1.67, 0.73, 0.45); // no cars, use size relative to building floor spacing
+}
+
+void add_pg_obstacles(vect_room_object_t const &objs, unsigned objs_start, unsigned objs_end, vect_cube_t &walls, vect_cube_t &beams, vect_cube_t &obstacles) {
+	assert(objs_start <= objs_end);
+
+	for (auto i = objs.begin()+objs_start; i != objs.begin()+objs_end; ++i) {
+		if (i->type == TYPE_PG_WALL) {walls.push_back(*i);} // wall
+		else if (i->type == TYPE_PG_PILLAR) { // pillar
+			walls    .push_back(*i); // included in walls
+			obstacles.push_back(*i); // pillars also count as obstacles
+		}
+		else if (i->type == TYPE_PG_BEAM) {beams    .push_back(*i);} // ceiling beam
+		//else if (i->type == TYPE_RAMP   ) {obstacles.push_back(*i);} // ramps are obstacles for pipes, but they're already added
+	} // for i
 }
 
 void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, float zval, unsigned room_id, unsigned floor_ix,
@@ -226,7 +325,7 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 	nlights_len = num_rows; // lights over each row of parking spaces
 	nlights_wid = round_fp(0.25*wid_sz/parking_sz.y); // 4 parking spaces per light on average, including roads
 	//cout << TXT(nlights_len) << TXT(nlights_wid) << TXT(num_space_wid) << TXT(num_rows) << TXT(capacity) << endl; // TESTING
-	assert(num_space_wid   >= 4); // must fit at least 4 cars per row
+	assert(num_space_wid >= 4); // must fit at least 4 cars per row
 	
 	// add walls and pillars between strips
 	vect_room_object_t &objs(interior->room_geom->objs);
@@ -254,8 +353,17 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 	beam.z1()    += beam_delta_z; // shift the bottom up to the ceiling
 	vect_cube_t obstacles, obstacles_exp, obstacles_ps, wall_parts, temp;
 	// get obstacles for walls with and without clearance; maybe later add entrance/exit ramps, etc.
-	interior->get_stairs_and_elevators_bcubes_intersecting_cube(room_floor_cube, obstacles, 0.0); // without clearance, for beams
-	interior->get_stairs_and_elevators_bcubes_intersecting_cube(room_floor_cube, obstacles_exp, 0.9*window_vspacing); // with clearance in front, for walls and pillars
+	interior->get_stairs_and_elevators_bcubes_intersecting_cube(room_floor_cube, obstacles,         wall_thickness ); // with small clearance in front, for beams and pipes
+	interior->get_stairs_and_elevators_bcubes_intersecting_cube(room_floor_cube, obstacles_exp, 0.9*window_vspacing); // with more  clearance in front, for walls and pillars
+
+	if (has_ext_basement()) { // everything should avoid the extended basement door
+		door_t const &eb_door(interior->get_ext_basement_door());
+		cube_t avoid(eb_door.get_true_bcube());
+		avoid.expand_in_dim(eb_door.dim, get_doorway_width());
+		obstacles    .push_back(avoid);
+		obstacles_exp.push_back(avoid);
+		obstacles_ps .push_back(avoid);
+	}
 	cube_with_ix_t const &ramp(interior->pg_ramp);
 	bool const is_top_floor(floor_ix+1 == num_floors);
 	
@@ -304,12 +412,11 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 	// add walls and pillars
 	bool const no_sep_wall(num_walls == 0 || (capacity < 100 && (room_id & 1))); // use room_id rather than rgen so that this agrees between floors
 	bool const split_sep_wall(!no_sep_wall && (num_pillars >= 5 || (num_pillars >= 4 && rgen.rand_bool())));
-	bool const have_cent_stairs(can_extend_pri_hall_stairs_to_pg()); // assume pri hall stairs were extended down to PG
 	float sp_const(0.0);
-	if      (no_sep_wall)      {sp_const = 0.25;} // no separator wall, minimal clearance around stairs
-	else if (have_cent_stairs) {sp_const = 0.50;} // central stairs should open along the wall, not a tight space, need less clearance
-	else if (split_sep_wall)   {sp_const = 0.75;} // gap should provide access, need slightly less clearance
-	else                       {sp_const = 1.00;} // stairs may cut through/along full wall, need max clearance
+	if      (no_sep_wall)           {sp_const = 0.25;} // no separator wall, minimal clearance around stairs
+	else if (pri_hall_stairs_to_pg) {sp_const = 0.50;} // central stairs should open along the wall, not a tight space, need less clearance
+	else if (split_sep_wall)        {sp_const = 0.75;} // gap should provide access, need slightly less clearance
+	else                            {sp_const = 1.00;} // stairs may cut through/along full wall, need max clearance
 	float const space_clearance(sp_const*max(0.5f*window_vspacing, parking_sz.y));
 	// obstacles with clearance all sides, for parking spaces
 	interior->get_stairs_and_elevators_bcubes_intersecting_cube(room_floor_cube, obstacles_ps, max(space_clearance, 0.9f*window_vspacing), space_clearance);
@@ -337,7 +444,8 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 			
 					for (auto const &w : wall_parts) {
 						if (w.get_sz_dim(dim) < 2.0*window_vspacing) continue; // too short, skip
-						objs.emplace_back(w, TYPE_PG_WALL, room_id, !dim, 0, 0, tot_light_amt, SHAPE_CUBE, wall_color, 0);
+						objs.emplace_back(w, TYPE_PG_WALL, room_id, !dim, 0, 0, tot_light_amt, SHAPE_CUBE, wall_color);
+						interior->room_geom->pgbr_walls[!dim].push_back(w); // save for occlusion culling
 					}
 				} // for side
 			}
@@ -354,7 +462,7 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 			pillars.push_back(pillar);
 		} // for p
 	} // for n
-	for (auto const &p : pillars) {objs.emplace_back(p, TYPE_PG_WALL, room_id, !dim, 0, 0, tot_light_amt, SHAPE_CUBE, wall_color, 1);}
+	for (auto const &p : pillars) {objs.emplace_back(p, TYPE_PG_PILLAR, room_id, !dim, 0, 0, tot_light_amt, SHAPE_CUBE, wall_color);}
 
 	// add beams in !dim, at and between pillars
 	unsigned const beam_flags(RO_FLAG_NOCOLL | RO_FLAG_HANGING);
@@ -365,9 +473,9 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 		subtract_cubes_from_cube_split_in_dim(beam, obstacles, wall_parts, temp, !dim);
 		
 		for (auto const &w : wall_parts) {
-			if (min(w.dx(), w.dy()) > beam_hwidth) {objs.emplace_back(w, TYPE_PG_WALL, room_id, !dim, 0, beam_flags, tot_light_amt, SHAPE_CUBE, wall_color, 2);}
+			if (min(w.dx(), w.dy()) > beam_hwidth) {objs.emplace_back(w, TYPE_PG_BEAM, room_id, !dim, 0, beam_flags, tot_light_amt, SHAPE_CUBE, wall_color);}
 		}
-	}
+	} // for p
 	// add beams in dim for each row of lights
 	for (unsigned n = 0; n < num_rows; ++n) {
 		float const pos(room.d[!dim][0] + (n + 0.5)*beam_spacing);
@@ -377,13 +485,13 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 		subtract_cubes_from_cube_split_in_dim(beam, obstacles, wall_parts, temp, dim);
 
 		for (auto const &w : wall_parts) {
-			if (min(w.dx(), w.dy()) > beam_hwidth) {objs.emplace_back(w, TYPE_PG_WALL, room_id, !dim, 0, beam_flags, tot_light_amt, SHAPE_CUBE, wall_color, 2);}
+			if (min(w.dx(), w.dy()) > beam_hwidth) {objs.emplace_back(w, TYPE_PG_BEAM, room_id, dim, 0, beam_flags, tot_light_amt, SHAPE_CUBE, wall_color);}
 		}
 	}
 
 	// add parking spaces on both sides of each row (one side if half row)
 	cube_t row(wall); // same length as the wall; includes the width of the pillars
-	row.z2() = row.z1() + 0.001*window_vspacing; // slightly above the floor
+	row.z2() = row.z1() + get_rug_thickness(); // slightly above the floor
 	float const space_width(row.get_sz_dim(dim)/num_space_wid), strips_start(virt_room_for_wall.d[!dim][0]), wall_half_gap(2.0*wall_hc), space_shrink(row_width - space_length);
 	bool const add_cars(enable_parked_cars() && !is_rotated()); // skip cars for rotated buildings
 	unsigned const max_handicap_spots(capacity/20 + 1);
@@ -466,20 +574,12 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 			} // for s
 		} // for d
 	} // for n
-	if (is_top_floor) {
+	if (is_top_floor) { // place pipes on the top level parking garage ceiling (except for sprinkler pipes, which go on every floor)
 		float const pipe_light_amt = 1.0; // make pipes and electrical brighter and easier to see
 		// avoid intersecting lights, pillars, walls, stairs, elevators, and ramps;
 		// note that lights haven't been added yet though, but they're placed on beams, so we can avoid beams instead
 		vect_cube_t walls, beams;
-
-		for (auto i = objs.begin()+objs_start; i != objs.end(); ++i) {
-			if (i->type == TYPE_PG_WALL) {
-				if (i->item_flags == 2) {beams    .push_back(*i);} // beams
-				else                    {walls    .push_back(*i);} // walls and pillars
-				if (i->item_flags == 1) {obstacles.push_back(*i);} // pillars also count as obstacles
-			}
-			else if (i->type == TYPE_RAMP) {obstacles.push_back(*i);} // ramps are obstacles for pipes
-		}
+		add_pg_obstacles(objs, objs_start, objs.size(), walls, beams, obstacles);
 		add_basement_electrical(obstacles, walls, beams, room_id, pipe_light_amt, rgen);
 		// get pipe ends (risers) coming in through the ceiling
 		vect_riser_pos_t sewer, cold_water, hot_water, gas_pipes;
@@ -487,18 +587,26 @@ void building_t::add_parking_garage_objs(rand_gen_t rgen, room_t const &room, fl
 		vect_cube_t pipe_cubes;
 		// hang sewer pipes under the ceiling beams; hang water pipes from the ceiling, above sewer pipes and through the beams
 		float const ceil_zval(beam.z1()), water_ceil_zval(beam.z2());
-		add_basement_pipes(obstacles, walls, beams, sewer,      pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, ceil_zval,      rgen, PIPE_TYPE_SEWER); // sewer
+		add_basement_pipes(obstacles, walls, beams, sewer,      pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, ceil_zval,      rgen, PIPE_TYPE_SEWER, 0); // sewer
 		add_to_and_clear(pipe_cubes, obstacles); // add sewer pipes to obstacles
-		add_basement_pipes(obstacles, walls, beams, cold_water, pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, water_ceil_zval, rgen, PIPE_TYPE_CW  ); // cold water
+		add_basement_pipes(obstacles, walls, beams, cold_water, pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, water_ceil_zval, rgen, PIPE_TYPE_CW,   0); // cold water
 		add_to_and_clear(pipe_cubes, obstacles); // add cold water pipes to obstacles
-		add_basement_pipes(obstacles, walls, beams, hot_water,  pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, water_ceil_zval, rgen, PIPE_TYPE_HW  ); // hot water
+		add_basement_pipes(obstacles, walls, beams, hot_water,  pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, water_ceil_zval, rgen, PIPE_TYPE_HW,   1); // hot water
 		add_to_and_clear(pipe_cubes, obstacles); // add hot water pipes to obstacles
 		get_pipe_basement_gas_connections(gas_pipes);
-		add_basement_pipes(obstacles, walls, beams, gas_pipes,  pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, water_ceil_zval, rgen, PIPE_TYPE_GAS, 1); // gas
+		add_basement_pipes(obstacles, walls, beams, gas_pipes,  pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, water_ceil_zval, rgen, PIPE_TYPE_GAS,  1); // gas
 		add_to_and_clear(pipe_cubes, obstacles); // add gas pipes to obstacles
-		add_sprinkler_pipes(obstacles, walls, beams, pipe_cubes, room_id, num_floors, pipe_light_amt, rgen);
+
+		// if there are multiple parking garage floors, lights have already been added on the floor(s) below; add them as occluders for sprinkler pipes;
+		// lights on the top floor will be added later and will check for pipe intersections
+		for (auto i = objs.begin()+interior->room_geom->wall_ps_start; i < objs.begin()+objs_start; ++i) {
+			if (i->type == TYPE_LIGHT && room.contains_cube(*i)) {obstacles.push_back(*i);}
+		}
+		add_sprinkler_pipes(obstacles, walls, beams, pipe_cubes, room_id, num_floors, objs_start, pipe_light_amt, rgen);
 	}
 }
+
+// *** Pipes ***
 
 // find the closest wall (including room wall) to this location, avoiding obstacles, and shift outward by radius; routes in X or Y only, for now
 point get_closest_wall_pos(point const &pos, float radius, cube_t const &room, vect_cube_t const &walls, vect_cube_t const &obstacles, bool vertical) {
@@ -508,7 +616,7 @@ point get_closest_wall_pos(point const &pos, float radius, cube_t const &room, v
 	point best(pos);
 	float dmin(room.dx() + room.dy()); // use an initial distance larger than what we can return
 
-	for (unsigned dim = 0; dim < 2; ++dim) { // check room exterior walls first
+	for (unsigned dim = 0; dim < 2; ++dim) { // check room/part exterior walls first
 		for (unsigned dir = 0; dir < 2; ++dir) {
 			float const val(room.d[dim][dir] + (dir ? -radius : radius)), dist(fabs(val - pos[dim])); // shift val inward
 			if (dist >= dmin) continue;
@@ -578,29 +686,61 @@ void add_insul_exclude(pipe_t const &pipe, cube_t const &fitting, vect_cube_t &i
 	ie.expand_in_dim(pipe.dim, 1.0*pipe.radius); // expand a bit more in pipe dim
 	insul_exclude.push_back(ie);
 }
+bool has_int_obstacle_or_parallel_wall(cube_t const &c, vect_cube_t const &obstacles, vect_cube_t const &walls) {
+	if (has_bcube_int(c, obstacles)) return 1;
+	bool const pipe_dim(c.dx() < c.dy());
+
+	for (cube_t const &wall : walls) {
+		bool const wall_dim(wall.dy() < wall.dx());
+		if (wall_dim != pipe_dim && wall.intersects(c)) return 1; // check if wall and pipe are parallel
+	}
+	return 0;
+}
+void add_pass_through_fittings(room_object_t const &pipe, vect_cube_t const &walls, float fitting_len,
+	float fitting_expand, unsigned dim, colorRGBA const &color, vect_room_object_t &objs)
+{
+	float const min_ext(2.0*fitting_len);
+
+	for (cube_t const &wall : walls) {
+		if (!wall.intersects(pipe)) continue;
+		if (wall.d[dim][0] < pipe.d[dim][0] - min_ext || wall.d[dim][1] > pipe.d[dim][1] + min_ext) continue; // no space for fitting
+		room_object_t pf(pipe);
+		pf.flags = (RO_FLAG_NOCOLL | RO_FLAG_HANGING | RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI); // draw both ends as flat
+		pf.color = color;
+		pf.d[dim][0] = wall.d[dim][0] - fitting_len;
+		pf.d[dim][1] = wall.d[dim][1] + fitting_len;
+		expand_cube_except_in_dim(pf, 0.9*fitting_expand, dim); // expand slightly, less than regular fittings to prevent Z-fighting when overlapped near ends
+		objs.push_back(pf);
+	} // for wall
+}
+
+float const FITTING_LEN(1.25), FITTING_RADIUS(1.1); // relative to radius
 
 bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t const &walls, vect_cube_t const &beams, vect_riser_pos_t const &risers, vect_cube_t &pipe_cubes,
 	unsigned room_id, unsigned num_floors, unsigned objs_start, float tot_light_amt, float ceil_zval, rand_gen_t &rgen, unsigned pipe_type, bool allow_place_fail)
 {
+	//highres_timer_t timer("add_basement_pipes");
 	assert(pipe_type < NUM_PIPE_TYPES);
 	if (risers.empty()) return 0; // can happen for hot water pipes when there are no hot water fixtures
-	float const FITTING_LEN(1.2), FITTING_RADIUS(1.1); // relative to radius
+	float const max_pipe_radius_mult[NUM_PIPE_TYPES] = {0.75, 0.25, 0.2, 0.15}; // sewer, cold water, hot water, gas; in muptiples of wall thickness
 	bool const is_hot_water(pipe_type == PIPE_TYPE_HW), is_closed_loop(is_hot_water), add_insul(is_hot_water);
 	vect_room_object_t &objs(interior->room_geom->objs);
 	assert(objs_start <= objs.size());
 	cube_t const &basement(get_basement());
-	float const r_main(get_merged_risers_radius(risers, (is_closed_loop ? 0 : 2))); // exclude incoming water from hot water heaters for hot water pipes
+	float r_main(get_merged_risers_radius(risers, (is_closed_loop ? 0 : 2))); // exclude incoming water from hot water heaters for hot water pipes
 	if (r_main == 0.0) return 0; // hot water heater but no hot water pipes?
 	float const insul_thickness(0.4), min_insum_len(4.0); // both relative to pipe radius
 	float const window_vspacing(get_window_vspace()), fc_thickness(get_fc_thickness()), wall_thickness(get_wall_thickness());
 	float const pipe_zval(ceil_zval   - FITTING_RADIUS*r_main); // includes clearance for fittings vs. beams (and lights - mostly)
 	float const pipe_min_z1(pipe_zval - FITTING_RADIUS*r_main);
 	float const align_dist(2.0*wall_thickness); // align pipes within this range (in particular sinks and stall toilets)
-	float const r_main_spacing((add_insul ? 1.0+insul_thickness : 1.0)*r_main); // include insulation thickness for hot water pipes
+	float const radius_factor(add_insul ? 1.0+insul_thickness : 1.0), max_pipe_radius(max_pipe_radius_mult[pipe_type]*wall_thickness);
+	float const r_main_spacing(radius_factor*r_main); // include insulation thickness for hot water pipes
+	min_eq(r_main, max_pipe_radius); // limit pipe radius; even with these limits, we can still have hot water and cold water clipping through each other with enough flow
 	assert(pipe_zval > bcube.z1());
 	vector<pipe_t> pipes, fittings;
 	cube_t pipe_end_bcube;
-	unsigned num_valid(0), num_connected(0);
+	unsigned num_valid(0), num_connected(0), num_conn_segs(0);
 	// build random shifts table; make consistent per pipe to preserve X/Y alignments
 	unsigned const NUM_SHIFTS = 21; // {0,0} + 20 random shifts
 	vector3d rshifts[NUM_SHIFTS] = {};
@@ -612,6 +752,7 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 		for (riser_pos_t const &p : risers) {
 			if (p.flow_dir == 0) {add_exit_pipe = 0; break;} // hot water flowing out of a water heater
 		}
+		// if we got here and add_exit_pipe=1, just create the exit pipe and assume the hot water heater is somewhere else
 	}
 
 	// seed the pipe graph with valid vertical segments and build a graph of X/Y values
@@ -680,13 +821,15 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 		mp[d].z     = pipe_zval;
 	}
 	// shift pipe until it clears all obstacles
-	float const step_dist(2.0*r_main), step_area(bcube.get_sz_dim(!dim)); // step by pipe radius
-	unsigned const max_steps(step_area/step_dist);
+	float step_dist(2.0*r_main);
+	float const step_area(bcube.get_sz_dim(!dim)); // step by pipe radius
+	unsigned const max_steps(max(1U, min(unsigned(step_area/step_dist), 100U))); // limit to 100 steps
+	step_dist = step_area/max_steps;
 	bool success(0);
 
 	for (unsigned n = 0; n < max_steps; ++n) {
 		cube_t const c(pipe_t(mp[0], mp[1], r_main_spacing, dim, PIPE_MAIN, 3).get_bcube());
-		if (!has_bcube_int(c, obstacles)) {
+		if (!has_int_obstacle_or_parallel_wall(c, obstacles, walls)) {
 			success = 1;
 
 			// check for overlap with beam running parallel to the main pipe, and reject it; mostly there to avoid blocking lights that may be on the beam
@@ -716,11 +859,16 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 			min_eq(riser_min, r.pos[dim]);
 			max_eq(riser_max, r.pos[dim]);
 		}
+		if (risers.size() >= 10) { // optimization for many risers case to avoid long quadratic runtime: clip off an additional 5% from each end
+			float const extra_clip(0.05*(riser_max - riser_min));
+			riser_min += extra_clip;
+			riser_max -= extra_clip;
+		}
 		for (unsigned dir = 0; dir < 2; ++dir) {
 			risers_sub.clear();
 			// try to remove risers at each end recursively until successful
 			for (riser_pos_t const &r : risers) {
-				if (r.pos[dim] != (dir ? riser_max : riser_min)) {risers_sub.push_back(r);}
+				if (dir ? (r.pos[dim] < riser_max) : (r.pos[dim] > riser_min)) {risers_sub.push_back(r);}
 			}
 			if (risers_sub.empty()) continue;
 			assert(risers_sub.size() < risers.size());
@@ -728,15 +876,31 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 		} // for dir
 		return 0;
 	}
-	else {
-		UNROLL_2X(mp[i_][!dim] = centerline;) // else use the centerline, even though it's invalid; rare, and I don't have a non-house example where it looks wrong
+	else { // somewhat rare failure case; can lead to intersections between hot water and cold water pipes
+		float cur_pos(centerline);
+		UNROLL_2X(mp[i_][!dim] = centerline;); // else use the centerline, even though it's invalid
+		// must still avoid stairs and elevators
+		cube_t c(pipe_t(mp[0], mp[1], r_main_spacing, dim, PIPE_MAIN, 3).get_bcube());
+		vect_cube_t avoid;
+		vector_add_to(interior->stairwells, avoid);
+		vector_add_to(interior->elevators,  avoid);
+
+		for (cube_t &a : avoid) {
+			a.expand_by_xy(0.25*wall_thickness); // account for stairs walls
+			if (!c.intersects(a)) continue;
+			bool const move_dir(a.get_center_dim(!dim) < c.get_center_dim(!dim));
+			float const new_pos(a.d[!dim][move_dir] + (move_dir ? 1.0 : -1.0)*r_main_spacing), move_amt(new_pos - cur_pos);
+			c.translate_dim(!dim, move_amt);
+			UNROLL_2X(mp[i_][!dim] += move_amt;);
+			cur_pos = new_pos;
+		} // for a
 	}
 	mp[0][dim] = bcube.d[dim][1]; mp[1][dim] = bcube.d[dim][0]; // make dim range denormalized; will recalculate below with correct range
 	bool const d(!dim);
 	float const conn_pipe_merge_exp = 3.0; // cubic
 	unsigned const conn_pipes_start(pipes.size());
 
-	// connect drains to main pipe in !dim
+	// connect drains/feeders to main pipe in !dim
 	for (auto const &v : xy_map) { // for each unique position along the main pipe
 		float radius(0.0), range_min(centerline), range_max(centerline), unconn_radius(0.0);
 		point const &ref_p1(pipes[v.second.front()].p1);
@@ -753,16 +917,17 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 				point p1(ref_p1), p2(p1);
 				if      (lo < range_min) {p1[d] = lo; p2[d] = range_min;} // on the lo side
 				else if (hi > range_max) {p1[d] = range_max; p2[d] = hi;} // on the hi side
-				bool skip(has_bcube_int(pipe_t(p1, p2, radius, d, PIPE_CONN, 3).get_bcube(), obstacles));
+				float const r_test(radius_factor*pipe.radius);
+				bool skip(has_int_obstacle_or_parallel_wall(pipe_t(p1, p2, r_test, d, PIPE_CONN, 3).get_bcube(), obstacles, walls));
 
 				if (skip && (p2[d] - p1[d]) > 8.0*pipe.radius) { // blocked, can't connect, long segment: try extending halfway
 					if      (lo < range_min) {p1[d] = lo = 0.5*(lo + range_min); pipe.p1[d] = pipe.p2[d] = lo + pipe.radius;} // on the lo side
 					else if (hi > range_max) {p2[d] = hi = 0.5*(hi + range_max); pipe.p1[d] = pipe.p2[d] = hi - pipe.radius;} // on the hi side
-					skip = has_bcube_int(pipe_t(p1, p2, radius, d, PIPE_CONN, 3).get_bcube(), obstacles);
+					skip = has_int_obstacle_or_parallel_wall(pipe_t(p1, p2, r_test, d, PIPE_CONN, 3).get_bcube(), obstacles, walls);
 
 					if (!skip) { // okay so far; now check that the new shortened pipe has a riser pos that's clear of walls and beams
 						point const new_riser_pos((lo < range_min) ? p1 : p2); // the end that was clipped
-						cube_t test_cube; test_cube.set_from_sphere(new_riser_pos, radius);
+						cube_t test_cube; test_cube.set_from_sphere(new_riser_pos, pipe.radius);
 						skip = (has_bcube_int(test_cube, walls) || has_bcube_int(test_cube, beams));
 					}
 				}
@@ -779,6 +944,7 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 			++num_keep;
 		} // for ix
 		if (num_keep == 0) continue; // no valid connections for this row
+		min_eq(radius, 0.8f*max_pipe_radius); // a bit smaller than r_main
 
 		// we can skip adding a connector if short and under the main pipe
 		if (range_max - range_min > r_main) {
@@ -802,107 +968,122 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 		min_eq(mp[0][dim], v.first-radius);
 		max_eq(mp[1][dim], v.first+radius);
 		num_connected += num_keep;
+		++num_conn_segs;
 	} // for v
 	if (mp[0][dim] >= mp[1][dim]) return 0; // no pipes connected to main? I guess there's nothing to do here
 	unsigned main_pipe_end_flags(0); // start with both ends unconnected
-	bool has_exit(0);
 
-	if (add_exit_pipe && (num_floors > 1 || rgen.rand_bool())) { // exit into the wall of the building
-		// Note: if roads are added for secondary buildings, we should have the exit on the side of the building closest to the road
-		bool const first_dir((basement.d[dim][1] - mp[1][dim]) < (mp[0][dim] - basement.d[dim][0])); // closer basement exterior wall
+	if (add_exit_pipe) {
+		bool tried_horizontal(0);
 
-		for (unsigned d = 0; d < 2; ++d) { // dir
-			bool const dir(bool(d) ^ first_dir);
-			point ext[2] = {mp[dir], mp[dir]};
-			ext[dir][dim] = basement.d[dim][dir]; // shift this end to the basement wall
-			if (has_bcube_int(pipe_t(ext[0], ext[1], r_main_spacing, dim, PIPE_MAIN, 0).get_bcube(), obstacles)) continue; // can't extend to ext wall in this dim
-			mp[dir]  = ext[dir];
-			has_exit = 1;
-			main_pipe_end_flags = (dir ? 2 : 1); // connect the end going to the exit
-			break; // success
-		} // for d
-		if (!has_exit) { // no straight segment? how about a right angle?
-			bool first_side(0);
-			if (centerline == pipes_bcube_center) {first_side = rgen.rand_bool();} // centered, choose a random side
-			else {first_side = ((basement.d[!dim][1] - mp[0][!dim]) < (mp[0][!dim] - basement.d[!dim][0]));} // off-center, choose closer basement exterior wall
+		for (unsigned attempt = 0; attempt < 2; ++attempt) { // make up to 2 attempts with a horizontal or vertical connection
+			if (is_closed_loop || num_floors > 1 || attempt == 1 || num_conn_segs == 1 || rgen.rand_bool()) { // exit into the wall of the building
+				if (tried_horizontal) break; // we got here the previous iteration; give up, exit can't be found
+				tried_horizontal = 1;
+				// Note: if roads are added for secondary buildings, we should have the exit on the side of the building closest to the road
+				bool const first_dir((basement.d[dim][1] - mp[1][dim]) < (mp[0][dim] - basement.d[dim][0])); // closer basement exterior wall
+				bool added_exit(0);
 
-			for (unsigned d = 0; d < 2 && !has_exit; ++d) { // dir
-				for (unsigned e = 0; e < 2; ++e) { // side
-					bool const dir(bool(d) ^ first_dir), side(bool(e) ^ first_side);
+				for (unsigned d = 0; d < 2; ++d) { // dir
+					bool const dir(bool(d) ^ first_dir);
 					point ext[2] = {mp[dir], mp[dir]};
-					ext[side][!dim] = basement.d[!dim][side]; // shift this end to the basement wall
-					pipe_t const exit_pipe(ext[0], ext[1], r_main, !dim, PIPE_MEC, (side ? 1 : 2)); // add a bend in the side connecting to the main pipe
-					cube_t const pipe_bcube(exit_pipe.get_bcube());
-					if (has_bcube_int(pipe_bcube, obstacles)) continue; // can't extend to the ext wall in this dim
-					bool bad_place(0);
+					ext[dir][dim] = basement.d[dim][dir]; // shift this end to the basement wall
+					if (has_int_obstacle_or_parallel_wall(pipe_t(ext[0], ext[1], r_main_spacing, dim, PIPE_MAIN, 0).get_bcube(), obstacles, walls)) continue;
+					mp[dir] = ext[dir];
+					main_pipe_end_flags = (dir ? 2 : 1); // connect the end going to the exit
+					added_exit = 1;
+					break;
+				} // for d
+				if (added_exit) break;
+				// no straight segment? how about a right angle?
+				bool first_side(0);
+				if (centerline == pipes_bcube_center) {first_side = rgen.rand_bool();} // centered, choose a random side
+				else {first_side = ((basement.d[!dim][1] - mp[0][!dim]) < (mp[0][!dim] - basement.d[!dim][0]));} // off-center, choose closer basement exterior wall
 
-					// check if the pipe is too close to an existing conn pipe; allow it to contain the other pipe in dim
-					for (auto p = pipes.begin()+conn_pipes_start; p != pipes.end(); ++p) {
-						cube_t const other_bcube(p->get_bcube());
-						if (!pipe_bcube.intersects(other_bcube)) continue;
-						if (pipe_bcube.d[dim][0] > other_bcube.d[dim][0] || pipe_bcube.d[dim][1] < other_bcube.d[dim][1]) {bad_place = 1; break;}
+				for (unsigned d = 0; d < 2 && !added_exit; ++d) { // dir
+					for (unsigned e = 0; e < 2; ++e) { // side
+						bool const dir(bool(d) ^ first_dir), side(bool(e) ^ first_side);
+						point ext[2] = {mp[dir], mp[dir]};
+						ext[side][!dim] = basement.d[!dim][side]; // shift this end to the basement wall
+						pipe_t const exit_pipe(ext[0], ext[1], r_main, !dim, PIPE_MEC, (side ? 1 : 2)); // add a bend in the side connecting to the main pipe
+						cube_t const pipe_bcube(exit_pipe.get_bcube());
+						if (has_int_obstacle_or_parallel_wall(pipe_bcube, obstacles, walls)) continue; // can't extend to the ext wall in this dim
+						bool bad_place(0);
+
+						// check if the pipe is too close to an existing conn pipe; allow it to contain the other pipe in dim
+						for (auto p = pipes.begin()+conn_pipes_start; p != pipes.end(); ++p) {
+							cube_t const other_bcube(p->get_bcube());
+							if (!pipe_bcube.intersects(other_bcube)) continue;
+							if (pipe_bcube.d[dim][0] > other_bcube.d[dim][0] || pipe_bcube.d[dim][1] < other_bcube.d[dim][1]) {bad_place = 1; break;}
+						}
+						if (bad_place) continue; // seems to usually fail
+						pipes.push_back(exit_pipe);
+						main_pipe_end_flags = (dir ? 2 : 1); // connect the end going to the exit connector pipe
+						added_exit = 1;
+						break;
+					} // for e
+				} // for d
+				if (added_exit) break;
+			}
+			// create exit segment and vertical pipe into the floor
+			float exit_dmin(0.0);
+
+			for (unsigned d = 0; d < 2; ++d) { // dim
+				point const cand_exit_pos(get_closest_wall_pos(mp[d], r_main_spacing, basement, walls, obstacles, 1)); // vertical=1
+				float dist(p2p_dist(mp[d], cand_exit_pos));
+				if (dist == 0.0) {dist = FLT_MAX;} // dist will be 0 if we fail to find a wall, so don't prefer it in that case
+				if (exit_dmin == 0.0 || dist < exit_dmin) {exit_pos = cand_exit_pos; exit_dir = d; exit_dmin = dist;}
+			}
+			point &exit_conn(mp[exit_dir]);
+			unsigned exit_pipe_end_flags(2); // bend at the top only
+			float const exit_floor_zval(basement.z1() + fc_thickness); // on the bottom level floor
+
+			if (exit_pos[!dim] == exit_conn[!dim]) { // exit point is along the main pipe
+				if (exit_conn[dim] == exit_pos[dim]) { // exit is exactly at the pipe end
+					// maybe no valid wall was found above, and this location is also invalid; try with a vertical connection if this was the first attempt;
+					// this is the only situation where we can get to attempt=1
+					if (attempt == 0 && has_bcube_int(pipe_t(point(exit_pos.x, exit_pos.y, exit_floor_zval), exit_pos, r_main, 2, PIPE_EXIT, 0).get_bcube(), obstacles)) continue;
+						
+					if (has_parking_garage) { // check that no parking spaces are blocked by this pipe
+						auto start(objs.begin() + objs_start);
+
+						for (auto i = start; i != objs.end(); ++i) {
+							if (i->type != TYPE_PARK_SPACE || !i->contains_pt_xy(exit_pos)) continue;
+							i->remove(); // remove this parking space
+							// now remove any car collider and curb associated with this parking space (placed before it, optional collider then optional curb)
+							auto cur(i);
+							if (cur > start && (cur-1)->type == TYPE_CURB    ) {(cur-1)->remove(); --cur;}
+							if (cur > start && (cur-1)->type == TYPE_COLLIDER) {(cur-1)->remove();}
+							//break; // maybe can't break here because there may be a parking space to remove on another level?
+						} // for i
 					}
-					if (bad_place) continue; // seems to usually fail
-					pipes.push_back(exit_pipe);
-					has_exit = 1;
-					main_pipe_end_flags = (dir ? 2 : 1); // connect the end going to the exit connector pipe
-					break; // success
-				} // for e
-			} // for d
-		}
-	}
-	if (add_exit_pipe && !has_exit) { // create exit segment and vertical pipe into the floor
-		float exit_dmin(0.0);
-
-		for (unsigned d = 0; d < 2; ++d) { // dim
-			point const cand_exit_pos(get_closest_wall_pos(mp[d], r_main_spacing, basement, walls, obstacles, 1)); // vertical=1
-			float dist(p2p_dist(mp[d], cand_exit_pos));
-			if (dist == 0.0) {dist = FLT_MAX;} // dist will be 0 if we fail to find a wall, so don't prefer it in that case
-			if (exit_dmin == 0.0 || dist < exit_dmin) {exit_pos = cand_exit_pos; exit_dir = d; exit_dmin = dist;}
-		}
-		point &exit_conn(mp[exit_dir]);
-		unsigned exit_pipe_end_flags(2); // bend at the top only
-
-		if (exit_pos[!dim] == exit_conn[!dim]) { // exit point is along the main pipe
-			if (exit_conn[dim] == exit_pos[dim]) { // exit is exactly at the pipe end (no wall found above?)
-				if (has_parking_garage) { // check that no parking spaces are blocked by this pipe
-					auto start(objs.begin() + objs_start);
-
-					for (auto i = start; i != objs.end(); ++i) {
-						if (i->type != TYPE_PARK_SPACE || !i->contains_pt_xy(exit_pos)) continue;
-						i->remove(); // remove this parking space
-						// now remove any car collider and curb associated with this parking space (placed before it, optional collider then optional curb)
-						auto cur(i);
-						if (cur > start && (cur-1)->type == TYPE_CURB    ) {(cur-1)->remove(); --cur;}
-						if (cur > start && (cur-1)->type == TYPE_COLLIDER) {(cur-1)->remove();}
-						//break; // maybe can't break here because there may be a parking space to remove on another level?
-					} // for i
+				}
+				else if ((exit_conn[dim] < exit_pos[dim]) == exit_dir) { // extend main pipe to exit point
+					exit_conn[dim] = exit_pos[dim];
+					main_pipe_end_flags = (exit_dir ? 2 : 1); // connect the end going to the exit
+				}
+				else { // exit is in the middle of the pipe; add fitting to the main pipe
+					point p1(exit_pos), p2(p1);
+					float const fitting_len(FITTING_LEN*r_main);
+					p1[dim] -= fitting_len; p2[dim] += fitting_len;
+					fittings.emplace_back(p1, p2, FITTING_RADIUS*r_main, !d, PIPE_FITTING, 3);
+					exit_pipe_end_flags = 0; // no bend needed
 				}
 			}
-			else if ((exit_conn[dim] < exit_pos[dim]) == exit_dir) { // extend main pipe to exit point
-				exit_conn[dim] = exit_pos[dim];
-				main_pipe_end_flags = (exit_dir ? 2 : 1); // connect the end going to the exit
+			else { // create a right angle bend
+				// extend by 2*radius to avoid overlapping a connector pipe or it's fittings, but keep it inside the building
+				if (exit_dir) {exit_conn[dim] = exit_pos[dim] = min(exit_conn[dim]+2.0f*r_main, bcube.d[dim][1]-r_main);}
+				else          {exit_conn[dim] = exit_pos[dim] = max(exit_conn[dim]-2.0f*r_main, bcube.d[dim][0]+r_main);}
+				pipes.emplace_back(exit_conn, exit_pos, r_main, !dim, PIPE_MEC, 3); // main exit connector, bends at both ends
+				exit_pipe_end_flags = 0; // the above pipe will provide the bend, so it's not needed at the top of the exit pipe
+				main_pipe_end_flags = (exit_dir ? 2 : 1); // connect the end going to the exit connector pipe
 			}
-			else { // exit is in the middle of the pipe; add fitting to the main pipe
-				point p1(exit_pos), p2(p1);
-				float const fitting_len(FITTING_LEN*r_main);
-				p1[dim] -= fitting_len; p2[dim] += fitting_len;
-				fittings.emplace_back(p1, p2, FITTING_RADIUS*r_main, !d, PIPE_FITTING, 3);
-				exit_pipe_end_flags = 0; // no bend needed
-			}
-		}
-		else { // create a right angle bend
-			// extend by 2*radius to avoid overlapping a connector pipe or it's fittings, but keep it inside the building
-			if (exit_dir) {exit_conn[dim] = exit_pos[dim] = min(exit_conn[dim]+2.0f*r_main, bcube.d[dim][1]-r_main);}
-			else          {exit_conn[dim] = exit_pos[dim] = max(exit_conn[dim]-2.0f*r_main, bcube.d[dim][0]+r_main);}
-			pipes.emplace_back(exit_conn, exit_pos, r_main, !dim, PIPE_MEC, 3); // main exit connector, bends at both ends
-			exit_pipe_end_flags = 0; // the above pipe will provide the bend, so it's not needed at the top of the exit pipe
-			main_pipe_end_flags = (exit_dir ? 2 : 1); // connect the end going to the exit connector pipe
-		}
-		point exit_floor_pos(exit_pos);
-		exit_floor_pos.z = basement.z1() + fc_thickness; // on the bottom level floor
-		pipes.emplace_back(exit_floor_pos, exit_pos, r_main, 2, PIPE_EXIT, exit_pipe_end_flags);
-	}
+			point exit_floor_pos(exit_pos);
+			exit_floor_pos.z = exit_floor_zval;
+			pipes.emplace_back(exit_floor_pos, exit_pos, r_main, 2, PIPE_EXIT, exit_pipe_end_flags);
+			break; // success
+		} // for attempt
+	} // end add_exit_pipe
 	// add main pipe
 	assert(mp[0] != mp[1]);
 	pipe_t main_pipe(mp[0], mp[1], r_main, dim, PIPE_MAIN, main_pipe_end_flags);
@@ -919,11 +1100,21 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 	colorRGBA const &pipes_color(pcolors[pipe_type]), &fittings_color(fcolors[pipe_type]);
 	vect_cube_t insul_exclude;
 	pipe_cubes.reserve(pipe_cubes.size() + pipes.size());
+	// if an extended basement room overlaps the non-basement part of this building, we may need to draw pipes crossing through this room; this is relatively rare
+	bool draw_pipes_outside_basement(0);
 
+	if (has_ext_basement()) {
+		assert(interior->ext_basement_hallway_room_id >= 0);
+
+		for (unsigned r = interior->ext_basement_hallway_room_id+1; r < interior->rooms.size(); ++r) { // skip hallway
+			room_t const &room(interior->rooms[r]);
+			if (room.z1() == basement.z1() && room.intersects_xy(bcube)) {draw_pipes_outside_basement = 1; break;}
+		}
+	}
 	for (pipe_t &p : pipes) {
 		if (!p.connected) continue; // unconnected drain, skip
 		cube_t const pbc(p.get_bcube());
-		if (!basement.intersects_xy(pbc)) {p.outside_pg = 1; continue;} // outside the basement, don't need to draw
+		if (!draw_pipes_outside_basement && !basement.intersects_xy(pbc)) {p.outside_pg = 1; continue;} // outside the basement, don't need to draw
 		pipe_cubes.push_back(pbc);
 		pipe_cubes.back().expand_in_dim(p.dim, 0.5*p.radius); // add a bit of extra space for the end cap
 		bool const pdim(p.dim & 1), pdir(p.dim >> 1); // encoded as: X:dim=0,dir=0 Y:dim=1,dir=0, Z:dim=x,dir=1
@@ -937,7 +1128,7 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 		// add pipe fittings around ends and joins; only fittings have flat and round ends because raw pipe ends should never be exposed;
 		// note that we may not need fittings at T-junctions for hot water pipes, but then we would need to cap the ends
 		if (p.type == PIPE_RISER) continue; // not for vertical drain pipes, since they're so short and mostly hidden above the connector pipes
-		float const fitting_len(FITTING_LEN*p.radius), fitting_expand((FITTING_RADIUS - 1.0)*p.radius);
+		float const fitting_len(FITTING_LEN*r_main), fitting_expand((FITTING_RADIUS - 1.0)*p.radius); // fitting len based on main pipe radius
 
 		for (unsigned d = 0; d < 2; ++d) {
 			if ((p.type == PIPE_CONN || p.type == PIPE_MAIN) && !(p.end_flags & (1<<d))) continue; // already have fittings added from connecting pipes
@@ -966,10 +1157,23 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 				}
 			}
 		} // for d
+		if (p.type == PIPE_CONN && pipe.d[p.dim][0] < centerline-fitting_len && pipe.d[p.dim][1] > centerline+fitting_len) { // crosses through main pipe, add fitting
+			room_object_t pf(pipe);
+			pf.flags |= RO_FLAG_NOCOLL;
+			pf.color  = fittings_color;
+			set_wall_width(pf, centerline, fitting_len, p.dim);
+			expand_cube_except_in_dim(pf, fitting_expand, p.dim); // expand slightly
+			objs.push_back(pf);
+		}
+		if (p.dim < 2 && !add_insul) { // horizontal pipes only; no fittings on insulated pipes as insulation is flush with the walls
+			// basement walls, parking garage walls, parking garage pillars, and beams
+			add_pass_through_fittings(pipe, walls, fitting_len, fitting_expand, p.dim, LT_GRAY, objs); // different from fittings color
+			add_pass_through_fittings(pipe, beams, fitting_len, fitting_expand, p.dim, LT_GRAY, objs);
+		}
 	} // for p
 	for (pipe_t const &p : fittings) {
 		cube_t const pbc(p.get_bcube());
-		if (!basement.intersects_xy(pbc)) continue; // outside the basement, don't need to draw
+		if (!draw_pipes_outside_basement && !basement.intersects_xy(pbc)) continue; // outside the basement, don't need to draw
 		bool const pdim(p.dim & 1), pdir(p.dim >> 1);
 		unsigned const flags(RO_FLAG_NOCOLL | RO_FLAG_HANGING | RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI); // non-colliding, flat ends on both sides
 		objs.emplace_back(pbc, TYPE_PIPE, room_id, pdim, pdir, flags, tot_light_amt, SHAPE_CYLIN, fittings_color);
@@ -981,7 +1185,7 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 
 		for (pipe_t const &p : pipes) {
 			if (!p.connected || p.outside_pg || p.type == PIPE_RISER) continue; // unconnected, outside, or drain, skip
-			float const min_len(min_insum_len*p.radius), radius_exp(insul_thickness*p.radius);
+			float const min_len(min_insum_len*p.radius), radius_exp(min(insul_thickness*p.radius, 0.2f*max_pipe_radius));
 			if (p.get_length() < min_len) continue; // length is too short
 			cube_t const pbc(p.get_bcube());
 			insulation.clear();
@@ -1003,14 +1207,137 @@ bool building_t::add_basement_pipes(vect_cube_t const &obstacles, vect_cube_t co
 	return 1;
 }
 
-void building_t::add_sprinkler_pipes(vect_cube_t const &obstacles, vect_cube_t const &walls, vect_cube_t const &beams, vect_cube_t const &pipe_cubes,
-		unsigned room_id, unsigned num_floors, float tot_light_amt, rand_gen_t &rgen)
+void add_hanging_pipe_bracket(cube_t const &pipe, float len_pos, float ceiling_zval, bool dim, unsigned room_id, float tot_light_amt,
+	unsigned pipe_conn_start, vect_room_object_t &objs, vect_cube_t const &obstacles, vect_cube_t const &walls)
 {
-	// add red sprinkler system pipe
+	unsigned const pipe_flags(RO_FLAG_NOCOLL | RO_FLAG_HANGING);
+	float const radius(0.5*pipe.dz()), thickness(0.12*radius);
+	cube_t bracket(pipe);
+	set_wall_width(bracket, len_pos, 0.8*radius, dim);
+	bracket.expand_in_dim(!dim, thickness);
+	bracket.expand_in_dim(2,    thickness);
+	cube_t bc(bracket);
+	bc.z1() = ceiling_zval; // extend up to ceiling
+	if (has_bcube_int(bc, obstacles) || has_bcube_int(bc, walls)) return;
+
+	for (auto i = objs.begin()+pipe_conn_start; i != objs.end(); ++i) {
+		if (i->intersects(bc)) return; // is this intersection possible given the existing constraints on pipe placement? unclear
+	}
+	objs.emplace_back(bracket, TYPE_PIPE, room_id, dim, 0, (pipe_flags | RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI), tot_light_amt, SHAPE_CYLIN, LT_GRAY);
+
+	if (bracket.z2() < ceiling_zval) { // add a vertical bolt into the ceiling; beams should not be empty
+		cube_t bolt;
+		set_cube_zvals(bolt, pipe.z2(), ceiling_zval);
+		set_wall_width(bolt, bracket.get_center_dim( dim), 0.2*radius,  dim);
+		set_wall_width(bolt, bracket.get_center_dim(!dim), 0.2*radius, !dim);
+		objs.emplace_back(bolt, TYPE_PIPE, room_id, 0, 1, pipe_flags, tot_light_amt, SHAPE_CYLIN, GRAY); // vertical, no ends
+	}
+}
+
+// return value: 0=failed to place, 1=placed full length, 2=placed partial length
+// Note: beams are for the top floor, even though we may be routing sprinkler pipes on a floor below
+int add_sprinkler_pipe(building_t const &b, point const &p1, float end_val, float radius, bool dim, bool dir, vect_cube_t const &obstacles,
+	vect_cube_t const &walls, vect_cube_t const &beams, vect_cube_t const &pipe_cubes, cube_t &ramp, float ceiling_zval, unsigned room_id,
+	float tot_light_amt, vect_room_object_t &objs, colorRGBA const &pcolor, colorRGBA const &ccolor, unsigned max_shorten_steps, int add_sprinklers)
+{
+	point p2(p1);
+	p2[dim] = end_val;
+	cube_t h_pipe(p1, p2);
+	h_pipe.expand_in_dim(!dim, radius);
+	h_pipe.expand_in_dim(2,    radius); // set zvals
+	unsigned const num_steps(8), max_n_iter(min(num_steps-1, max_shorten_steps+1));
+	unsigned const objs_start(objs.size()), pipe_flags(RO_FLAG_NOCOLL | RO_FLAG_HANGING);
+	unsigned conn_flags(pipe_flags);
+	float &pipe_end(h_pipe.d[dim][!dir]);
+	float const step_val((p1[dim] - pipe_end)/num_steps); // signed
+	int ret(0);
+
+	// keep cutting off the ends until we can place a pipe
+	for (unsigned n = 0; n < max_n_iter; ++n, pipe_end += step_val) {
+		// Note: pipe should touch the bottom of beams, so we don't need to check intersections with beams (and it may fail due to FP error)
+		if (has_bcube_int(h_pipe, obstacles) || has_bcube_int(h_pipe, pipe_cubes)) continue; // no need to check walls here
+		if (!ramp.is_all_zeros() && h_pipe.intersects(ramp)) continue; // check ramps as well, since they won't be included for lower floors
+		if (n > 0) {conn_flags |= (dir ? RO_FLAG_ADJ_LO : RO_FLAG_ADJ_HI);} // shortened pipe, draw the connector end caps
+		ret = ((n > 0) ? 2 : 1);
+		break;
+	} // for n
+	if (ret == 0) return 0; // failed to place a pipe at any length
+	bool const is_partial(ret == 2);
+	// encoded as: X:dim=0,dir=0 Y:dim=1,dir=0, Z:dim=x,dir=1
+	room_object_t const pipe(h_pipe, TYPE_PIPE, room_id, dim, 0, pipe_flags, tot_light_amt, SHAPE_CYLIN, pcolor); // add to pipe_cubes?
+	objs.push_back(pipe);
+	float const conn_thickness(0.2*radius), conn_max_length(3.2*radius);
+
+	for (unsigned d = 0; d < 2; ++d) { // add connector segments
+		float const conn_length(conn_max_length*((bool(d) == dir) ? 1.0 : (is_partial ? 0.4 : 0.6))); // long connected to pipe, medium at the wall, and short partial
+		cube_t conn(h_pipe);
+		conn.d[dim][!d] = conn.d[dim][d] + (d ? -1.0 : 1.0)*conn_length; // set length
+		conn.expand_in_dim(!dim, conn_thickness);
+		conn.expand_in_dim(2,    conn_thickness);
+		objs.emplace_back(conn, TYPE_PIPE, room_id, dim, 0, (conn_flags | (d ? RO_FLAG_ADJ_LO : RO_FLAG_ADJ_HI)), tot_light_amt, SHAPE_CYLIN, ccolor);
+	}
+	if (is_partial) { // partial pipe, add a bracket to suspend the end
+		float const len_pos(pipe_end - (dir ? -1.0 : 1.0)*2.6*conn_max_length);
+		add_hanging_pipe_bracket(h_pipe, len_pos, ceiling_zval, dim, room_id, tot_light_amt, objs_start+1, objs, obstacles, walls);
+	}
+	if (add_sprinklers) {
+		bool const inverted(add_sprinklers & 1); // use LSB
+		float const length(h_pipe.get_sz_dim(dim)), sprinkler_radius(0.9*radius);
+		unsigned const num_sprinklers(max(1U, unsigned(length/(60.0*radius))));
+		float const end_spacing(is_partial ? 1.5*conn_max_length : length/(num_sprinklers - 0.5)); // near the connector if truncated, otherwise one spacing from the wall
+		float const end(pipe_end - (dir ? -1.0 : 1.0)*end_spacing);
+		float const spacing((num_sprinklers == 1) ? (pipe_end - p1[dim]) : (end - p1[dim])/(num_sprinklers - 0.5)); // signed; always halfway if single sprinkler
+		float const sprinkler_height(3.2*radius), sprinkler_dz((inverted ? -1.0 : 1.0)*sprinkler_height);
+		point center(p1);
+		center[dim] = p1[dim] + 0.5*spacing; // half spacing from the end so that sprinklers are centered on the main pipe
+		bool any_added(0);
+
+		for (unsigned n = 0; n < num_sprinklers; ++n, center[dim] += spacing) {
+			cube_t s(center, center);
+			s.d[2][!inverted] += sprinkler_dz;
+			s.expand_by_xy(sprinkler_radius);
+			cube_t s_ext(s); // includes some extra clearance
+			s_ext.d[2][!inverted] += sprinkler_dz;
+			s.expand_by_xy(0.5*sprinkler_radius);
+			if (has_bcube_int(s_ext, obstacles) || has_bcube_int(s_ext, walls) || has_bcube_int_xy(s_ext, beams) || has_bcube_int(s_ext, pipe_cubes)) continue;
+			if (b.interior->is_blocked_by_stairs_or_elevator(s_ext)) continue; // check extra padding in front of stairs and elevators
+			objs.emplace_back(s, TYPE_SPRINKLER, room_id, 0, inverted, RO_FLAG_NOCOLL, tot_light_amt, SHAPE_CYLIN, pcolor);
+			// add the connector ring around the sprinkler, same color as the pipe
+			cube_t conn(h_pipe);
+			set_wall_width(conn, center[dim], 0.35*conn_max_length, dim);
+			conn.expand_in_dim(!dim, 0.8*conn_thickness);
+			conn.expand_in_dim(2,    0.8*conn_thickness);
+			objs.emplace_back(conn, TYPE_PIPE, room_id, dim, 0, (pipe_flags | RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI), tot_light_amt, SHAPE_CYLIN, pcolor);
+			any_added = 1;
+		} // for n
+		// if no sprinklers were added (maybe because the pipe was along a beam), remove the entire pipe
+		if (!any_added) {objs.resize(objs_start); return 0;}
+	}
+	if (h_pipe.z2() < ceiling_zval) { // add hangers for each beam the pipe passes under; ignores beam zval (assumes beams stack on each floor)
+		for (cube_t const &beam : beams) {
+			if (beam.get_sz_dim(!dim) < beam.get_sz_dim(dim)) continue; // beam runs in the wrong dim (parallel, not perpendicular)
+			if (beam.d[!dim][0] > h_pipe.d[!dim][0] || beam.d[!dim][1] < h_pipe.d[!dim][1]) continue; // beam length doesn't contain pipe
+			if (beam.d[ dim][0] < h_pipe.d[ dim][0] || beam.d[ dim][1] > h_pipe.d[ dim][1]) continue; // pipe length doesn't contain beam
+			float const len_pos(beam.get_center_dim(dim));
+			add_hanging_pipe_bracket(h_pipe, len_pos, ceiling_zval, dim, room_id, tot_light_amt, objs_start+1, objs, obstacles, walls);
+		}
+	}
+	// add fittings at parking garage walls and pillars
+	float const fitting_len(FITTING_LEN*radius), fitting_expand((FITTING_RADIUS - 1.0)*radius);
+	add_pass_through_fittings(pipe, walls, fitting_len, fitting_expand, dim, ccolor, objs);
+	return ret;
+}
+void building_t::add_sprinkler_pipes(vect_cube_t const &obstacles, vect_cube_t const &walls, vect_cube_t const &beams, vect_cube_t const &pipe_cubes,
+		unsigned room_id, unsigned num_floors, unsigned objs_start, float tot_light_amt, rand_gen_t &rgen)
+{
+	// add vertical red sprinkler system pipe
 	float const floor_spacing(get_window_vspace()), fc_thickness(get_fc_thickness());
 	float const sp_radius(1.2*get_wall_thickness()), spacing(2.0*sp_radius), flange_expand(0.3*sp_radius);
 	float const bolt_dist(sp_radius + 0.5*flange_expand), bolt_radius(0.32*flange_expand), bolt_height(0.1*fc_thickness);
+	bool const inverted_sprinklers(room_id & 1); // random-ish
+	colorRGBA const pcolor(RED), ccolor(BRASS_C); // pipe and connector colors
 	vect_room_object_t &objs(interior->room_geom->objs);
+	unsigned const sprinker_pipes_start(objs.size());
 	cube_t const &basement(get_basement());
 	cube_t c;
 	set_cube_zvals(c, (basement.z1() + fc_thickness), (basement.z2() - fc_thickness));
@@ -1020,8 +1347,18 @@ void building_t::add_sprinkler_pipes(vect_cube_t const &obstacles, vect_cube_t c
 		set_wall_width(c, rgen.rand_uniform(basement.d[!dim][0]+spacing, basement.d[!dim][1]-spacing), sp_radius, !dim);
 		c.d[dim][ dir] = basement.d[dim][dir] + (dir ? -1.0 : 1.0)*flange_expand; // against the wall (with space for the flange)
 		c.d[dim][!dir] = c.d[dim][dir] + (dir ? -1.0 : 1.0)*2.0*sp_radius;
-		if (has_bcube_int(c, obstacles) || has_bcube_int(c, walls) || has_bcube_int(c, beams) || has_bcube_int(c, pipe_cubes)) continue; // bad position
-		objs.emplace_back(c, TYPE_PIPE, room_id, 0, 1, RO_FLAG_LIT, tot_light_amt, SHAPE_CYLIN, RED); // dir=1 for vertical; casts shadows; add to pipe_cubes?
+		cube_t c2(c);
+		c2.expand_in_dim(!dim, 0.5*sp_radius); // add a bit of extra space to the sides for the flanges and valves
+		if (has_bcube_int(c2, obstacles) || has_bcube_int(c2, walls) || has_bcube_int(c2, beams) || has_bcube_int(c2, pipe_cubes)) continue; // include walls and beams
+		// skip if the pipe aligns with a pillar because we won't be able to place a horizontal sprinkler pipe
+		bool is_blocked(0);
+		
+		for (cube_t const &wall : walls) { // includes both walls and pillars
+			if (wall.dx() > 2.0*wall.dy() || wall.dy() > 2.0*wall.dx()) continue; // skip walls since they have pillars intersecting them as well
+			if ((wall.x2() > c.x1() && wall.x1() < c.x2()) || (wall.y2() > c.y1() && wall.y1() < c.y2())) {is_blocked = 1; break;} // X or Y projection
+		}
+		if (is_blocked) continue;
+		objs.emplace_back(c, TYPE_PIPE, room_id, 0, 1, RO_FLAG_LIT, tot_light_amt, SHAPE_CYLIN, pcolor); // dir=1 for vertical; casts shadows; add to pipe_cubes?
 		// add flanges at top and bottom of each floor
 		cube_t flange(c);
 		flange.expand_by_xy(flange_expand);
@@ -1032,7 +1369,7 @@ void building_t::add_sprinkler_pipes(vect_cube_t const &obstacles, vect_cube_t c
 			float const z(basement.z1() + f*floor_spacing);
 			flange.z1() = z - ((f ==          0) ? -1.0 : 1.15)*fc_thickness;
 			flange.z2() = z + ((f == num_floors) ? -1.0 : 1.15)*fc_thickness;
-			objs.emplace_back(flange, TYPE_PIPE, room_id, 0, 1, flags, tot_light_amt, SHAPE_CYLIN, RED);
+			objs.emplace_back(flange, TYPE_PIPE, room_id, 0, 1, flags, tot_light_amt, SHAPE_CYLIN, pcolor);
 			unsigned const NUM_BOLTS = 8;
 			float const angle_step(TWO_PI/NUM_BOLTS);
 
@@ -1041,39 +1378,108 @@ void building_t::add_sprinkler_pipes(vect_cube_t const &obstacles, vect_cube_t c
 				cube_t bolt;
 				bolt.set_from_sphere(point(center.x+dx, center.y+dy, 0.0), bolt_radius);
 				set_cube_zvals(bolt, flange.z1()-bolt_height, flange.z2()+bolt_height);
-				objs.emplace_back(bolt, TYPE_PIPE, room_id, 0, 1, (flags | RO_FLAG_RAND_ROT), tot_light_amt, SHAPE_CYLIN, RED);
+				objs.emplace_back(bolt, TYPE_PIPE, room_id, 0, 1, (flags | RO_FLAG_RAND_ROT), tot_light_amt, SHAPE_CYLIN, pcolor);
 			} // for m
 		} // for f
-
+		// add valves on each floor
+		for (unsigned f = 0; f < num_floors; ++f) {
+			float const z(basement.z1() + (f + 0.55)*floor_spacing), valve_radius(1.5*sp_radius);
+			point center(c.xc(), c.yc(), z);
+			center[dim] += (dir ? -1.0 : 1.0)*1.5*sp_radius;
+			cube_t valve(center);
+			valve.expand_in_dim(2,        valve_radius);
+			valve.expand_in_dim(!dim,     valve_radius);
+			valve.expand_in_dim( dim, 0.4*valve_radius);
+			if (has_bcube_int(valve, obstacles) || has_bcube_int(valve, walls)) continue; // check for pillars, etc.; should be rare
+			objs.emplace_back(valve, TYPE_VALVE, room_id, dim, 0, RO_FLAG_NOCOLL, tot_light_amt, SHAPE_CYLIN, pcolor);
+			// add a brass band around the pipe where the valve connects
+			cube_t band(c);
+			band.expand_by_xy(0.1*sp_radius);
+			set_cube_zvals(band, z-0.5*valve_radius, z+0.5*valve_radius);
+			objs.emplace_back(band, TYPE_PIPE, room_id, 0, 1, (RO_FLAG_HANGING | RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI), tot_light_amt, SHAPE_CYLIN, BRASS_C);
+		} // for f
 		// attempt to run horizontal pipes across the basement ceiling
 		float const h_pipe_radius(0.5*sp_radius), conn_thickness(0.2*h_pipe_radius);
-		float const ceil_gap(fc_thickness + max(0.25f*fc_thickness, 0.05f*get_floor_ceil_gap())); // make enough room for both flange + bolts and ceiling beams
+		float const ceil_gap(max(0.25f*fc_thickness, 0.05f*get_floor_ceil_gap())); // make enough room for both flange + bolts and ceiling beams
+		unsigned const max_shorten_steps(n/5); // start off with no horizontal pipe shortening to get better coverage, but relax this constraint as we go
+		bool place_failed(0);
 
 		for (unsigned f = 0; f < num_floors; ++f) {
-			point p1(center); // vertical pipe center
-			p1.z = basement.z1() + (f+1)*floor_spacing - ceil_gap - h_pipe_radius;
-			point p2(p1);
-			p2[dim] = basement.d[dim][!dir]; // extend to the opposite wall
-			cube_t h_pipe(p1, p2);
-			h_pipe.expand_in_dim(!dim, h_pipe_radius);
-			h_pipe.expand_in_dim(2,    h_pipe_radius); // set zvals
-			if (has_bcube_int(h_pipe, obstacles) || has_bcube_int(h_pipe, walls) || has_bcube_int(h_pipe, beams) || has_bcube_int(h_pipe, pipe_cubes)) continue;
-			if (h_pipe.intersects(interior->pg_ramp)) continue; // check ramps as well, since they won't be included for lower floors
-			unsigned flags(RO_FLAG_NOCOLL | RO_FLAG_HANGING);
-			// encoded as: X:dim=0,dir=0 Y:dim=1,dir=0, Z:dim=x,dir=1
-			objs.emplace_back(h_pipe, TYPE_PIPE, room_id, dim, 0, flags, tot_light_amt, SHAPE_CYLIN, RED); // add to pipe_cubes?
+			bool const lf(f+1 < num_floors);
+			vect_cube_t walls2, beams2, obstacles2;
 
-			for (unsigned d = 0; d < 2; ++d) { // add connector segments
-				cube_t conn(h_pipe);
-				conn.d[dim][!d] = conn.d[dim][d] + (d ? -1.0 : 1.0)*1.6*sp_radius; // set length
-				conn.expand_in_dim(!dim, conn_thickness);
-				conn.expand_in_dim(2,    conn_thickness);
-				objs.emplace_back(conn, TYPE_PIPE, room_id, dim, 0, (flags | (d ? RO_FLAG_ADJ_LO : RO_FLAG_ADJ_HI)), tot_light_amt, SHAPE_CYLIN, RED);
+			if (lf) { // query walls/beams/obstacles added to lower floors in previous PG placement steps
+				obstacles2 = obstacles; // copy existing obstacles, since the stairs, elevators, ramps, etc. that aren't objects or per-floor are needed
+				add_pg_obstacles(objs, interior->room_geom->wall_ps_start, objs_start, walls2, beams2, obstacles2);
 			}
-		} // f
+			vect_cube_t const &walls_(lf ? walls2 : walls), &beams_(lf ? beams2 : beams), &obstacles_(lf ? obstacles2 : obstacles);
+			float const ceiling_zval(basement.z1() + (f+1)*floor_spacing - fc_thickness);
+			point p1(center); // vertical pipe center
+			// place below the ceiling so that fittings just touch beams rather than clipping through them; however, pipes may still clip through lights placed on beams
+			p1.z = ceiling_zval - ceil_gap - h_pipe_radius - conn_thickness;
+			unsigned const pipe_obj_ix(objs.size());
+			float const wpos(basement.d[dim][!dir]); // extend to the opposite wall
+			int const ret(add_sprinkler_pipe(*this, p1, wpos, h_pipe_radius, dim, dir, obstacles_, walls_, beams_, pipe_cubes,
+				interior->pg_ramp, ceiling_zval, room_id, tot_light_amt, objs, pcolor, ccolor, max_shorten_steps, 0)); // sprinklers=0
+			
+			if (ret == 0) { // failed to place
+				if (n < 50) {place_failed = 1; break;} // failed; retry with a different vertical pipe placement
+				// try to run horizontal pipe in the opposite dim, but don't connect branch lines because the pipe may be too close to the wall and the code would be messy
+				bool const other_dir(basement.get_center_dim(!dim) < p1[!dim]);
+				add_sprinkler_pipe(*this, p1, basement.d[!dim][!other_dir], h_pipe_radius, !dim, other_dir, obstacles_, walls_, beams_, pipe_cubes,
+					interior->pg_ramp, ceiling_zval, room_id, tot_light_amt, objs, pcolor, ccolor, max_shorten_steps, 0); // sprinklers=0
+				continue;
+			}
+			// run smaller branch lines off this pipe in the other dim; we could add the actual sprinklers to these
+			cube_t const h_pipe(objs[pipe_obj_ix]);
+			float const h_pipe_len(h_pipe.get_sz_dim(dim)), conn_radius(0.5*h_pipe_radius);
+			unsigned const pri_pipe_end_ix(objs.size()), num_conn(max(1U, unsigned(h_pipe_len/(1.5*floor_spacing))));
+			bool const end_flush(ret == 2); // if a partial pipe was added, place the last connector at the end of the pipe so that there's no unused length
+			float const conn_step((dir ? -1.0 : 1.0)*h_pipe_len/(num_conn - (end_flush ? 0.5 : 0.0))); // signed step (pipe runs in -dir)
+			p1[dim] += 0.5*conn_step; // first half step
+			int added(0);
+			float last_added_conn_pipe_pos(center[dim]); // start at center of vertical pipe
+
+			for (unsigned n = 0; n < num_conn; ++n) { // add secondary connector pipes, with sprinklers
+				added = 0; // reset for this conn
+
+				for (unsigned d = 0; d < 2; ++d) { // extend to either side of the pipe
+					float const wpos2(basement.d[!dim][!d]); // extend to the opposite wall
+					added |= add_sprinkler_pipe(*this, p1, wpos2, conn_radius, !dim, d, obstacles_, walls_, beams_, pipe_cubes,
+						interior->pg_ramp, ceiling_zval, room_id, tot_light_amt, objs, pcolor, ccolor, 8, (inverted_sprinklers ? 1 : 2)); // add sprinklers
+				}
+				if (added) { // if conn was added in either dir, add a connector segment
+					unsigned const flags(RO_FLAG_NOCOLL | RO_FLAG_HANGING | RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI); // flat ends on both sides
+					cube_t conn(h_pipe);
+					set_wall_width(conn, p1[dim], 1.2*h_pipe_radius, dim); // set length
+					conn.expand_in_dim(!dim, conn_thickness);
+					conn.expand_in_dim(2,    conn_thickness);
+					objs.emplace_back(conn, TYPE_PIPE, room_id, dim, 0, flags, tot_light_amt, SHAPE_CYLIN, ccolor);
+					last_added_conn_pipe_pos = p1[dim];
+				}
+				p1[dim] += conn_step;
+			} // for n
+			if (end_flush && !added && last_added_conn_pipe_pos != center[dim]) { // partial pipe with final connector not added, but some other connector added
+				cube_t &pipe_bc(objs[pipe_obj_ix]);
+				float &end_to_move(pipe_bc.d[dim][!dir]);
+				float const pipe_end(end_to_move), xlate(last_added_conn_pipe_pos - pipe_end);
+				end_to_move = last_added_conn_pipe_pos;
+
+				for (unsigned i = pipe_obj_ix+1; i < pipe_obj_ix+3; ++i) { // check both end caps
+					if (objs[i].d[dim][!dir] == pipe_end) {objs[i].translate_dim(dim, xlate);}
+				}
+				for (unsigned i = pipe_obj_ix+3; i < pri_pipe_end_ix; ++i) { // remove end caps no longer covering shortened pipe
+					room_object_t &obj(objs[i]);
+					if (obj.d[dim][0] < pipe_bc.d[dim][0] || obj.d[dim][1] > pipe_bc.d[dim][1]) {obj.remove();}
+				}
+			}
+		} // for f
+		if (place_failed) { // placement of secondary pipes failed; remove all sprinkler pipes and retry
+			objs.resize(sprinker_pipes_start);
+			continue;
+		}
 		break; // done
 	} // for n
-	//cout << TXT(pipe_ends.size()) << TXT(num_valid) << TXT(num_connected) << TXT(pipes.size()) << TXT(xy_map.size()) << endl;
 }
 
 // here each sphere represents the entry point of a pipe with this radius into the basement ceiling
@@ -1081,8 +1487,10 @@ void building_t::add_sprinkler_pipes(vect_cube_t const &obstacles, vect_cube_t c
 void building_t::get_pipe_basement_water_connections(vect_riser_pos_t &sewer, vect_riser_pos_t &cold_water, vect_riser_pos_t &hot_water, rand_gen_t &rgen) const {
 	cube_t const &basement(get_basement());
 	float const merge_dist = 4.0; // merge two pipes if their combined radius is within this distance
-	float const floor_spacing(get_window_vspace()), base_pipe_radius(0.01*floor_spacing), base_pipe_area(base_pipe_radius*base_pipe_radius);
-	float const merge_dist_sq(merge_dist*merge_dist), max_radius(0.4*get_wall_thickness()), ceil_zval(basement.z2() - get_fc_thickness());
+	// use reduced pipe radius for apartments and hotels since they have so many plumbing fixtures
+	float const floor_spacing(get_window_vspace()), floor_thickness(get_floor_thickness());
+	float const base_pipe_radius((is_apt_or_hotel() ? 0.008 : 0.01)*floor_spacing), base_pipe_area(base_pipe_radius*base_pipe_radius);
+	float const merge_dist_sq(merge_dist*merge_dist), max_radius(0.3*get_wall_thickness()), ceil_zval(basement.z2() - get_fc_thickness());
 	vector<room_object_t> water_heaters;
 	bool const inc_basement_wheaters = 1;
 
@@ -1090,13 +1498,16 @@ void building_t::get_pipe_basement_water_connections(vect_riser_pos_t &sewer, ve
 	for (room_object_t const &i : interior->room_geom->objs) { // check all objects placed so far
 		if (i.type == TYPE_WHEATER) { // water heaters are special because they take cold water and return hot water
 			// maybe skip if in the basement, since this must connect directly to pipes rather than through a riser;
-			// this can happen for houses (which don't have parking garages or pipes), but currently not for office buildings
-			if (!inc_basement_wheaters && i.z1() < ground_floor_z1) continue;
+			// this can happen for houses (which don't have parking garages or pipes), but currently not for office buildings;
+			// also skip water heaters in the extended basement (not inside basement)
+			if (i.z1() < ground_floor_z1 && (!inc_basement_wheaters || !basement.intersects(i))) continue;
 			water_heaters.push_back(i);
 			continue;
 		}
 		if (i.z1() < ground_floor_z1) continue; // object in the house basement; unclear how to handle it here
-		bool const hot_cold_obj (i.type == TYPE_SINK || i.type == TYPE_TUB || i.type == TYPE_SHOWER || i.type == TYPE_BRSINK || i.type == TYPE_KSINK || i.type == TYPE_WASHER);
+		// Note: the dishwasher is always next to the kitchen sink and uses the same water connections
+		bool const hot_cold_obj (i.type == TYPE_SINK || i.type == TYPE_BRSINK || i.type == TYPE_KSINK || i.type == TYPE_TUB ||
+			i.type == TYPE_SHOWER || i.type == TYPE_SHOWERTUB || i.type == TYPE_WASHER);
 		bool const cold_only_obj(i.type == TYPE_TOILET || i.type == TYPE_URINAL || i.type == TYPE_DRAIN);
 		if (!hot_cold_obj && !cold_only_obj) continue;
 		point pos(i.xc(), i.yc(), ceil_zval);
@@ -1106,7 +1517,7 @@ void building_t::get_pipe_basement_water_connections(vect_riser_pos_t &sewer, ve
 		// see if we can merge this sewer riser into an existing nearby riser
 		for (auto &r : sewer) {
 			float const p_area(r.radius*r.radius), sum_area(p_area + base_pipe_area);
-			if (!dist_xy_less_than(r.pos, pos, merge_dist_sq*sum_area)) continue;
+			if (p2p_dist_xy_sq(r.pos, pos) > merge_dist_sq*sum_area) continue;
 			r.pos      = (p_area*r.pos + base_pipe_area*pos)/sum_area; // merged position is weighted average area
 			r.radius   = get_merged_pipe_radius(r.radius, base_pipe_radius, 3.0); // cubic
 			r.has_hot |= hot_cold_obj;
@@ -1115,8 +1526,31 @@ void building_t::get_pipe_basement_water_connections(vect_riser_pos_t &sewer, ve
 		} // for p
 		if (!merged) {sewer.emplace_back(pos, base_pipe_radius, hot_cold_obj, 0);} // create a new riser; flow_dir=0/out
 	} // for i
-	for (riser_pos_t &s : sewer) {min_eq(s.radius, max_radius);} // clamp radius to a reasonable value after all merges
+	for (riser_pos_t &s : sewer) {
+		min_eq(s.radius, max_radius); // clamp radius to a reasonable value after all merges
+		// try to find a nearby interior wall on the ground floor to route the riser to
+		if (!basement.contains_pt_xy(s.pos)) continue; // outside the basement; riser not drawn anyway
+		float dmin(0.5*floor_spacing); // max movement distance
+		// if we're close to the basement wall, then leave pos unchanged; we don't want to move to the basement wall and have it half inside the basement
+		for (unsigned d = 0; d < 2; ++d) {min_eq(dmin, min((basement.d[d][1] - s.pos[d]), (s.pos[d] - basement.d[d][0])));}
+		vector3d best_delta;
 
+		for (unsigned d = 0; d < 2; ++d) { // find nearby interior walls; d is the wall separating dim
+			float const lo(s.pos[!d] - s.radius), hi(s.pos[!d] + s.radius);
+
+			for (cube_t const &w : interior->walls[d]) {
+				if (w.z1() > ground_floor_z1 + floor_thickness || w.z2() < ground_floor_z1 - floor_thickness) continue; // not on the ground floor
+				if (w.d[!d][0] > lo || w.d[!d][1] < hi) continue; // riser not contained in wall length
+				float const center(w.get_center_dim(d)), delta(center - s.pos[d]), dist(fabs(delta));
+				if (dist > dmin) continue;
+				dmin = dist;
+				best_delta[!d] = 0.0;
+				best_delta[ d] = delta;
+			}
+		} // for d
+		s.pos += best_delta;
+		assert(basement.contains_pt_xy(s.pos));
+	} // for s
 	// generate hot and cold water pipes
 	// choose a shift direction 45 degrees diagonally in the XY plane to avoid collisions with sewer pipes placed in either dim
 	vector3d const shift_dir(vector3d((rgen.rand_bool() ? -1.0 : 1.0), (rgen.rand_bool() ? -1.0 : 1.0), 0.0).get_norm());
@@ -1136,18 +1570,32 @@ void building_t::get_pipe_basement_water_connections(vect_riser_pos_t &sewer, ve
 		hot_water.emplace_back((s.pos - delta), hot_radius, 1, 1); // shift in opposite dir; has_hot=1, flow_dir=1/in
 	} // for sewer
 	if (!water_heaters.empty() && !hot_water.empty()) { // add connections for water heaters if there are hot water pipes
-		float const radius_hot(get_merged_risers_radius(hot_water)); // this is the radius of the main hot water supply
+		float const radius_hot(get_merged_risers_radius(hot_water)); // this is the radius of the main hot water supply; not limited to max
 		float const per_wh_radius(radius_hot*pow(1.0/water_heaters.size(), 1/4.0)); // distribute evenly among the water heaters using the same merge exponent
 
 		for (room_object_t const &wh : water_heaters) {
+			float const radius(wh.get_radius()), shift_val(WHEATER_PIPE_SPACING*radius);
+			point center(wh.xc(), wh.yc(), ceil_zval);
+			vector3d wh_shift_dir(shift_dir);
+
 			if (wh.z1() < ground_floor_z1) { // house basement water heater
 				// should this connect directly? what if vent or other pipe is in the way? how to match pipe radius?
 			}
-			float const shift_val(0.75*wh.get_radius());
-			point const center(wh.xc(), wh.yc(), ceil_zval);
-			cold_water.emplace_back((center + shift_val*shift_dir), per_wh_radius, 0, 1); // has_hot=0, flow_dir=1/in
-			hot_water .emplace_back((center - shift_val*shift_dir), per_wh_radius, 1, 0); // has_hot=1, flow_dir=0/out
+			else { // office building first floor water heater: use exact location where bent over pipes meet the floor
+				center[wh.dim] += (wh.dir ? 1.0 : -1.0)*radius*WHEATER_PIPE_H_DIST;
+				wh_shift_dir[ wh.dim] = 0.0;
+				wh_shift_dir[!wh.dim] = ((shift_dir[!wh.dim] < 0.0) ? -1.0 : 1.0);
+			}
+			cold_water.emplace_back((center + shift_val*wh_shift_dir), per_wh_radius, 0, 1); // has_hot=0, flow_dir=1/in
+			hot_water .emplace_back((center - shift_val*wh_shift_dir), per_wh_radius, 1, 0); // has_hot=1, flow_dir=0/out
 		} // for wh
+	}
+	if (!is_house) { // add pipes for office building rooftop water tower, if present; unclear if we ever get here
+		for (auto i = details.begin(); i != details.end(); ++i) {
+			if (i->type != ROOF_OBJ_WTOWER) continue;
+			// assume water enters water tower through this pipe and exits water tower to provide water to upper floors, which we don't need to consider in the basement
+			cold_water.emplace_back(point(i->xc(), i->yc(), ceil_zval), 2.0*base_pipe_radius, 0, 1); // 2x base radius, has_hot=0, flow_dir=1/in
+		}
 	}
 }
 
@@ -1161,40 +1609,123 @@ void building_t::get_pipe_basement_gas_connections(vect_riser_pos_t &pipes) cons
 	}
 }
 
+// *** Electrical ***
+
+bool is_good_conduit_placement(cube_t const &c, cube_t const &avoid, vect_room_object_t const &objs, unsigned end_ix, unsigned skip_ix) {
+	if (!avoid.is_all_zeros() && c.intersects(avoid)) return 0;
+
+	for (unsigned i = 0; i < end_ix; ++i) {
+		if (i != skip_ix && objs[i].intersects(c)) return 0;
+	}
+	return 1;
+}
 void building_t::add_basement_electrical(vect_cube_t &obstacles, vect_cube_t const &walls, vect_cube_t const &beams, int room_id, float tot_light_amt, rand_gen_t &rgen) {
 	cube_t const &basement(get_basement());
 	float const floor_spacing(get_window_vspace()), fc_thickness(get_fc_thickness()), floor_height(floor_spacing - 2.0*fc_thickness), ceil_zval(basement.z2() - fc_thickness);
-	unsigned const num_panels(is_house ? 1 : (1 + (rgen.rand()&3))); // 1 for houses, 1-3 for office buildings
-	colorRGBA const color(0.5, 0.6, 0.7);
+	unsigned const num_panels(is_house ? 1 : (2 + (rgen.rand()&3))); // 1 for houses, 2-4 for office buildings
 	auto &objs(interior->room_geom->objs);
+	unsigned const objs_start(objs.size());
 
 	for (unsigned n = 0; n < num_panels; ++n) {
-		float const bp_hwidth(rgen.rand_uniform(0.15, 0.25)*(is_house ? 0.7 : 1.0)*floor_height), bp_depth(rgen.rand_uniform(0.05, 0.07)*(is_house ? 0.5 : 1.0)*floor_height);
+		float const bp_hwidth(rgen.rand_uniform(0.15, 0.25)*(is_house ? 0.7 : 1.0)*floor_height), bp_hdepth(rgen.rand_uniform(0.05, 0.07)*(is_house ? 0.5 : 1.0)*floor_height);
 		if (bp_hwidth > 0.25*min(basement.dx(), basement.dy())) continue; // basement too small
 		cube_t c;
 		set_cube_zvals(c, (ceil_zval - 0.75*floor_height), (ceil_zval - rgen.rand_uniform(0.2, 0.35)*floor_height));
 
 		for (unsigned t = 0; t < ((n == 0) ? 100U : 1U); ++t) { // 100 tries for the first panel, one try after that
 			bool const dim(rgen.rand_bool()), dir(rgen.rand_bool());
-			set_wall_width(c, rgen.rand_uniform(basement.d[!dim][0]+bp_hwidth, basement.d[!dim][1]-bp_hwidth), bp_hwidth, !dim);
-			c.d[dim][ dir] = basement.d[dim][dir];
-			c.d[dim][!dir] = c.d[dim][dir] + (dir ? -1.0 : 1.0)*2.0*bp_depth;
+			float const dir_sign(dir ? -1.0 : 1.0), wall_pos(basement.d[dim][dir]), bp_center(rgen.rand_uniform(basement.d[!dim][0]+bp_hwidth, basement.d[!dim][1]-bp_hwidth));
+			set_wall_width(c, bp_center, bp_hwidth, !dim);
+			c.d[dim][ dir] = wall_pos;
+			c.d[dim][!dir] = wall_pos + dir_sign*2.0*bp_hdepth; // extend outward from wall
 			assert(c.is_strictly_normalized());
 			cube_t test_cube(c);
-			test_cube.d[dim][!dir] += (dir ? -1.0 : 1.0)*2.0*bp_hwidth; // add a width worth of clearance in the front so that the door can be opened
-			if (has_bcube_int(test_cube, obstacles) || has_bcube_int(test_cube, walls)) continue; // bad breaker box position
+			test_cube.d[dim][!dir] += dir_sign*2.0*bp_hwidth; // add a width worth of clearance in the front so that the door can be opened
+			test_cube.z2() = ceil_zval; // extend up to ceiling to ensure space for the conduit
+			if (has_bcube_int(test_cube, obstacles) || has_bcube_int(test_cube, walls) || has_bcube_int(test_cube, beams)) continue; // bad breaker box or conduit position
 			if (is_cube_close_to_doorway(test_cube, basement, 0.0, 1)) continue; // needed for ext basement doorways; inc_open=1
-			point top_center(c.xc(), c.yc(), c.z2());
-			cube_t conduit(top_center);
-			conduit.z2() = ceil_zval;
-			conduit.expand_by_xy(rgen.rand_uniform(0.38, 0.46)*bp_depth);
-			if (has_bcube_int(conduit, beams)) continue; // bad conduit position
 			unsigned cur_room_id((room_id < 0) ? get_room_containing_pt(c.get_cube_center()) : (unsigned)room_id); // calculate room_id if needed
-			objs.emplace_back(c, TYPE_BRK_PANEL, cur_room_id, dim, dir, RO_FLAG_INTERIOR, tot_light_amt, SHAPE_CUBE, color);
-			objs.emplace_back(conduit, TYPE_PIPE, cur_room_id, 0, 1, (RO_FLAG_NOCOLL | RO_FLAG_INTERIOR), tot_light_amt, SHAPE_CYLIN, LT_GRAY); // vertical pipe
-			set_obj_id(objs);
-			set_cube_zvals(c, ceil_zval-floor_height, ceil_zval); // expand to floor-to-ceiling
-			obstacles.push_back(c); // block off from pipes
+			add_breaker_panel(rgen, c, ceil_zval, dim, dir, cur_room_id, tot_light_amt);
+			cube_t blocker(c);
+			set_cube_zvals(blocker, ceil_zval-floor_height, ceil_zval); // expand to floor-to-ceiling
+			obstacles.push_back(blocker); // block off from pipes
+
+			if (is_house) { // try to reroute outlet conduits that were previously placed on the same wall horizontally to the breaker box
+				float const conn_height(c.z1() + rgen.rand_uniform(0.25, 0.75)*c.dz());
+				cube_t avoid;
+
+				if (has_ext_basement()) {
+					door_t const &eb_door(interior->get_ext_basement_door());
+					avoid = eb_door.get_true_bcube();
+					avoid.expand_in_dim(eb_door.dim, get_wall_thickness());
+				}
+				// Note: only need to check basement objects, but there's no easy way to do this (index not recorded), so we check them all
+				for (unsigned i = 0; i < objs_start; ++i) { // can't use an iterator as it may be invalidated
+					room_object_t &obj(objs[i]);
+
+					if (obj.type == TYPE_FURNACE) { // connect to furnace if on the same wall; straight segment with no connectors
+						cube_t conn;
+						if (!connect_furnace_to_breaker_panel(obj, c, dim, dir, conn_height, conn)) continue;
+						if (!is_good_conduit_placement(conn, avoid, objs, objs_start, i)) continue;
+						objs.emplace_back(conn, TYPE_PIPE, room_id, !dim, 0, RO_FLAG_NOCOLL, tot_light_amt, SHAPE_CYLIN, LT_GRAY); // horizontal
+						continue;
+					}
+					// handle power outlets
+					if (obj.type != TYPE_PIPE || obj.shape != SHAPE_CYLIN || obj.dim != 0 || obj.dir != 1) continue; // vertical pipes only
+					if (obj.d[dim][dir] != wall_pos) continue; // wrong wall; though we could always bend the pipe around the corner?
+					if (obj.intersects_xy(c))        continue; // too close to the panel; may intersect anyway; is this possibe?
+					float const radius(obj.get_radius());
+					if ((obj.z1() + 4.0*radius) > conn_height) continue; // too high (possibly light switch rather than outlet)
+					float const pipe_center(obj.get_center_dim(!dim));
+					bool const pipe_dir(pipe_center < bp_center);
+					float const bp_near_edge(c.d[!dim][!pipe_dir]);
+					room_object_t h_pipe(obj);
+					set_wall_width(h_pipe, conn_height, radius, 2); // set zvals
+					h_pipe.d[!dim][!pipe_dir] = pipe_center;
+					h_pipe.d[!dim][ pipe_dir] = bp_near_edge;
+					assert(h_pipe.is_strictly_normalized());
+					// check for valid placement/blocked by ext basement door or other objects;
+					// we may place two horizontal conduits that overlap, but they should be at the same positions and look correct enough
+					if (!is_good_conduit_placement(h_pipe, avoid, objs, objs_start, i)) continue;
+					h_pipe.dim = !dim;
+					h_pipe.dir = 0; // horizontal
+					obj.z2()   = conn_height; // shorten original conduit
+
+					if (min(obj.dz(), h_pipe.get_sz_dim(!dim)) > 4.0*radius) { // not a short segment; add connector parts
+						float const conn_exp(0.2*radius), xlate((dir ? -1.0 : 1.0)*conn_exp);
+						float const conn_len(2.0*radius), signed_conn_len((pipe_dir ? 1.0 : -1.0)*conn_len);
+						obj   .translate_dim(dim, xlate); // move away from the wall
+						h_pipe.translate_dim(dim, xlate);
+						room_object_t v_conn(obj), h_conn(h_pipe);
+						h_conn.expand_in_dim(dim,  conn_exp);
+						v_conn.expand_in_dim(dim,  conn_exp);
+						h_conn.expand_in_dim(2,    conn_exp);
+						v_conn.expand_in_dim(!dim, conn_exp);
+						room_object_t v_conn2(v_conn), h_conn2(h_conn); // these will be the short connectors going to the outlet and breaker box, respectively
+						v_conn .z1()  = conn_height -     conn_len;
+						v_conn2.z2()  = obj.z1()    + 0.6*conn_len;
+						h_conn .d[!dim][ pipe_dir] = pipe_center  +     signed_conn_len;
+						h_conn2.d[!dim][!pipe_dir] = bp_near_edge - 0.6*signed_conn_len;
+						v_conn .flags |=  RO_FLAG_ADJ_HI; // add joint connecting to horizontal pipe
+						h_conn .flags |= (RO_FLAG_HANGING | (pipe_dir ? RO_FLAG_ADJ_HI : RO_FLAG_ADJ_LO)); // one flat end
+						v_conn2.flags |= (RO_FLAG_HANGING | RO_FLAG_ADJ_HI); // flat end on top
+						h_conn2.flags |= (RO_FLAG_HANGING | (pipe_dir ? RO_FLAG_ADJ_LO : RO_FLAG_ADJ_HI)); // one flat end
+						v_conn .color  = h_conn.color = v_conn2.color  = h_conn2.color = GRAY; // darker
+						objs.push_back(v_conn );
+						objs.push_back(h_conn );
+						objs.push_back(v_conn2);
+						objs.push_back(h_conn2);
+						// duplicate to get flat ends on the vertical part as well
+						v_conn.flags |=  RO_FLAG_ADJ_LO | RO_FLAG_HANGING;
+						v_conn.flags &= ~RO_FLAG_ADJ_HI;
+						objs.push_back(v_conn);
+					}
+					else { // short segment
+						obj.flags |= RO_FLAG_ADJ_HI; // add joint connecting to horizontal pipe
+					}
+					objs.push_back(h_pipe); // not added to obstacles since this should not affect pipes routed in the ceiling
+				} // for i
+			}
 			break; // done
 		} // for t
 	} // for n
@@ -1204,17 +1735,18 @@ void building_t::add_basement_electrical_house(rand_gen_t &rgen) {
 	assert(has_room_geom());
 	float const tot_light_amt = 1.0; // ???
 	float const obj_expand(0.5*get_wall_thickness());
+	cube_t const &basement(get_basement());
 	vect_cube_t obstacles, walls;
 
 	for (unsigned d = 0; d < 2; ++d) { // add basement walls
 		for (cube_t const &wall : interior->walls[d]) {
-			if (wall.zc() < ground_floor_z1) {walls.push_back(wall);}
+			if (wall.zc() < ground_floor_z1 && basement.intersects(wall)) {walls.push_back(wall);}
 		}
 	}
 	// add basement objects; include them all, since it's not perf critical; we haven't added objects such as trim yet;
 	// what about blocking the breaker box with something, is that possible?
 	for (room_object_t const &c : interior->room_geom->objs) {
-		if (c.z1() < ground_floor_z1) {obstacles.push_back(c); obstacles.back().expand_by(obj_expand);} // with some clearance
+		if (c.z1() < ground_floor_z1 && basement.intersects(c)) {obstacles.push_back(c); obstacles.back().expand_by(obj_expand);} // with some clearance
 	}
 	vector_add_to(interior->stairwells, obstacles); // add stairs; what about open doors?
 	vector_add_to(interior->elevators,  obstacles); // there probably are none, but it doesn't hurt to add them
@@ -1249,17 +1781,18 @@ void building_t::add_house_basement_pipes(rand_gen_t &rgen) {
 	}
 	for (unsigned d = 0; d < 2; ++d) { // add all basement walls
 		for (cube_t &wall : interior->walls[d]) {
-			if (wall.z1() >= ground_floor_z1) continue; // not in the basement
+			if (wall.z1() >= ground_floor_z1 || !basement.intersects(wall)) continue; // not in the basement
 			walls.push_back(wall);
 			walls.back().expand_by_xy(trim_thickness); // include the trim
 		}
 	}
 	// Note: elevators/buttons/stairs haven't been placed at this point, so iterate over all objects
 	for (room_object_t const &i : interior->room_geom->objs) {
-		bool no_blocking(i.type == TYPE_PICTURE || i.type == TYPE_WBOARD);
+		if (i.z1() >= ground_floor_z1 || !basement.intersects(i)) continue; // not in the basement
+		bool const no_blocking(i.type == TYPE_PICTURE || i.type == TYPE_WBOARD || i.type == TYPE_OUTLET || i.type == TYPE_SWITCH);
+		// Note: bottles and trash on the floor counts, though it would be better to add pipes first and floor clutter later
 		// Note: TYPE_PIPE (vertical electrical conduits from outlets) may block pipes from running horizontally along walls
-		if (i.no_coll() && !no_blocking && i.type != TYPE_LIGHT && i.type != TYPE_PIPE && i.type != TYPE_VENT) continue; // no collisions
-		if (i.z1() >= ground_floor_z1) continue; // not in the basement
+		if (i.no_coll() && !no_blocking && i.type != TYPE_LIGHT && i.type != TYPE_PIPE && i.type != TYPE_VENT && !i.is_floor_clutter()) continue; // no collisions
 		// Note: we could maybe skip if i.z2() < sewer_zval-pipe_radius, but we still need to handle collisions with vertical exit pipe segments
 
 		if (i.type == TYPE_VENT) {
@@ -1273,30 +1806,35 @@ void building_t::add_house_basement_pipes(rand_gen_t &rgen) {
 		}
 		else if (no_blocking) {
 			cube_t c(i);
-			c.d[i.dim][!i.dir] += (i.dir ? 1.0 : -1.0)*wall_thickness; // add a wall thickness of clearance
-			cube_t obstacle(c);
+			c.d[i.dim][i.dir] += (i.dir ? 1.0 : -1.0)*wall_thickness; // add a wall thickness of clearance
+			if (i.type == TYPE_PICTURE) {c.expand_in_dim(!i.dim, 0.05*i.get_sz_dim(!i.dim));} // expand slightly to include the frame
+			obstacles.push_back(c);
 		}
 		else {obstacles.push_back(i);}
 	} // for i
-	// TODO: maybe should move the ceiling up or move the tops of the doors down to avoid door collisions
+	// add doors as obstacles; maybe should move the ceiling up or move the tops of the doors down to avoid door collisions?
+	// but this would need to be handled inside add_basement_pipes(), which uses obstacles in 8+ places;
+	// so we would probably need to reduce the height of all doors and add extra wall segments above them to make this work,
+	// and this is too late in the interior creation process to add walls without regenerating the VBO (unless we use stairs walls?)
 	float const door_trim_exp(2.0*trim_thickness + 0.5*wall_thickness);
 
 	for (door_t const &d : interior->doors) {
 		if (d.z1() >= ground_floor_z1) continue; // not in the basement
 		door_t door(d);
-		door.open = 0; // start closed
+		door.open = 0; door.open_amt = 0.0; // start closed
 		cube_t door_bcube(get_door_bounding_cube(door));
+		if (has_ext_basement() && !basement.intersects(door_bcube)) continue; // skip extended basement doors
 		door_bcube.d[d.dim][ d.open_dir] += (d.open_dir ? 1.0 : -1.0)*d.get_width(); // include space for door to swing open
 		door_bcube.d[d.dim][!d.open_dir] -= (d.open_dir ? 1.0 : -1.0)*door_trim_exp; // include door trim width on the other side
 
 		if (!d.on_stairs) { // [basement] stairs doors don't really open, so we only need clearance in front
-			door.open = 1; // now try the open door to avoid blocking it when open
+			door.open = 1; door.open_amt = 1.0; // now try the open door to avoid blocking it when open
 			door_bcube.union_with_cube(get_door_bounding_cube(door));
 		}
 		obstacles.push_back(door_bcube);
 	} // for doors
 	for (stairwell_t const &s : interior->stairwells) { // add stairwells (basement stairs); there should be no elevators
-		if (s.z1() >= ground_floor_z1) continue; // not in the basement
+		if (s.z1() >= ground_floor_z1 || !basement.intersects(s)) continue; // not in the basement
 		obstacles.push_back(s);
 	}
 	unsigned const objs_start(interior->room_geom->objs.size()); // no other basement objects added here that would interfere with pipes
@@ -1342,6 +1880,11 @@ void building_t::add_parking_garage_ramp(rand_gen_t &rgen) {
 				cube_t test_cube(ramp_cand);
 				test_cube.expand_in_dim(!dim, road_width); // extend outward for clearance to enter/exit the ramp (ramp dim is actually !dim)
 				if (interior->is_blocked_by_stairs_or_elevator(test_cube)) continue;
+				
+				if (has_ext_basement()) { // check for backrooms door, in case it was placed already (but currently it's not)
+					test_cube.expand_in_dim(dim, get_wall_thickness());
+					if (interior->get_ext_basement_door().get_true_bcube().intersects(test_cube)) continue; // blocked by backrooms door
+				}
 				ramp = cube_with_ix_t(ramp_cand, (((!dim)<<1) + dir)); // encode dim and dir in ramp index field
 				added_ramp = 1;
 				break; // done
@@ -1367,361 +1910,5 @@ void building_t::add_parking_garage_ramp(rand_gen_t &rgen) {
 	subtract_cube_from_floor_ceil(ramp, interior->floors  );
 	subtract_cube_from_floor_ceil(ramp, interior->ceilings);
 	// make rooms over the ramp of type RTYPE_RAMP_EXIT
-}
-
-bool building_t::extend_underground_basement(rand_gen_t rgen) {
-	if (!interior) return 0;
-	//highres_timer_t timer("Extend Underground Basement"); // 540ms total
-	float const height(get_window_vspace() - get_fc_thickness()); // full height of floor to avoid a gap at the top
-	cube_t const &basement(get_basement());
-	bool dim(rgen.rand_bool()), dir(rgen.rand_bool());
-
-	for (unsigned len = 4; len >= 2; --len) { // 100%, 75%, 50% of basement length
-		for (unsigned d = 0; d < 2; ++d, dim ^= 1) { // try both dims
-			for (unsigned e = 0; e < 2; ++e, dir ^= 1) { // try both dirs
-				if (basement.d[dim][dir] != bcube.d[dim][dir]) continue; // wall not on the building bcube
-				cube_t cand_door(place_door(basement, dim, dir, height, 0.0, 0.0, 0.25, DOOR_WIDTH_SCALE, 1, 0, rgen));
-				if (cand_door.is_all_zeros()) continue; // can't place a door on this wall
-				float const fc_thick(get_fc_thickness());
-				set_cube_zvals(cand_door, basement.z1()+fc_thick, basement.z2()-fc_thick); // change z to span floor to ceiling for interior door
-				cand_door.translate_dim(dim, (dir ? 1.0 : -1.0)*0.25*get_wall_thickness()); // zero width, centered on the door
-				if (add_underground_exterior_rooms(rgen, cand_door, dim, dir, 0.25*len)) return 1; // exit on success
-			} // for e
-		} // for d
-	} // for len
-	return 0;
-}
-
-float query_min_height(cube_t const &c, float stop_at) {
-	float hmin(FLT_MAX);
-
-	if (using_tiled_terrain_hmap_tex() && !using_hmap_with_detail()) { // optimized flow when using heightmap texture
-		float x1((c.x1() + X_SCENE_SIZE)*DX_VAL_INV + 0.5 + xoff2), x2((c.x2() + X_SCENE_SIZE)*DX_VAL_INV + 0.5 + xoff2);
-		float y1((c.y1() + Y_SCENE_SIZE)*DY_VAL_INV + 0.5 + yoff2), y2((c.y2() + Y_SCENE_SIZE)*DY_VAL_INV + 0.5 + yoff2);
-
-		for (float y = y1-0.5; y < y2+0.5; y += 0.5) {
-			for (float x = x1-0.5; x < x2+0.5; x += 0.5) {
-				min_eq(hmin, get_tiled_terrain_height_tex(x, y, 1)); // check every grid point with the X/Y range; nearest_texel=1
-				if (hmin < stop_at) return hmin;
-			}
-		}
-	}
-	else { // we don't have the float heightmap here, so we have to do an expensive get_exact_zval() for each grid point
-		float const x_step(0.5*DX_VAL), y_step(0.5*DY_VAL);
-
-		for (float y = c.y1()-y_step; y < c.y2()+y_step; y += y_step) {
-			for (float x = c.x1()-x_step; x < c.x2()+x_step; x += x_step) {
-				min_eq(hmin, get_exact_zval(min(x, c.x2()), min(y, c.y2()))); // check every grid point with the X/Y range
-				if (hmin < stop_at) return hmin;
-			}
-		}
-	}
-	return hmin;
-}
-
-struct ext_basement_room_params_t {
-	vect_cube_t wall_exclude, wall_segs, temp_cubes;
-	vect_extb_room_t rooms;
-	vector<stairs_place_t> stairs;
-};
-
-bool building_t::is_basement_room_placement_valid(cube_t &room, ext_basement_room_params_t &P, bool dim, bool dir, bool *add_end_door) const {
-	cube_t test_cube(room);
-	test_cube.expand_in_dim(dim, -0.1*get_wall_thickness()); // shrink slightly to avoid intersections with our parent room
-	test_cube.expand_in_dim(2, -0.01*test_cube.dz()); // shrink slightly so that rooms on different floors can cross over each other
-	float const room_len(room.get_sz_dim(dim)), room_width(room.get_sz_dim(!dim));
-	extb_room_t *end_conn_room(nullptr);
-
-	for (auto r = P.rooms.begin(); r != P.rooms.end(); ++r) {
-		if (!r->intersects(test_cube)) continue;
-		if (add_end_door == nullptr)   return 0; // no end door enabled
-		if (r == P.rooms.begin())      return 0; // basement is first room - can't reconnect to it
-		if (r->d[!dim][0] > room.d[!dim][0] || r->d[!dim][1] < room.d[!dim][1]) return 0; // doesn't span entire room/clips off corner - invalid
-		if (r->z1() != room.z1() || r->z2() != room.z2()) return 0; // floor or ceiling zval not shared
-		float const edge_pos(r->d[dim][!dir]); // intersection edge pos on other room
-		float const clip_len((edge_pos - room.d[dim][!dir])*(dir ? 1.0 : -1.0));
-		if (clip_len < max(room_width, 0.5f*room_len)) return 0; // clipped room length is less than room width or half unclipped room length; handles negative size
-		room.d[dim][dir] = test_cube.d[dim][dir] = edge_pos; // clip room to this shorter length and add an end door; may be clipped smaller for another room
-		assert(room.is_strictly_normalized());
-		end_conn_room = &(*r);
-		*add_end_door = 1;
-	} // for r
-	for (stairs_place_t const &s : P.stairs) {
-		cube_t avoid(s);
-		avoid.expand_in_dim(!s.dim, 0.25*s.get_sz_dim(!s.dim)); // expand to the sides to avoid placing a door too close to the stairs
-		if (avoid.intersects(room)) return 0;
-	}
-	float const ceiling_zval(room.z2() - get_fc_thickness());
-	if (query_min_height(room, ceiling_zval) < ceiling_zval) return 0; // check for terrain clipping through ceiling
-	// check for other buildings, including their extended basements;
-	// Warning: technically not thread safe, since we can be adding basements to another building at the same time, but seems to be okay in practice
-	if (check_buildings_cube_coll(room, 0, 1, this))         return 0; // xy_only=0, inc_basement=1, exclude ourself
-	cube_t const grid_bcube(get_grid_bcube_for_building(*this));
-	assert(!grid_bcube.is_all_zeros()); // must be found
-	assert(grid_bcube.contains_cube_xy(bcube)); // must contain our building
-	if (!grid_bcube.contains_cube_xy(room)) return 0; // outside the grid (tile or city) bcube
-	if (end_conn_room) {end_conn_room->conn_bcube.assign_or_union_with_cube(room);} // include this room in our connected bcube
-	return 1;
-}
-
-// add rooms to the basement that may extend outside the building's bcube
-bool building_t::add_underground_exterior_rooms(rand_gen_t &rgen, cube_t const &door_bcube, bool wall_dim, bool wall_dir, float length_mult) {
-	// start by placing a hallway in ext_wall_dim/dir using interior walls;
-	assert(interior);
-	cube_t const &basement(get_basement());
-	float const ext_wall_pos(basement.d[wall_dim][wall_dir]);
-	float const hallway_len(length_mult*basement.get_sz_dim(wall_dim)), door_width(door_bcube.get_sz_dim(!wall_dim)), hallway_width(1.6*door_width);
-	extb_room_t hallway(basement, 0); // is_hallway=0; will likely be set below
-	set_wall_width(hallway, door_bcube.get_center_dim(!wall_dim), 0.5*hallway_width, !wall_dim);
-	hallway.d[wall_dim][!wall_dir] = ext_wall_pos; // flush with the exterior wall/door
-	hallway.d[wall_dim][ wall_dir] = ext_wall_pos + (wall_dir ? 1.0 : -1.0)*hallway_len;
-	assert(hallway.is_strictly_normalized());
-	ext_basement_room_params_t P;
-	if (!is_basement_room_placement_valid(hallway, P, wall_dim, wall_dir, nullptr)) return 0; // try to place the hallway; add_end_door=nullptr
-	// valid placement; now add the door, hallway, and connected rooms
-	has_basement_door = 1;
-	// Note: recording the door_stack index rather than the door index allows us to get either the first door or the first stack
-	interior->ext_basement_door_stack_ix = interior->door_stacks.size();
-	float const fc_thick(get_fc_thickness()), wall_thickness(get_wall_thickness());
-	P.wall_exclude.push_back(basement);
-	P.wall_exclude.back().expand_in_dim(wall_dim, 1.1*get_trim_thickness()); // add slightly expanded basement to keep interior wall trim from intersecting exterior walls
-	P.wall_exclude.push_back(door_bcube);
-	P.wall_exclude.back().expand_in_dim(wall_dim, 2.0*wall_thickness); // make sure the doorway covers the entire wall thickness
-	interior->ext_basement_hallway_room_id = interior->rooms.size();
-	door_t Door(door_bcube, wall_dim, wall_dir, rgen.rand_bool());
-	add_interior_door(Door, 0, 1); // open 50% of the time; is_bathroom=0, make_unlocked=1
-	P.rooms.emplace_back(basement, 0);
-	P.rooms.push_back(hallway);
-	hallway.conn_bcube = basement; // make sure the basement is included
-
-	// recursively add rooms connected to this hallway in alternating dimensions
-	if (add_ext_basement_rooms_recur(hallway, P, door_width, !wall_dim, 1, rgen)) { // dept=1, since we already added a hallway
-		end_ext_basement_hallway(hallway, P.rooms[1].conn_bcube, P, door_width, wall_dim, wall_dir, 0, rgen);
-	}
-	// place rooms, now that wall_exclude has been calculated, starting with the hallway
-	cube_t wall_area(hallway);
-	wall_area.d[wall_dim][!wall_dir] += (wall_dir ? 1.0 : -1.0)*0.5*wall_thickness; // move separator wall inside the hallway to avoid clipping exterior wall
-	interior->place_exterior_room(hallway, wall_area, fc_thick, wall_thickness, P, basement_part_ix, 0, hallway.is_hallway); // use basement part_ix; num_lights=0
-
-	for (auto r = P.rooms.begin()+2; r != P.rooms.end(); ++r) { // skip basement and primary hallway
-		interior->place_exterior_room(*r, *r, fc_thick, wall_thickness, P, basement_part_ix, 0, r->is_hallway);
-	}
-	for (stairs_place_t const &stairs : P.stairs) {
-		landing_t landing(stairs, 0, 0, stairs.dim, stairs.dir, stairs.add_railing, SHAPE_STRAIGHT, 0, 1, 1, 0, 1); // roof_access=0, is_at_top=1, stack_conn=1, for_ramp=0, ieb=1
-		bool const against_wall[2] = {1, 1};
-		landing.set_against_wall(against_wall);
-		stairs_landing_base_t stairwell(landing);
-		landing  .z1() = stairs.z2() - 2.0*fc_thick;
-		stairwell.z2() += 0.99*get_floor_ceil_gap(); // bottom of ceiling of upper part; must cover z-range of upper floor for AIs and room object collisions
-		interior->landings.push_back(landing);
-		interior->stairwells.emplace_back(stairwell, 1); // num_floors=1
-	} // for stairs
-	return 1;
-}
-
-bool building_t::add_ext_basement_rooms_recur(extb_room_t &parent_room, ext_basement_room_params_t &P, float door_width, bool dim, unsigned depth, rand_gen_t &rgen) {
-	// add doors and other rooms along hallway; currently, all rooms are hallways
-	float const parent_len(parent_room.get_sz_dim(!dim)), parent_width(parent_room.get_sz_dim(dim));
-	float const end_spacing(0.75*door_width), min_length(max(4.0f*door_width, 0.5f*parent_len)), max_length(max(parent_len, 2.0f*min_length));
-	float const pos_lo(parent_room.d[!dim][0] + end_spacing), pos_hi(parent_room.d[!dim][1] - end_spacing);
-	if (pos_lo >= pos_hi) return 0; // not enough space to add a door
-	bool const is_end_room(depth >= global_building_params.max_ext_basement_room_depth);
-	float const min_width_scale(is_end_room ? 1.0 : 0.9), max_width_scale(is_end_room ? 3.0 : 1.5);
-	bool was_added(0);
-
-	for (unsigned n = 0; n < global_building_params.max_ext_basement_hall_branches; ++n) {
-		for (unsigned N = 0; N < 2; ++N) { // make up to 2 tries to place this room
-			bool const dir(rgen.rand_bool());
-			float const conn_edge(parent_room.d[dim][dir]), room_pos(rgen.rand_uniform(pos_lo, pos_hi));
-			float const room_length(rgen.rand_uniform(min_length, max_length));
-			float const room_width(max(1.5f*door_width, rgen.rand_uniform(min_width_scale, max_width_scale)*parent_width));
-			extb_room_t room(parent_room); // sets correct zvals
-			room.d[dim][!dir] = conn_edge;
-			room.d[dim][ dir] = conn_edge + (dir ? 1.0 : -1.0)*room_length;
-			set_wall_width(room, room_pos, 0.5*room_width, !dim);
-			bool add_end_door(0);
-			if (!is_basement_room_placement_valid(room, P, dim, dir, &add_end_door)) continue; // can't place the room here
-			bool const add_doors[2] = {(dir == 1 || add_end_door), (dir == 0 || add_end_door)}; // one or both
-			cube_t const cur_room(add_and_connect_ext_basement_room(room, P, door_width, dim, dir, is_end_room, depth, add_doors, rgen));
-			parent_room.conn_bcube.assign_or_union_with_cube(cur_room);
-			was_added = 1;
-			break; // done/success
-		} // for N
-	} // for n
-	return was_added;
-}
-
-cube_t building_t::add_and_connect_ext_basement_room(extb_room_t &room, ext_basement_room_params_t &P,
-	float door_width, bool dim, bool dir, bool is_end_room, unsigned depth, bool const add_doors[2], rand_gen_t &rgen)
-{
-	assert(room.is_strictly_normalized());
-	unsigned const cur_room_ix(P.rooms.size());
-	P.rooms.push_back(room);
-	// add a connecting door at one or both ends
-	float const fc_thick(get_fc_thickness());
-
-	for (unsigned d = 0; d < 2; ++d) {
-		if (!add_doors[d]) continue; // no door at this end
-		cube_t door;
-		set_cube_zvals(door, room.z1()+fc_thick, room.z2()-fc_thick);
-		set_wall_width(door, room.get_center_dim(!dim), 0.5*door_width, !dim);
-		door.d[dim][0] = door.d[dim][1] = room.d[dim][d]; // one end of the room
-		door_t Door(door, dim, !d, rgen.rand_bool());
-		add_interior_door(Door, 0, !is_end_room); // open 50% of the time; is_bathroom=0, make_unlocked=!is_end_room
-		door.expand_in_dim(dim, 2.0*get_wall_thickness());
-		P.wall_exclude.push_back(door);
-		room.conn_bcube.assign_or_union_with_cube(door);
-	}
-	// recursively add rooms connecting to this one
-	bool is_hallway(0);
-	if (!is_end_room) {is_hallway = add_ext_basement_rooms_recur(room, P, door_width, !dim, depth+1, rgen);}
-	extb_room_t &cur_room(P.rooms[cur_room_ix]);
-	cur_room.is_hallway = is_hallway; // all non-end rooms are hallways
-	// for hallway with no door at the end: clip off the extra
-	if (is_hallway) {end_ext_basement_hallway(cur_room, room.conn_bcube, P, door_width, dim, dir, depth+1, rgen);} // Note: may invalidate cur_room reference
-	return P.rooms[cur_room_ix];
-}
-
-void building_t::end_ext_basement_hallway(extb_room_t &room, cube_t const &conn_bcube, ext_basement_room_params_t &P,
-	float door_width, bool dim, bool dir, unsigned depth, rand_gen_t &rgen)
-{
-	room.conn_bcube.assign_or_union_with_cube(conn_bcube); // combine conns from child rooms and end connected rooms
-	float const stairs_len(3.0*door_width), stairs_end(room.d[dim][dir]), dsign(dir ? 1.0 : -1.0);
-	
-	if (depth < global_building_params.max_ext_basement_room_depth && dsign*(room.d[dim][dir] - room.conn_bcube.d[dim][dir]) > stairs_len /*&& rgen.rand_bool()*/) {
-		float const ceil_below(room.z1()), floor_below(ceil_below - room.dz());
-
-		if (floor_below > get_max_sea_level()) {
-			// connect downward with stairs; we know that there aren't any other rooms/doors coming off the end that could be blocked
-			float const fc_thick(get_fc_thickness()), stairs_start(stairs_end - dsign*stairs_len);
-			float const hall_below_len(max(4.0f*door_width, rgen.rand_uniform(0.5, 1.5)*room.get_sz_dim(dim)));
-			extb_room_t hall_below(room, 0, 1); // copy !dim values; is_hallway will be set later; has_stairs=1
-			set_cube_zvals(hall_below, floor_below, ceil_below);
-			hall_below.d[dim][!dir] = stairs_start;
-			hall_below.d[dim][ dir] = stairs_end + dsign*hall_below_len;
-			assert(hall_below.is_strictly_normalized());
-			bool add_end_door(0);
-
-			if (is_basement_room_placement_valid(hall_below, P, dim, dir, &add_end_door)) {
-				// create stairs
-				cube_t stairs(room); // copy room.d[dim][dir] (far end/bottom of stairs)
-				set_cube_zvals(stairs, (floor_below + fc_thick), (room.z1() + fc_thick));
-				stairs.d[dim][!dir] = stairs_start; // near end/top of stairs
-				bool const add_railing(rgen.rand_bool()); // 50% of the time
-				float const wall_half_thick(0.5*get_wall_thickness());
-				stairs.expand_in_dim(!dim, -(add_railing ? 2.0 : 1.0)*wall_half_thick); // shrink on the sides; more if there are railings
-				stairs.expand_in_dim( dim, -(wall_half_thick + get_trim_thickness()));  // shrink on the ends
-				assert(!stairs.intersects_xy(room.conn_bcube));
-				P.stairs.emplace_back(stairs, dim, !dir, add_railing);
-				hall_below.conn_bcube = stairs; // must include the stairs
-				room.has_stairs = 1;
-				// add the room
-				bool const add_doors[2] = {(dir == 0 && add_end_door), (dir == 1 && add_end_door)}; // at most one at the end
-				add_and_connect_ext_basement_room(hall_below, P, door_width, dim, dir, 0, depth, add_doors, rgen); // is_end_room=0
-				return; // done
-			}
-		}
-	}
-	room.clip_hallway_to_conn_bcube(dim); // else clip
-}
-
-void extb_room_t::clip_hallway_to_conn_bcube(bool dim) { // clip off the unconnected length at the end of the hallway
-	if (!is_hallway) return;
-	assert(conn_bcube.is_strictly_normalized());
-	assert(conn_bcube.intersects(*this));
-	max_eq(d[dim][0], conn_bcube.d[dim][0]);
-	min_eq(d[dim][1], conn_bcube.d[dim][1]);
-	assert(is_strictly_normalized());
-}
-
-void building_interior_t::place_exterior_room(extb_room_t const &room, cube_t const &wall_area, float fc_thick, float wall_thick, ext_basement_room_params_t &P,
-	unsigned part_id, unsigned num_lights, bool is_hallway)
-{
-	assert(room.is_strictly_normalized());
-	bool const long_dim(room.dx() < room.dy());
-	if (num_lights == 0) {num_lights = max(1U, min(8U, (unsigned)round_fp(0.33*room.get_sz_dim(long_dim)/room.get_sz_dim(!long_dim))));} // auto calculate num_lights
-	room_t Room(room, part_id, num_lights, is_hallway);
-	Room.interior = 2; // mark as extended basement
-	if (room.has_stairs) {Room.has_stairs = 1;} // stairs on the first/only floor
-	if (is_hallway) {Room.assign_all_to(RTYPE_HALL, 0);} // initially all hallways; locked=0
-	rooms.push_back(Room);
-	cube_t ceiling(room), floor(room);
-	ceiling.z1() = room.z2() - fc_thick;
-	floor  .z2() = room.z1() + fc_thick;
-	subtract_cubes_from_cube(ceiling, P.stairs, P.wall_segs, P.temp_cubes, 2); // cut out stairs; zval_mode=2 (check for zval overlap)
-	vector_add_to(P.wall_segs, ceilings);
-	subtract_cubes_from_cube(floor,   P.stairs, P.wall_segs, P.temp_cubes, 2); // cut out stairs; zval_mode=2 (check for zval overlap)
-	vector_add_to(P.wall_segs, floors);
-	basement_ext_bcube.assign_or_union_with_cube(room);
-	// add walls; Note: two adjoining rooms may share overlapping walls
-	float const wall_half_thick(0.5*wall_thick);
-
-	for (unsigned dim = 0; dim < 2; ++dim) {
-		for (unsigned dir = 0; dir < 2; ++dir) {
-			cube_t wall(wall_area);
-			set_wall_width(wall, wall_area.d[dim][dir], wall_half_thick, dim);
-			set_cube_zvals(wall, floor.z2(), ceiling.z1());
-			if (bool(dim) != long_dim) {wall.expand_in_dim(!dim, -wall_half_thick);} // remove the overlaps at corners in the long time (house exterior wall dim)
-			// remove overlapping walls from shared rooms
-			unsigned const wall_exclude_sz(P.wall_exclude.size());
-			assert(extb_walls_start[dim] <= walls[dim].size());
-
-			for (auto w = walls[dim].begin()+extb_walls_start[dim]; w != walls[dim].end(); ++w) { // check all prev added ext basement walls in this dim
-				if (w->d[ dim][0] == wall.d[ dim][0] && w->d[ dim][1] == wall.d[dim][1] &&
-					w->d[!dim][0] <  wall.d[!dim][1] && w->d[!dim][1] >  wall.d[dim][0] &&
-					w->z1() == wall.z1() && w->z2() == wall.z2()) {P.wall_exclude.push_back(*w);} // same width and height, overlap in length
-			}
-			subtract_cubes_from_cube(wall, P.wall_exclude, P.wall_segs, P.temp_cubes, 2); // cut out doorways, etc.; zval_mode=2 (check for zval overlap)
-			vector_add_to(P.wall_segs, walls[dim]);
-			P.wall_exclude.resize(wall_exclude_sz); // remove the wall_exclude cubes we just added
-		} // for dir
-	} // for dim
-}
-
-cube_t building_t::get_bcube_inc_extensions() const {
-	cube_t ret(bcube);
-	if (has_ext_basement()) {ret.union_with_cube(interior->basement_ext_bcube);}
-	return ret;
-}
-cube_t building_t::get_full_basement_bcube() const {
-	cube_t ret(get_basement());
-	if (has_ext_basement()) {ret.union_with_cube(interior->basement_ext_bcube);}
-	return ret;
-}
-room_t const &building_t::get_ext_basement_hallway() const {
-	assert(interior);
-	assert(interior->ext_basement_hallway_room_id >= 0);
-	return *interior->ext_basement_rooms_start();
-}
-
-vector<room_t>::const_iterator building_interior_t::ext_basement_rooms_start() const {
-	if (ext_basement_hallway_room_id < 0) return rooms.end(); // no ext basement rooms
-	assert((unsigned)ext_basement_hallway_room_id < rooms.size());
-	return rooms.begin() + ext_basement_hallway_room_id;
-}
-bool building_interior_t::point_in_ext_basement_room(point const &pos) const {
-	if (ext_basement_hallway_room_id < 0)     return 0; // no ext basement rooms
-	if (!basement_ext_bcube.contains_pt(pos)) return 0;
-
-	for (auto r = ext_basement_rooms_start(); r != rooms.end(); ++r) {
-		if (r->contains_pt(pos)) return 1;
-	}
-	return 0;
-}
-// returns true if cube is completely contained in any single room
-bool building_interior_t::cube_in_ext_basement_room(cube_t const &c, bool xy_only) const {
-	if (ext_basement_hallway_room_id < 0)        return 0; // no ext basement rooms
-	if (!basement_ext_bcube.contains_cube_xy(c)) return 0;
-
-	for (auto r = ext_basement_rooms_start(); r != rooms.end(); ++r) {
-		if (xy_only ? r->contains_cube_xy(c) : r->contains_cube(c)) return 1;
-	}
-	return 0;
-}
-door_t const &building_interior_t::get_ext_basement_door() const {
-	assert(ext_basement_door_stack_ix >= 0 && (unsigned)ext_basement_door_stack_ix < door_stacks.size());
-	unsigned const door_ix(door_stacks[ext_basement_door_stack_ix].first_door_ix);
-	assert(door_ix < doors.size());
-	return doors[door_ix];
 }
 

@@ -370,7 +370,7 @@ void draw_obj(obj_group &objg, vector<wap_obj> *wap_vis_objs, int type, float ra
 	case BALL:
 		// Note: this is the only place where drawing an object modifies its physics state, but it's difficult to move the code
 		draw_rolling_obj(pos, objg.get_obj(j).init_dir, radius, obj.status, ((obj.flags & WAS_FIRED) != 0), ndiv, ((obj.flags & PLATFORM_COLL) != 0),
-			dodgeball_tids[(game_mode == 2) ? (j%NUM_DB_TIDS) : 0], (in_ammo ? NULL : &objg.get_td()->get_matrix(j)));
+			dodgeball_tids[(game_mode == GAME_MODE_DODGEBALL) ? (j%NUM_DB_TIDS) : 0], (in_ammo ? NULL : &objg.get_td()->get_matrix(j)));
 		break;
 	case POWERUP:
 	case HEALTH:
@@ -1078,19 +1078,10 @@ void draw_smiley(point const &pos, vector3d const &orient, float radius, int ndi
 	else { // damaged
 		shader.set_cur_color(colorRGBA(1.0, (0.25 + 0.015*health), 0.0, alpha));
 	}
-	if (game_mode == 2) { // dodgeball
-		select_texture(CAMOFLAGE_TEX);
-	}
-	else {
-		select_smiley_texture(id);
-	}
-	if (mesh) { // main body
-		mesh->draw_perturbed_sphere(all_zeros, radius, ndiv, 1);
-		//if (mesh->size > 0) ndiv = mesh->size;
-	}
-	else {
-		draw_sphere_vbo(all_zeros, radius, ndiv, 1);
-	}
+	if (game_mode == GAME_MODE_DODGEBALL) {select_texture(CAMOFLAGE_TEX);}
+	else {select_smiley_texture(id);}
+	if (mesh) {mesh->draw_perturbed_sphere(all_zeros, radius, ndiv, 1);} // main body
+	else {draw_sphere_vbo(all_zeros, radius, ndiv, 1);}
 	select_no_texture();
 	draw_smiley_part(point(0.0, 0.0, 0.45*radius), orient, SF_HEADBAND, id, 0, ndiv, shader, 1.0, alpha);
 	
@@ -1108,7 +1099,7 @@ void draw_smiley(point const &pos, vector3d const &orient, float radius, int ndi
 		point pos4(0.0, 0.8*radius, -0.4*radius);
 		draw_smiley_part(pos4, orient, SF_TONGUE, id, 0, ndiv2, shader);
 	}
-	if (game_mode == 2 && (sstates[id].p_ammo[W_BALL] > 0 || UNLIMITED_WEAPONS)) { // dodgeball
+	if (game_mode == GAME_MODE_DODGEBALL && (sstates[id].p_ammo[W_BALL] > 0 || UNLIMITED_WEAPONS)) { // dodgeball
 		select_texture(select_dodgeball_texture(id));
 		shader.set_cur_color(mult_alpha(object_types[BALL].color, alpha));
 		draw_cube_mapped_sphere(point(0.0, 1.3*radius, 0.0), 0.8*object_types[BALL].radius, ndiv/2, 1);
@@ -1504,18 +1495,17 @@ void draw_keycard(point const &pos, vector3d const &orient, vector3d const &init
 }
 
 
-colorRGBA get_glowing_obj_color(point const &pos, int time, int lifetime, float &stime, bool shrapnel_cscale, bool fade) {
-
-	stime = ((float)time)/((float)lifetime)*(shrapnel_cscale ? 1.0 : 0.3);
-	if (is_underwater(pos)) stime *= 5.0;
-	stime = min(1.0f, 5.0f*stime);
+colorRGBA get_glow_color(float stime, bool fade) {
 	if (fade) {return colorRGBA(1.0, min(1.0, (2.0 - 2.0*stime)), max(0.0f, (1.0f - 1.5f*stime)), min(1.0, (4.0 - 4.0*stime)));}
 	else      {return colorRGBA((1.0 - 0.9*stime), max(0.0f, (0.9f - 2.0f*stime)), max(0.0f, (0.6f - 4.0f*stime)), 1.0);}
 }
-
-
+colorRGBA get_glowing_obj_color(point const &pos, int time, int lifetime, float &stime, bool shrapnel_cscale, bool fade) {
+	stime = ((float)time)/((float)lifetime)*(shrapnel_cscale ? 1.0 : 0.3);
+	if (is_underwater(pos)) {stime *= 5.0;}
+	stime = min(1.0f, 5.0f*stime);
+	return get_glow_color(stime, fade);
+}
 colorRGBA get_glow_color(dwobject const &obj, bool shrapnel_cscale) {
-
 	float stime;
 	colorRGBA color(get_glowing_obj_color(obj.pos, obj.time, object_types[obj.type].lifetime, stime, shrapnel_cscale, ((obj.flags & TYPE_FLAG) != 0)));
 	if (shrapnel_cscale) {color *= CLIP_TO_01(1.0f - stime);}

@@ -193,7 +193,7 @@ void dwobject::add_obj_dynamic_light(int index) const {
 		break;
 	case BALL: {
 			colorRGBA colors[NUM_DB_TIDS] = {BLUE, colorRGBA(1.0, 0.5, 0.5, 1.0), colorRGBA(0.5, 1.0, 0.5, 1.0)};
-			colorRGBA const color((game_mode == 2) ? colors[index%NUM_DB_TIDS] : colorRGBA(-1.0, -1.0, -1.0, 1.0));
+			colorRGBA const color((game_mode == GAME_MODE_DODGEBALL) ? colors[index%NUM_DB_TIDS] : colorRGBA(-1.0, -1.0, -1.0, 1.0));
 			add_dynamic_light(0.8, pos, color);
 		}
 		break;
@@ -409,8 +409,8 @@ void process_groups() {
 
 			if (obj.status == 0) {
 				if (type == MAT_SPHERE) {remove_mat_sphere(j);}
-				if (gen_count >= app_rate || !(flags & WAS_ADVANCED))      continue;
-				if (type == BALL && (game_mode != 2 || UNLIMITED_WEAPONS)) continue; // not in dodgeball mode
+				if (gen_count >= app_rate || !(flags & WAS_ADVANCED)) continue;
+				if (type == BALL && (game_mode != GAME_MODE_DODGEBALL || UNLIMITED_WEAPONS)) continue; // not in dodgeball mode
 				++gen_count;
 				if (precip && temperature >= WATER_MAX_TEMP) continue; // skip it
 				dwobject new_obj(def_objects[type]);
@@ -531,7 +531,7 @@ void process_groups() {
 						collision_detect_large_sphere(pos, r2, obj_flags);
 					}
 					if (type != CHUNK && (type != LANDMINE || !obj.lm_coll_invalid()) && !(otype.flags & OBJ_NON_SOLID)) {
-						if (type == BALL) {cp.tid = dodgeball_tids[(game_mode == 2) ? (j%NUM_DB_TIDS) : 0];}
+						if (type == BALL) {cp.tid = dodgeball_tids[(game_mode == GAME_MODE_DODGEBALL) ? (j%NUM_DB_TIDS) : 0];}
 						cp.cf_index = j;
 						if (type == MAT_SPHERE) {add_cobj_for_mat_sphere(obj, cp);}
 						else {
@@ -1208,14 +1208,14 @@ int read_coll_obj_file(const char *coll_obj_file, geom_xform_t xf, coll_obj cobj
 	char str[MAX_CHARS] = {0};
 	unsigned line_num(1), npoints(0), indir_dlight_ix(0), prev_light_ix_start(0);
 	int end(0), use_z(0), use_vel(0), ivals[3];
-	float fvals[3] = {}, light_rotate(0.0);
+	float fvals[3] = {}, light_rotate(0.0), model_lod_scale(1.0);
 	point pos(all_zeros);
 	vector3d tv0(zero_vector), vel(zero_vector), light_axis(zero_vector);
 	polygon_t poly;
 	vector<coll_tquad> ppts;
 	// tree state
 	float tree_br_scale_mult(1.0), tree_nl_scale(1.0), tree_height(1.0);
-	bool enable_leaf_wind(1), remove_t_junctions(0), outdoor_shadows(0), dynamic_indir(0), skip_cur_model(0);
+	bool enable_leaf_wind(1), remove_t_junctions(0), outdoor_shadows(0), dynamic_indir(0), skip_cur_model(0), model3d_fit_to_scene(0);
 	int reflective(0); // reflective: 0=none, 1=planar, 2=cube map (applies to cobjs and model3d)
 	typedef map<string, cobj_params> material_map_t;
 	material_map_t materials;
@@ -1280,6 +1280,9 @@ int read_coll_obj_file(const char *coll_obj_file, geom_xform_t xf, coll_obj cobj
 				else if (keyword == "damage") {
 					if (!read_float(fp, cobj.cp.damage)) {return read_error(fp, keyword, coll_obj_file);}
 				}
+				else if (keyword == "model_lod_scale") {
+					if (!read_float(fp, model_lod_scale) || model_lod_scale <= 0.0) {return read_error(fp, keyword, coll_obj_file);}
+				}
 				else if (keyword == "start_cobj_group") {cobj.cgroup_id = cobj_groups.new_group();}
 				else if (keyword == "end_cobj_group") {cobj.cgroup_id = -1;}
 				else if (keyword == "start_draw_group") {cobj.dgroup_id = cdraw_groups.new_group();}
@@ -1301,6 +1304,9 @@ int read_coll_obj_file(const char *coll_obj_file, geom_xform_t xf, coll_obj cobj
 				}
 				else if (keyword == "sensor") {
 					if (!cur_sensor.read_from_file(fp, xf)) {return read_error(fp, keyword, coll_obj_file);}
+				}
+				else if (keyword == "model3d_fit_to_scene") {
+					if (!read_bool(fp, model3d_fit_to_scene)) {return read_error(fp, keyword, coll_obj_file);}
 				}
 				else if (keyword == "transform_array_1d") {
 					unsigned num(0);
@@ -1454,13 +1460,14 @@ int read_coll_obj_file(const char *coll_obj_file, geom_xform_t xf, coll_obj cobj
 				RESET_TIME;
 				
 				if (!read_model_file(fn, (no_cobjs ? nullptr : &ppts), xf, cobj.cp.tid, cobj.cp.color, reflective, cobj.cp.metalness,
-					use_model3d, recalc_normals, model_xf2.group_cobjs_level, (write_file != 0), 1))
+					model_lod_scale, use_model3d, recalc_normals, model_xf2.group_cobjs_level, (write_file != 0), 1))
 				{
 					//return read_error(fp, "model file data", coll_obj_file);
 					cerr << "Error reading model file data from file " << fn << "; Model will be skipped" << endl; // make it nonfatal
 					skip_cur_model = 1;
 					break;
 				}
+				if (model3d_fit_to_scene) {fit_cur_model_to_scene();} // apply translate and scale as a transform before adding the model
 				string const error_str(add_loaded_model(ppts, cobj, xf.scale, has_layer, model_xf2));
 				if (!error_str.empty()) {return read_error(fp, error_str.c_str(), coll_obj_file);}
 				skip_cur_model = 0;
@@ -2108,8 +2115,6 @@ int read_coll_objects(const char *filename) {
 
 
 string texture_str(int tid) {
-
-	//ostringstream oss; oss << tid; return oss.str();
 	if (tid < 0) {return "none";} // or -1
 	assert((unsigned)tid < textures.size());
 	return textures[tid].name;

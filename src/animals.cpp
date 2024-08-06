@@ -42,7 +42,8 @@ class animal_model_loader_t : public model3ds { // currently for fish only
 	model_info_t fish_info, bfly_info[BF_NUM_PARTS];
 
 	model3d &get_model(unsigned id) {
-		assert(id > 0 && id-1 < size()); // Note: id is vector index offset by 1
+		assert(id > 0);
+		assert(id-1 < size()); // Note: id is vector index offset by 1
 		return operator[](id-1);
 	}
 	unsigned load_model(string const &fn, colorRGBA const &def_color=WHITE, int def_tid=-1) {
@@ -50,7 +51,7 @@ class animal_model_loader_t : public model3ds { // currently for fish only
 		bool const write_file    = 0;
 		int const recalc_normals = 0; // okay for loading model3d
 
-		if (!load_model_file(fn, *this, geom_xform_t(), "", def_tid, def_color, 0, 0.0, recalc_normals, 0, write_file, 1)) { // no animations in this model
+		if (!load_model_file(fn, *this, geom_xform_t(), "", def_tid, def_color, 0, 0.0, 1.0, recalc_normals, 0, write_file, 1)) { // no animations in this model
 			cerr << "Error: Failed to read model file '" << fn << "'" << endl;
 			return 0;
 		}
@@ -141,6 +142,8 @@ bool butterfly_t::type_enabled() {return animal_model_loader.load_butterfly_mode
 
 bool fish_t     ::can_place_in_tile(tile_t const *const tile) {return tile->has_water();}
 bool butterfly_t::can_place_in_tile(tile_t const *const tile) {return (!tile->all_water() && tile->has_grass());} // only spawn over grass
+
+bool have_fish_model() {return fish_t::type_enabled();}
 
 
 void animal_t::gen_dir_vel(rand_gen_t &rgen, float speed) {
@@ -405,7 +408,7 @@ bool butterfly_t::update(rand_gen_t &rgen, tile_t const *const tile) {
 	bool check_tree_coll(dist_less_than(cs_pos, get_camera_pos(), (X_SCENE_SIZE + Y_SCENE_SIZE)));
 	
 	// skip building interiors (shouldn't be there) and cars (too slow)
-	if (!skip_coll_check && proc_city_sphere_coll(cs_pos, prev_cs_pos, coll_radius, prev_cs_pos.z, 0, 0, &cnorm, 0)) {
+	if (!skip_coll_check && proc_city_sphere_coll(cs_pos, prev_cs_pos, coll_radius, prev_cs_pos.z, 0, &cnorm, 0)) {
 		pos = cs_pos - get_camera_coord_space_xlate(); // back to world space
 		calc_reflection_angle(dir, dir, cnorm); // reflect
 		dir.normalize();
@@ -515,6 +518,17 @@ int animal_t::get_ndiv(point const &pos_) const {
 	return min(N_SPHERE_DIV, max(3, int(4.0*sqrt(radius*window_width/distance_to_camera(pos_)))));
 }
 
+void draw_animated_fish_model(shader_t &s, vector3d const &pos, float radius, vector3d const &dir, float anim_time, colorRGBA const &color) {
+	if (!s.is_setup()) { // shader not setup; not needed if using lighting shader for fish in buildings
+		s.set_vert_shader("fish_animate");
+		s.set_frag_shader("simple_texture");
+		s.begin_shader();
+		s.add_uniform_float("min_alpha", 0.0);
+		s.add_uniform_int("tex0", 0);
+	}
+	animal_model_loader.draw_fish_model(s, pos, radius, dir, anim_time, color);
+}
+
 void fish_t::draw(shader_t &s, tile_t const *const tile, bool &first_draw) const { // Note: tile is unused, but could be used for shadows
 
 	point const pos_(get_camera_space_pos());
@@ -529,15 +543,7 @@ void fish_t::draw(shader_t &s, tile_t const *const tile, bool &first_draw) const
 	if (draw_color.alpha < 0.01) return;
 	if (draw_color.alpha < 0.1) {glDepthMask(GL_FALSE);} // disable depth writing to avoid alpha blend order problems
 	//draw_color = lerp(cur_fog_color, draw_color, alpha);
-	
-	if (!s.is_setup()) {
-		s.set_vert_shader("fish_animate");
-		s.set_frag_shader("simple_texture");
-		s.begin_shader();
-		s.add_uniform_float("min_alpha", 0.0);
-		s.add_uniform_int("tex0", 0);
-	}
-	animal_model_loader.draw_fish_model(s, pos_, radius, dir, anim_time, draw_color);
+	draw_animated_fish_model(s, pos_, radius, dir, anim_time, draw_color);
 	if (draw_color.alpha < 0.1) {glDepthMask(GL_TRUE);}
 }
 
@@ -550,10 +556,13 @@ void bird_t::draw(shader_t &s, tile_t const *const tile, bool &first_draw) const
 	float const dist(p2p_dist(pos_, get_camera_pos()));
 	float const alpha(CLIP_TO_01(2000.0f*radius/dist - 2.0f)); // 1.0 under half clip distance, after that linear falloff to zero
 	if (alpha < 0.01) return;
-	if (!s.is_setup()) {s.begin_color_only_shader();}
+	
+	if (!s.is_setup()) {
+		s.begin_color_only_shader();
+		bind_draw_sphere_vbo(0, 0); // no textures or normals
+	}
 	s.set_cur_color(colorRGBA(color, alpha));
 	int const ndiv(get_ndiv(pos_));
-	bind_draw_sphere_vbo(0, 0); // no textures or normals
 	fgPushMatrix();
 	translate_to(pos_);
 	rotate_to_plus_x(dir);
@@ -572,7 +581,6 @@ void bird_t::draw(shader_t &s, tile_t const *const tile, bool &first_draw) const
 		fgPopMatrix();
 	}
 	fgPopMatrix();
-	bind_vbo(0);
 }
 
 void butterfly_t::draw(shader_t &s, tile_t const *const tile, bool &first_draw) const {
@@ -670,6 +678,7 @@ template<typename A> void animal_group_t<A>::draw_animals(shader_t &s, tile_t co
 	if (!debug_animal_draw() && !camera_pdu.cube_visible(bcube + get_camera_coord_space_xlate())) return;
 	bool first_draw(1);
 	for (auto i = this->begin(); i != this->end(); ++i) {i->draw(s, tile, first_draw);}
+	bind_vbo(0); // needed for birds, okay for others
 }
 
 // explicit instantiations

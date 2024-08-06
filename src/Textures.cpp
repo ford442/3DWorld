@@ -169,8 +169,8 @@ texture_t(0, 5, 0,    0,    1, 3, 1, "normal_maps/dirt_normal.jpg", 0, 0, 2.0, 1
 texture_t(0, 6, 16,   16,   1, 3, 0, "cyan.png"), // for normal maps
 texture_t(0, 6, 16,   16,   1, 3, 0, "red.png"), // for TT default sand weights texture
 texture_t(0, 5, 0,    0,    1, 3, 1, "hazard_stripes.jpg", 0, 0, 4.0), // 500x500
-texture_t(1, 9, 256,  256,  1, 4, 1, "@windows" , 0, 0, 4.0),  // not real file
-texture_t(1, 9, 256,  256,  1, 4, 1, "@twindows", 0, 0, 4.0),  // not real file
+texture_t(1, 9, 512,  512,  1, 4, 1, "@windows" , 0, 0, 4.0),  // not real file
+texture_t(1, 9, 512,  512,  1, 4, 1, "@twindows", 0, 0, 4.0),  // not real file
 texture_t(0, 6, 0,    0,    1, 3, 1, "keycard.png", 0, 1, 4.0), // 512x512
 // type format width height wrap_mir ncolors use_mipmaps name [invert_y=0 [do_compress=1 [anisotropy=1.0 [mipmap_alpha_weight=1.0 [normal_map=0]]]]]
 };
@@ -219,7 +219,7 @@ void gen_wind_texture();
 void gen_noise_texture();
 void regrow_landscape_texture_amt0();
 void update_lt_section(int x1, int y1, int x2, int y2);
-bool endswith(string const &value, string const &ending);
+unsigned get_building_textures_gpu_mem();
 
 
 bool is_tex_disabled(int i) {
@@ -305,16 +305,20 @@ void load_textures() {
 
 unsigned get_loaded_textures_cpu_mem() {
 	unsigned mem(0);
-	for (auto i = textures.begin(); i != textures.end(); ++i) {mem += i->get_cpu_mem();}
+	for (texture_t const &t : textures) {mem += t.get_cpu_mem();}
 	return mem;
 }
 unsigned get_loaded_textures_gpu_mem() {
-	unsigned mem(0);
-	for (auto i = textures.begin(); i != textures.end(); ++i) {mem += i->get_gpu_mem();}
+	unsigned mem(get_building_textures_gpu_mem());
+	for (texture_t const &t : textures) {mem += t.get_gpu_mem();}
 	return mem;
 }
 void print_texture_memory_usage() { // full cities scene: 142MB / 272MB (660MB uncompressed) (244MB with ALLOW_SLOW_COMPRESS=1)
 	cout << "Texture Memory: " << get_loaded_textures_cpu_mem() << " CPU / " << get_loaded_textures_gpu_mem() << " GPU" << endl;
+}
+void print_texture_stats() {
+	cout << "Textures: " << textures.size() << endl;
+	print_texture_memory_usage();
 }
 
 
@@ -323,8 +327,10 @@ int texture_lookup(string const &name) {
 	return ((it != texture_name_map.end()) ? it->second : -1);
 }
 
-int get_texture_by_name(string const &name, bool is_normal_map, bool invert_y, int wrap_mir, float aniso, bool allow_compress, int use_mipmaps, unsigned ncolors) {
-
+int get_texture_by_name(string const &name, bool is_normal_map, bool invert_y, int wrap_mir, float aniso,
+	bool allow_compress, int use_mipmaps, unsigned ncolors, bool is_alpha_mask)
+{
+	if (name.empty()) return -1; // no texture
 	int const ix(atoi(name.c_str()));
 	if (ix > 0 || ix == -1 || name == "0") return ix; // a number was specified
 	if (name == "none" || name == "null")  return -1; // no texture
@@ -332,14 +338,16 @@ int get_texture_by_name(string const &name, bool is_normal_map, bool invert_y, i
 	if (tid >= 0) {assert((unsigned)tid < textures.size()); return tid;}
 	//timer_t timer("Load Texture " + name);
 	// try to load/add the texture directly from a file: assume it's RGB with wrap and mipmaps
+	assert(omp_get_thread_num_3dw() == 0); // must be serial
 	tid = textures.size();
 	bool const do_compress(allow_compress && def_tex_compress && !is_normal_map);
 	// type format width height wrap_mir ncolors use_mipmaps name [invert_y=0 [do_compress=1 [anisotropy=1.0 [mipmap_alpha_weight=1.0 [normal_map=0]]]]]
-	texture_t new_tex(0, IMG_FMT_AUTO, 0, 0, wrap_mir, ncolors, use_mipmaps, name, invert_y, do_compress, ((aniso > 0.0) ? aniso : def_tex_aniso), 1.0, is_normal_map);
+	texture_t new_tex(0, IMG_FMT_AUTO, 0, 0, wrap_mir, ncolors, use_mipmaps, name, invert_y, do_compress,
+		((aniso > 0.0) ? aniso : def_tex_aniso), 1.0, is_normal_map);
 
 	if (textures_inited) {
 		new_tex.load(tid);
-		if (ncolors == 1 && new_tex.ncolors == 4) {new_tex.fill_to_grayscale_color(255);} // alpha mask - fill color to white
+		if ((is_alpha_mask || ncolors == 1) && new_tex.ncolors == 4) {new_tex.fill_to_grayscale_color(255);} // alpha mask - fill color to white
 		new_tex.init();
 	}
 	textures.push_back(new_tex);
@@ -347,7 +355,7 @@ int get_texture_by_name(string const &name, bool is_normal_map, bool invert_y, i
 	return tid;
 }
 
-unsigned load_cube_map_texture(string const &name) {
+unsigned load_cube_map_texture(string const &name) { // used for sky boxes
 
 	// Rather than specify each of the 6 textures (one per side), we're going to specify the top texture and try to guess the names of the others
 	// There doesn't seem to be any well defined specs for which face corresponds to which direction, other than that Y is up (vs. Z being up in 3DWorld),
@@ -371,7 +379,11 @@ unsigned load_cube_map_texture(string const &name) {
 		std::cerr << "Expecting cube map texture filename to end with 'top' or 'up': " << prefix << endl;
 		return 0;
 	}
-	//for (unsigned n = 0; n < 6; ++n) {cout << names[n] << endl;}
+	for (unsigned n = 0; n < 6; ++n) {
+		if (check_texture_file_exists(names[n])) continue;
+		std::cerr << "Error: Failed to load cube map texture '" << names[n] << "'; Skipping file '" << name << "'" << endl;
+		return 0; // fails if any of the cube side textures don't exist
+	}
 	unsigned tid(0), tex_size(0);
 	bool const allocate(0), use_mipmaps(0), do_compress(1);
 	setup_cube_map_texture(tid, tex_size, allocate, use_mipmaps, 1.0);
@@ -390,25 +402,26 @@ unsigned load_cube_map_texture(string const &name) {
 
 void check_init_texture(int id, bool free_after_upload) {textures[id].check_init(free_after_upload);}
 
-bool select_texture(int id) {
-
+bool select_texture(int id, unsigned tu_id) {
 	bool const no_tex(id < 0);
 	if (no_tex) {id = WHITE_TEX;} //glBindTexture(GL_TEXTURE_2D, 0); // bind to none
 	assert((unsigned)id < textures.size());
 	bool const free_after_upload(no_store_model_textures_in_memory && id >= NUM_PREDEF_TEXTURES); // free textures loaded by name only
 	check_init_texture(id, free_after_upload);
-	textures[id].bind_gl();
+	textures[id].bind_gl(tu_id);
 	return !no_tex;
 }
 
+void bind_texture_tu_def_white_tex(unsigned tid, unsigned tu_id) {
+	if (tid == 0) {select_texture(WHITE_TEX, tu_id);}
+	else {bind_texture_tu(tid, tu_id);}
+}
 
 float get_tex_ar(int id) {
-
 	if (id < 0) return 1.0;
 	texture_t const &texture(get_texture_by_id(id));
 	return (((double)texture.width)/((double)texture.height));
 }
-
 
 void free_textures() {
 	for (unsigned i = 0; i < textures.size(); ++i) {textures[i].gl_delete();}
@@ -473,9 +486,9 @@ void texture_t::alloc() {
 	}
 }
 
-void texture_t::bind_gl() const {
+void texture_t::bind_gl(unsigned tu_id) const {
 	assert(tid > 0);
-	bind_2d_texture(tid);
+	bind_texture_tu(tid, tu_id);
 }
 GLuint64 texture_t::get_bindless_handle(bool make_resident) const {
 	assert(tid > 0);
@@ -776,7 +789,6 @@ void texture_t::fix_word_alignment() {
 	//if (ncolors == 3) {write_to_jpg("textures\\"+name);} // auto-update of resized textures
 }
 
-
 void texture_t::add_alpha_channel() {
 
 	if (ncolors == 4) return; // alread has an alpha channel
@@ -795,6 +807,18 @@ void texture_t::add_alpha_channel() {
 	data = new_data;
 }
 
+void texture_t::expand_grayscale_to_rgb() {
+
+	if (is_16_bit_gray) return; // 16-bit RGBA not supported; error?
+	if (ncolors != 1  ) return; // not grayscale
+	assert(is_allocated());
+	unsigned const npixels(num_pixels());
+	ncolors = 3; // make RGBA
+	unsigned char *new_data(new unsigned char[num_bytes()]);
+	for (unsigned i = 0; i < npixels; ++i) {UNROLL_3X(new_data[3*i+i_] = data[i];);}
+	free_data();
+	data = new_data;
+}
 
 void texture_t::resize(int new_w, int new_h) { // Note: not thread safe
 
@@ -818,7 +842,6 @@ void texture_t::resize(int new_w, int new_h) { // Note: not thread safe
 	height = new_h;
 }
 
-
 bool texture_t::try_compact_to_lum() {
 
 	if (!CHECK_FOR_LUM || ncolors != 3) return 0;
@@ -829,7 +852,7 @@ bool texture_t::try_compact_to_lum() {
 	for (unsigned i = 0; i < npixels && is_lum; ++i) {is_lum &= (data[3*i+1] == data[3*i] && data[3*i+2] == data[3*i]);}
 	if (!is_lum) return 0;
 	// RGB equal, make it a single color (luminance) channel
-	ncolors = 1; // add alpha channel
+	ncolors = 1; // make luminance
 	unsigned char *new_data(new unsigned char[num_bytes()]);
 	for (unsigned i = 0; i < npixels; ++i) {new_data[i] = data[3*i];}
 	free_data();
@@ -1175,14 +1198,14 @@ void gen_building_window_texture(float width_frac, float height_frac) { // Note:
 		assert(height_frac > 0.0 && height_frac < 1.0);
 		float const xspace(0.5*(1.0 - width_frac)), yspace(0.5*(1.0 - height_frac));
 		int const w1(round_fp(xspace*tex.width)), w2(round_fp((1.0 - xspace)*tex.width)), h1(round_fp(yspace*tex.height)), h2(round_fp((1.0 - yspace)*tex.height));
-		int const border(8 + n), w1b(w1 - border), w2b(w2 + border), h1b(h1 - border), h2b(h2 + border); // window borders
+		int const border(tex.width/32 + n), w1b(w1 - border), w2b(w2 + border), h1b(h1 - border), h2b(h2 + border); // window borders
 
 		for (int i = 0; i < tex.height; ++i) {
 			for (int j = 0; j < tex.width; ++j) {
 				int const offset(4*(i*tex.width + j));
 				bool const pane(i > h1 && i <= h2 && j > w1 && j <= w2), frame(i > h1b && i <= h2b && j > w1b && j <= w2b);
 				unsigned char luminance(pane ? 128 : 255); // gray for window, white for border
-				UNROLL_3X(tex_data[offset+i_] = luminance;) // white
+				UNROLL_3X(tex_data[offset+i_] = luminance;)
 				tex_data[offset+3] = (frame ? ((!pane || n==0) ? 255 : 32) : 0); // alpha: partially transparent inside window, opaque border, and transparent outside
 			}
 		}
@@ -1903,21 +1926,17 @@ vector2d get_billboard_texture_uv(point const *const points, point const &pos) {
 
 
 bool is_billboard_texture_transparent(point const *const points, point const &pos, int tid) {
-
 	vector2d const uv(get_billboard_texture_uv(points, pos));
 	return (get_texture_component(tid, uv.x, uv.y, 3) == 0.0);
 }
 
-
 void ensure_texture_loaded(unsigned &tid, unsigned txsize, unsigned tysize, bool mipmap, bool nearest, bool multisample) { // used with texture_pair_t/render-to-texture RGBA
-
 	assert(txsize > 0 && tysize > 0);
 	if (tid) return; // already created
 	setup_texture(tid, mipmap, 0, 0, 0, 0, nearest, 1.0, 0, multisample);
 	if (multisample) {glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, NUM_TEX_MS_SAMPLES, GL_RGBA8, txsize, tysize, false);}
 	else {glTexImage2D(get_2d_texture_target(0, multisample), 0, GL_RGBA8, txsize, tysize, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);}
 }
-
 
 void build_texture_mipmaps(unsigned tid, unsigned dim) {
 	bind_2d_texture(tid);
@@ -1929,21 +1948,15 @@ void texture_pair_t::free_context() {
 	free_texture(tids[0]);
 	free_texture(tids[1]);
 }
-
 void texture_pair_t::bind_texture() const {
-
 	assert(is_valid());
-	bind_2d_texture(tids[0], 0, multisample);
-	set_active_texture(1);
-	bind_2d_texture(tids[1], 0, multisample);
-	set_active_texture(0);
+	bind_texture_tu(tids[0], 0);
+	bind_texture_tu(tids[1], 1);
 }
-
 void texture_pair_t::ensure_tid(unsigned tsize, bool mipmap) {
 	ensure_texture_loaded(tids[0], tsize, tsize, mipmap, 0, multisample); // color
 	ensure_texture_loaded(tids[1], tsize, tsize, mipmap, 0, multisample); // normal
 }
-
 
 void texture_atlas_t::free_context() {free_texture(tid);}
 
@@ -1951,7 +1964,6 @@ void texture_atlas_t::bind_texture() const {
 	assert(tid);
 	bind_2d_texture(tid, 0, multisample);
 }
-
 void texture_atlas_t::ensure_tid(unsigned base_tsize, bool mipmap) {
 	assert(nx > 0 && ny > 0);
 	ensure_texture_loaded(tid, nx*base_tsize, ny*base_tsize, mipmap, 0, multisample);

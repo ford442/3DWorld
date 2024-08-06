@@ -57,6 +57,7 @@ extern bool player_autopilot, player_auto_stop, player_enemy, regen_uses_credits
 extern int frame_counter, iticks, onscreen_display, display_mode, animate2;
 extern float fticks, urm_proj, global_regen, ship_build_delay, hyperspeed_mult, player_turn_rate, rand_spawn_ship_dmax;
 extern unsigned alloced_fobjs[], team_credits[], init_credits[], ind_ships_used[];
+extern string player_killer;
 extern exp_type_params et_params[];
 extern vector<free_obj const *> a_targets, attackers;
 extern vector<ship_explosion> exploding;
@@ -528,7 +529,7 @@ void u_ship::acquire_target(float min_dist) {
 				retarg_time = RETARG_DELAY;
 				
 				if (target_obj->is_player_ship() && target_obj != parent) {
-					send_warning_message(string("Enemy Ship Detected: ") + get_name());
+					send_warning_message((string("Enemy Ship Detected: ") + get_name()), 1); // no_duplicate=1
 				}
 			}
 			if (target_obj != NULL && target_mode == TARGET_LAST) {target_set = 1;}
@@ -1352,7 +1353,7 @@ void u_ship::ai_fire(vector3d const &targ_dir, float target_dist, float min_dist
 			if (tdist > range) continue; // out of range
 		}
 		if (!weap_turret(sw.wclass) && bad_angle(d_angle, target_dist, sw.wclass)) { // target not aligned
-			default_next_weap = w; // if the only useable weapon is unaligned, then make this the next cur_weapon so that we can align ourselves next frame
+			default_next_weap = w; // if the only usable weapon is unaligned, then make this the next cur_weapon so that we can align ourselves next frame
 			continue;
 		}
 		if (uw.is_beam) {
@@ -1362,8 +1363,11 @@ void u_ship::ai_fire(vector3d const &targ_dir, float target_dist, float min_dist
 			if (bwp.mind_control && alignment != ALIGN_NEUTRAL && alignment == target_obj->get_align()) continue; // don't mind control a friendly
 			if (uw.damage == 0.0 && uw.force != 0.0 && !bwp.mind_control && target_obj->is_orbiting())  continue; // tractor beam on immovable ship
 		}
+		else if (uw.def_ammo > 0 && is_orbiting() && target_obj->is_orbiting()) { // ammo-using projectile fired between two orbiting ships (defsat, AMD, starbase, colony)
+			// TODO: may need to track hit rate and stop firing missiles if the target's point defenses keep shooting them down
+		}
 		good_weapons.push_back(w); // acceptable weapon
-	}
+	} // for i
 	if (good_weapons.empty()) { // no weapon for the given range, etc.
 		curr_weapon = default_next_weap;
 		return;
@@ -1399,7 +1403,7 @@ void u_ship::ai_fire(vector3d const &targ_dir, float target_dist, float min_dist
 		value *= 1.0 + 0.5*uw.no_coll; // can hit multiple targets and can't be destroyed easily
 		value *= sw.wcount;
 		if (value >= min_value) wchoices.push_back(make_pair(-value, good_weapons[i])); // want largest to smallest so negate w
-	}
+	} // for i
 	if (wchoices.empty()) return; // probably won't get here
 	sort(wchoices.begin(), wchoices.end());
 	bool fired_secondary(0);
@@ -1433,7 +1437,7 @@ void u_ship::ai_fire(vector3d const &targ_dir, float target_dist, float min_dist
 		//cout << weap.name << " " << target_obj->get_name() << endl; // testing
 		if (target_dist < TOLERANCE || fire_dir.mag() < TOLERANCE) continue; // not sure how we can get here
 		fire_weapon(fire_dir, target_dist);
-	}
+	} // for i
 	curr_weapon = wchoices[0].second; // reset back to first
 }
 
@@ -1612,7 +1616,7 @@ bool u_ship::fire_weapon(vector3d const &fire_dir, float target_dist) {
 					if (fobj != NULL && !fobj->invalid()) { // can query projectiles for now
 						string msg;
 						if (target) {msg = string("Target Acquired: ") + fobj->get_name();}
-						else {msg = fobj->get_name() + "\n" + fobj->get_info() + "  Dist: " + make_string(li_data.dist);}
+						else {msg = fobj->get_name() + "\n" + fobj->get_info() + "  Dist: " + std::to_string(li_data.dist);}
 						print_text_onscreen(msg, PURPLE, 0.5, TICKS_PER_SECOND, 1);
 
 						if (target && fobj->is_target() && target_valid(fobj)) {
@@ -1621,7 +1625,7 @@ bool u_ship::fire_weapon(vector3d const &fire_dir, float target_dist) {
 						}
 					}
 					else if (sobj != NULL) {
-						string const msg(sobj->get_name() + " at distance " + make_string(li_data.dist) + "\n" + sobj->get_info());
+						string const msg(sobj->get_name() + " at distance " + std::to_string(li_data.dist) + "\n" + sobj->get_info());
 						print_text_onscreen(msg, PURPLE, 0.5, TICKS_PER_SECOND, 1);
 					}
 				}
@@ -2103,7 +2107,11 @@ bool u_ship::capture_ship(u_ship *ship, bool add_as_fighter) { // this captures 
 	assert(ship != NULL && ship != this);
 	free_obj const *const old_parent(ship->parent);
 	bool const player(ship->is_player_ship());
-	if (player) destroy_player_ship(1);
+	
+	if (player) {
+		player_killer = get_name();
+		destroy_player_ship(1);
+	}
 	register_damage(sclass, ship->sclass, WCLASS_CAPTURE, (ship->get_shields() + ship->get_armor()), alignment, ship->get_align(), 1); // counts as a kill
 	acknowledge_kill(); // counts as a kill
 	ship->register_destruction(this); // counts as destroying the ship
@@ -2432,7 +2440,7 @@ float u_ship::damage(float val, int type, point const &hit_pos, free_obj const *
 	bool const friendly(source == this || ((type == DAMAGE_COLL || alignment == ALIGN_PLAYER) && src_align == alignment)); // accidental collision, etc.
 	bool const attack(!friendly && (wc != WCLASS_EXPLODE || (source && source->hostile_explode())) &&
 		(wc != WCLASS_HEAT || (source && source->is_ship())) && register_attacker(source));
-	if (attack && wc != WCLASS_COLLISION && is_player_ship()) send_warning_message("Under Attack");
+	if (attack && wc != WCLASS_COLLISION && is_player_ship()) {send_warning_message("Under Attack");}
 	
 	if (!ignores_shields) { // determine damage absorbed by shields
 		if (shields >= val) {
@@ -2459,6 +2467,7 @@ float u_ship::damage(float val, int type, point const &hit_pos, free_obj const *
 	if (attack) {register_destruction(source);}
 	// Note: we may need to increment kills and tot_kills here, which means that source can't be const, so we have to cast it to const; is it better to make kills mutable?
 	if (source) {const_cast<free_obj *>(source)->acknowledge_kill();}
+	if (is_player_ship()) {player_killer = (source ? source->get_name() : "");}
 	acknowledge_death();
 	destroy_ship(val);
 	return damage_amt;
@@ -2773,8 +2782,7 @@ void u_ship::draw_obj(uobj_draw_data &ddata) const { // front is in -z
 			fgPushMatrix();
 			set_additive_blend_mode();
 			set_std_depth_func_with_eq();
-			// FIXME: disable alpha testing to avoid artifacts at the shields boundary? but then we have potential alpha sort order problems
-			//ddata.shader->add_uniform_float("min_alpha", -1.0);
+			glDepthMask(GL_FALSE); // disable depth write
 			assert(last_hit <= SHIELDS_TIME);
 			colorRGBA color_alpha(disabled() ? YELLOW : GREEN);
 			color_alpha.alpha = (0.5*last_hit)*min(1.0, 2.5*shields/get_max_shields())/SHIELDS_TIME; // decrease at 40% shields
@@ -2800,8 +2808,9 @@ void u_ship::draw_obj(uobj_draw_data &ddata) const { // front is in -z
 			assert(radius > 0.0);
 			emissive_shader.enable();
 			ddata.set_color(color_alpha);
-			draw_sphere_vbo_back_to_front(all_zeros, ssize, 3*ndiv/2, has_hit_dir); // partial sphere?
+			draw_sphere_vbo_back_to_front(all_zeros, ssize, min(48, 3*ndiv/2), has_hit_dir); // partial sphere?
 			glDisable(GL_CULL_FACE);
+			glDepthMask(GL_TRUE);
 			set_std_depth_func();
 			set_std_blend_mode();
 			ddata.shader->enable();

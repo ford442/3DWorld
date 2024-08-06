@@ -74,6 +74,8 @@ inline float get_pos_fract(float v) {
 inline float extract_low_bits_01 (float v, float m) {return     get_pos_fract(m*v)      ;}
 inline float extract_low_bits_pm1(float v, float m) {return 2.0*get_pos_fract(m*v) - 1.0;}
 
+inline unsigned in_mb(uint64_t v) {return v/1024/1024;}
+
 
 // ***************** RANDOM NUMBER GENERATION ********************
 
@@ -501,15 +503,12 @@ inline void fix_fp_mag(float &v) {
 inline bool point_outside_mesh(int xpos, int ypos) {
 	return (xpos < 0 || ypos < 0 || xpos >= MESH_X_SIZE || ypos >= MESH_Y_SIZE);
 }
-
 inline bool point_interior_to_mesh(int xpos, int ypos) {
 	return (xpos > 0 && ypos > 0 && xpos < MESH_X_SIZE-1 && ypos < MESH_Y_SIZE-1);
 }
-
 inline bool is_over_mesh(point const &pos) { // always over mesh in tiled terrain mode
 	return (world_mode == WMODE_INF_TERRAIN || (pos.x > -X_SCENE_SIZE && pos.x < X_SCENE_SIZE && pos.y > -Y_SCENE_SIZE && pos.y < Y_SCENE_SIZE));
 }
-
 
 inline bool check_line_clip(point const &v1, point const &v2, float const d[3][2]) {
 	float tmin, tmax;
@@ -519,13 +518,10 @@ inline bool check_line_clip_xy(point const &v1, point const &v2, float const d[3
 	float tmin, tmax;
 	return get_line_clip_xy(v1, v2, d, tmin, tmax);
 }
-
 inline bool do_line_clip_scene(point &v1, point &v2, float z1, float z2) {
-
 	float const d[3][2] = {{-X_SCENE_SIZE, X_SCENE_SIZE}, {-Y_SCENE_SIZE, Y_SCENE_SIZE}, {z1, z2}};
 	return do_line_clip(v1, v2, d);
 }
-
 
 inline int get_region(point const &v, float const d[3][2]) {
 	int region(0);
@@ -534,13 +530,13 @@ inline int get_region(point const &v, float const d[3][2]) {
 	if (v.z < d[2][0]) {region |= 0x10;} else if (v.z >= d[2][1]) {region |= 0x20;}
 	return region;
 }
-
 inline int get_region_xy(point const &v, float const d[3][2]) {
 	int region(0);
 	if (v.x < d[0][0]) {region |= 0x01;} else if (v.x >= d[0][1]) {region |= 0x02;}
 	if (v.y < d[1][0]) {region |= 0x04;} else if (v.y >= d[1][1]) {region |= 0x08;}
 	return region;
 }
+inline bool region_in_corner(unsigned const r) {return (r==5 || r==9 || r==6 || r==10);}
 
 
 // ****************** MISC GL ************************
@@ -754,20 +750,18 @@ template<typename T> void remove_element(vector<T> &v, unsigned &ix) {
 
 template<typename S, typename T> void vector_add_to(S const &src, T &dest) {dest.insert(dest.end(), src.begin(), src.end());}
 
-template<typename T> void sort_and_unique(T &v) {
-	std::sort(v.begin(), v.end());
+template<typename T> void unique_cont(T &v) {
 	v.erase(std::unique(v.begin(), v.end()), v.end());
 }
-
-// string converters
-
-template<typename T> inline std::string make_string(T const val) {
-	std::ostringstream oss;
-	oss << val;
-	return oss.str();
+template<typename T> void sort_and_unique(T &v) {
+	std::sort(v.begin(), v.end());
+	unique_cont(v);
 }
 
 template<typename T> void set_bit_flag_to(T &flags, unsigned mask, bool val) {
 	if (val) {flags |= mask;} else {flags &= ~mask;}
 }
+
+
+inline void bind_default_flat_normal_map() {select_texture(FLAT_NMAP_TEX, 5);}
 

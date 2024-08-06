@@ -7,10 +7,10 @@
 
 using std::string;
 
-unsigned const TEX0_S_ATTR       = 0;
-unsigned const TEX0_T_ATTR       = 1;
-unsigned const TANGENT_ATTR      = 2;
-unsigned const NUM_SHADER_TYPES  = 6;
+unsigned const TEX0_S_ATTR  = 0;
+unsigned const TEX0_T_ATTR  = 1;
+unsigned const TANGENT_ATTR = 2;
+enum {SHADER_TYPE_VERT=0, SHADER_TYPE_FRAG, SHADER_TYPE_GEOM, SHADER_TYPE_TESC, SHADER_TYPE_TESE, SHADER_TYPE_COMP, NUM_SHADER_TYPES};
 
 #define make_shader_bool_prefix(name, val) ((val) ? ("const bool " name " = true;") : ("const bool " name " = false;"))
 
@@ -83,7 +83,6 @@ class shader_t : public property_map_t {
 	};
 	typedef map<unsigned, subroutine_val_t> subroutine_map_t;
 	subroutine_map_t subroutines;
-	property_map_t property_map;
 	unsigned user_flags;
 
 	int pm_loc, mvm_loc, mvmi_loc, mvpm_loc, nm_loc; // matrices
@@ -122,6 +121,7 @@ public:
 	void end_shader();
 	void begin_color_only_shader();
 	void begin_color_only_shader(colorRGBA const &color);
+	void begin_shadow_map_shader(bool use_alpha_mask=0, bool enable_xlate_scale=0);
 	void begin_simple_textured_shader(float min_alpha=0.0, bool include_2_lights=0, bool use_texgen=0, colorRGBA const *const color=NULL);
 	void begin_untextured_lit_glcolor_shader();
 
@@ -324,8 +324,6 @@ struct tile_blend_tex_data_t {
 	void clear_context();
 };
 
-
-unsigned get_vao_for_vbo(unsigned vbo, shader_t const *shader=nullptr);
-void bind_vao_for_vbo(unsigned vbo, shader_t const *shader=nullptr);
 void set_one_texture(shader_t &s, unsigned tid, unsigned tu_id, const char *const name);
+void setup_shader_underwater_atten(shader_t &s, float atten_scale, float mud_amt=0.0);
 

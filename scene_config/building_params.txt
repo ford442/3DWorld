@@ -14,10 +14,18 @@ buildings open_door_prob   0.75 # usually open
 buildings locked_door_prob 0.50 # fraction of closed doors that are locked
 buildings basement_prob_house  0.5
 buildings basement_prob_office 0.75
+buildings basement_water_level_min -0.5 # < 0.0 has a chance of no water
+buildings basement_water_level_max 1.1 # flooded a bit onto the floor above
 buildings ball_prob 0.6 # set to 1.0 for testing of balls
+buildings split_stack_floorplan_prob 0.0
+buildings retail_floorplan_prob 0.5
+buildings two_floor_retail_prob 0.5
 buildings add_office_basements 1
 buildings max_ext_basement_hall_branches 4
 buildings max_ext_basement_room_depth 4
+buildings max_room_geom_gen_per_frame 10 # >= 1; 1 is smoothest framerate but slower updating
+buildings add_office_backroom_basements 1
+buildings put_doors_in_corners 0 # more representative of real buildings, but changes a lot of buildings and doesn't always work
 
 buildings min_altitude 0.05 # slightly above sea level
 buildings max_altitude 4.00 # same for all buildings
@@ -25,6 +33,6 @@ buildings max_altitude 4.00 # same for all buildings
 buildings enable_people_ai 1
 buildings enable_rotated_room_geom 1
 
-buildings max_shadow_maps 60
+buildings max_shadow_maps 64 # I recommend not setting this larger than 64
 
 no_store_model_textures_in_memory 1 # Note: saves CPU side memory

@@ -2,6 +2,8 @@
 ![CODE SIZE](https://img.shields.io/github/languages/code-size/fegennari/3DWorld.svg) 
 ![License](https://img.shields.io/github/license/fegennari/3DWorld.svg)
 
+3DWorld Blog: https://3dworldgen.blogspot.com
+
 3DWorld is a cross-platform OpenGL-based 3D Game Engine that I've been working on since I took the CS184 computer graphics course at UC Berkeley in 2001.
 It has the following features:
 * 3D graphics functions, classes, and wrappers around OpenGL
@@ -72,16 +74,16 @@ These files are too large to store in the git repo. I've attempted to have 3DWor
 Many of the larger models can be found at the McGuire Computer Graphics Archive:
 http://casual-effects.com/data/
 
-I've packaged up the 3D models that are too large for the GitHub repo and put them on Google Drive here (up to v4 now):
-https://drive.google.com/file/d/1_IlKL2sJkkL--BonPrGPgNbdVJkMHiWT/view?usp=sharing
+I've packaged up the 3D models that are too large for the GitHub repo and put them on Google Drive here (up to v6 now):
+https://drive.google.com/file/d/1crN9rqT-LSvYyTZTw5wtkhwsubE651ex/view?usp=sharing
 Some of these models are stored in 3DWorld's internal format and should not be reused in other projects. Others come from websites such as Mixamo.
 
 System requirements:
-* Windows 7/8/10 (Runs on Windows 7, but I've only built on 8 and 10). Linux when using the makefile with gcc.
+* Windows 7/8/10/11 (Runs on Windows 7, but I've only built on 8, 10, and 11). Linux when using the makefile with gcc.
 * Microsoft Visual Studio 2019 or 2022. The professional or community version is needed for OpenMP support. You can also try to use gcc on linux.
 * A relatively new generation of Nvidia or ATI GPU (Runs on my laptop with Intel graphics, but at 12-20 FPS)
-* At least 4GB system memory for the larger scenes; My GPU has 8GB of memory
-* At least 4GB GPU memory for the larger scenes
+* At least 4GB system memory for the larger scenes
+* At least 4GB GPU memory for the larger scenes; My GPU has 12GB of memory
 
 Troubleshooting:
 It seems like some systems require an OpenGL core context. This can be selected by adding "use_core_context 1" in the config file.
@@ -114,9 +116,25 @@ If you would like to use something here for your project, please let me know.
 
 There is no further documentation for 3DWorld.
 However, I do have a blog that includes descriptions of the algorithms and lots of screenshots:
-https://3dworldgen.blogspot.com/
+https://3dworldgen.blogspot.com
 
 Here are some screenshots linked from my blog:
+
+![alt text](https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiDYcHMxI8d4EmqEt_R9zwbcmtk0wfCadahSXeP3xZU9SdXGkMqMAcFVxMMlcOvDRh7Lg5KhEjgosmId9HtHdtuErQd0okK7Vb7IU0RHeKpONDTc887BDIgWeuR8E0dHChU-vKQxkdnjWzaRLGSWBjmIa3O7z6PYR9v-j4oNYpuOzD9PJcv4XR-45YJYghK/w640-h360/racks1.jpg)
+
+Here is a retail area of a building with racks of shelves. Buildings can contain tens of thousands of interactive objects the player can take and carry around. (config_heightmap.txt)
+
+![alt text](https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEgI1KwsSM00BSkCWUr5OPrXMg5lsjeKk7GOPFdmGkk1NsHlYv4w-StMW8NJKZMHpRt3EoriqCyjD0xRM2E2BqLSBX5zts36VHn8s6TEuQCuhHFq6sFzLyqWSdOxroqB_37utAtB8nN0soiLp-cVFJwnL8VHyBdNNupxdF3HbjmtDdPm4-clTvTquk_JgOYK/w640-h360/sec_monitors_no_base.jpg)
+
+Cameras placed in other rooms show realtime video feeds on security monitors. (config_heightmap.txt)
+
+![alt text](https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEgUaakhysxiViFwntixF7D2F_FAOnU6mnm6A6jIkpdVrLmu5aW80dFXJ6pTiWWUcoamsLy44aPl3aZtM5QgwLDQxk2LpoGvy03TMAW0jlOr7bpNsoI-en8TXIJDjxkGhgIxhq1yFvRfq5xeYX1ElEK_kIUMt-Fsw9SaT_ap7tpNVXwrxLpJ5b9nCB-rruWz/w640-h338/zombie_pool_party.jpg)
+
+Zombies (with path finding and other AI behaviors) walking around and falling into an indoor pool. The water water surface has ripples, splashes, reflections, and refractions. (config_heightmap.txt)
+
+![alt text](https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEjtYUsFpkEeENoYmiyj0tWBJY-vAOfBhisVfK6GRhA5IZlprB0MgQ9KgyxecHigRF9gm5kiR4ADcH0LvxUdFrOtV1YsUYfeF1eYmWJF76vvUa-_LjyDcQlo80Q9ReNcfeSSLJ-kRMVGILU3zMBBXla_8ph0fcRV8DKJJwU1NdH0s5tgLPLDQ5wFe-JikA/w640-h360/sprinklers_with_cars_and_indir.jpg)
+
+Parking garage with parked cars and sprinkler pipes routed on the ceiling. (config_heightmap.txt)
 
 ![alt text](https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEgbKNuwYqJV9LSFC7hg18_yb76dG9JecG74WqLQs7ZMiS0sXTyJO6k7RbDpoQWH09-gh3eJrN4jabU64DvspqLeZvT1Uvfp87dbF2CKsK-KRDtsE4skVYHW2dcWC1POaIsy3ANCZj-BONgOFuIJtqCP1GcFCLSjt827q8OUnAnbKu_KTN4_iaBlEGQuWA/s1920/basement_indir_pipes.jpg)
 

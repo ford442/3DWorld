@@ -21,6 +21,7 @@ unsigned const GRAV_CHECK_MOD = 4; // must be a multiple of 2
 
 
 float last_temp(-100.0);
+string player_killer;
 s_object clobj0; // closest object to player
 pos_dir_up player_pdu;
 cobj_vector_t const empty_cobjs; // always empty
@@ -640,10 +641,15 @@ void draw_universe_sun_flare() {
 }
 
 
-void send_warning_message(string const &msg) {
+void send_warning_message(string const &msg, bool no_duplicate) {
 
 	static int last_warning_tfticks(0);
+	static string last_msg;
 	
+	if (no_duplicate) {
+		if (msg == last_msg) return;
+		last_msg = msg;
+	}
 	if ((tfticks - last_warning_tfticks) > 5.0*TICKS_PER_SECOND) {
 		print_text_onscreen(msg.c_str(), RED, 1.0, 1.0*TICKS_PER_SECOND, 1);
 		gen_sound(SOUND_ALERT, get_player_pos2(), 0.75);
@@ -664,7 +670,9 @@ void destroy_player_ship(bool captured) {
 
 	if (player_ship().is_resetting()) return; // already destroyed
 	do_run = 0;
-	print_text_onscreen((captured ? "Ship Captured" : "Ship Destroyed"), RED, 1.2, 2*TICKS_PER_SECOND, 2);
+	string msg(captured ? "Ship Captured" : "Ship Destroyed");
+	if (!player_killer.empty()) {msg += " by " + player_killer;}
+	print_text_onscreen(msg, RED, 1.2, 2*TICKS_PER_SECOND, 2);
 	add_camera_filter(colorRGBA(1.0, 0.0, 0.0, 0.6), 8, -1, CAM_FILT_DAMAGE);
 	if (!captured) gen_sound(SOUND_EXPLODE, get_player_pos2());
 	player_ship().reset_after(TICKS_PER_SECOND);
@@ -725,6 +733,7 @@ void exec_universe_text(string const &text) {
 	if (text[0] != '.') return; // not a command
 	
 	if (text == ".self-destruct") {
+		player_killer = "Self Destruct";
 		destroy_player_ship(0);
 		return;
 	}

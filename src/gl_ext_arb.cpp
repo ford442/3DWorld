@@ -24,8 +24,8 @@ void init_glew() {
 		exit(1);
 	}
 #endif
-	if (!glewIsSupported("GL_VERSION_3_3")) {
-		std::cerr << "Error: GL version 3.3 not found" << endl;
+	if (!glewIsSupported("GL_VERSION_4_5")) {
+		std::cerr << "Error: GL version 4.5 not found" << endl;
 		exit(1);
 	}
 }
@@ -41,27 +41,10 @@ GLenum get_internal_texture_format(int ncolors, bool compressed, bool linear_spa
 }
 
 
-// ***************** MULTITEXTURING *****************
-
-unsigned const MAX_MULTITEX = 32; // max is GL_TEXTURE31
-
-
-void set_active_texture(unsigned tu_id) {
-	assert(tu_id < MAX_MULTITEX); // Note: Assumes textures are defined sequentially
-	glActiveTexture((GL_TEXTURE0 + tu_id));
-}
-
-void select_multitex(int id, unsigned tu_id, bool reset) {
-	set_active_texture(tu_id);
-	select_texture(id);
-	if (reset) {set_active_texture(0);}
-}
-
-void bind_texture_tu(unsigned tid, unsigned tu_id, bool is_cube_map) {
+void bind_texture_tu(unsigned tid, unsigned tu_id) {
 	assert(tid);
-	set_active_texture(tu_id);
-	if (is_cube_map) {bind_cube_map_texture(tid);} else {bind_2d_texture(tid);}
-	set_active_texture(0);
+	assert(tu_id < 32); // max is GL_TEXTURE31; too strict?
+	glBindTextureUnit(tu_id, tid);
 }
 
 
@@ -109,13 +92,6 @@ void update_3d_texture(unsigned tid, unsigned xoff, unsigned yoff, unsigned zoff
 {
 	bind_3d_texture(tid);
 	glTexSubImage3D(GL_TEXTURE_3D, 0, xoff, yoff, zoff, xsz, ysz, zsz, get_texture_format(ncomp), GL_UNSIGNED_BYTE, data);
-}
-
-void set_3d_texture_as_current(unsigned tid, unsigned tu_id) { // end with active tu_id = 0
-
-	set_active_texture(tu_id);
-	bind_3d_texture(tid);
-	if (tu_id != 0) {set_active_texture(0);}
 }
 
 
@@ -177,6 +153,14 @@ void upload_ubo_sub_data(void const *const data, int offset, size_t size) {
 }
 void upload_ubo_data(void const *const data, size_t size, int dynamic_level) {
 	glBufferData(GL_UNIFORM_BUFFER, size, data, mode_from_dynamic_level(dynamic_level));
+}
+
+void ubo_wrap_t::allocate_with_size(unsigned size, int dynamic_level) {
+	if (ubo_valid()) return; // already created, assumed at the correct size
+	ubo = create_vbo();
+	check_bind_ubo(ubo);
+	upload_ubo_data(nullptr, size, dynamic_level);
+	bind_ubo(0); // optional?
 }
 
 
@@ -242,9 +226,25 @@ void const *vbo_ring_buffer_t::add_verts_bind_vbo(void const *const v, unsigned 
 
 // ***************** FBOs *****************
 
+void bind_fbo_texture(unsigned fbo_id, unsigned tid, bool is_depth_fbo, bool multisample, bool is_array, unsigned *layer=nullptr) {
+	assert(glIsTexture(tid));
+	int const attachment(is_depth_fbo ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0);
 
-void create_fbo(unsigned &fbo_id, unsigned tid, bool is_depth_fbo, bool multisample, unsigned *layer) {
-	
+	if (layer) {
+		assert(!multisample); // untested; probably doesn't work
+		glFramebufferTextureLayer(GL_FRAMEBUFFER, attachment, tid, 0, *layer);
+	}
+	else if (is_array) {
+		assert(!multisample); // untested; probably doesn't work
+		glFramebufferTexture(GL_FRAMEBUFFER, attachment, tid, 0);
+	}
+	else {
+		glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, get_2d_texture_target(0, multisample), tid, 0); // is_array=0
+	}
+	check_gl_error(551);
+}
+
+void create_fbo(unsigned &fbo_id, unsigned tid, bool is_depth_fbo, bool multisample, bool is_array, unsigned *layer) {
 	// Create a framebuffer object
 	check_gl_error(550);
 	glGenFramebuffers(1, &fbo_id);
@@ -254,31 +254,17 @@ void create_fbo(unsigned &fbo_id, unsigned tid, bool is_depth_fbo, bool multisam
 		glDrawBuffer(GL_NONE);
 		glReadBuffer(GL_NONE);
 	}
-	
 	// Attach the texture to FBO depth or color attachment point
-	assert(glIsTexture(tid));
-
-	if (layer) {
-		assert(!multisample); // untested; probably doesn't work
-		glFramebufferTextureLayer(GL_FRAMEBUFFER, (is_depth_fbo ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0), tid, 0, *layer);
-	}
-	else {
-		glFramebufferTexture2D(GL_FRAMEBUFFER, (is_depth_fbo ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0), get_2d_texture_target(0, multisample), tid, 0);
-	}
-	check_gl_error(551);
+	bind_fbo_texture(fbo_id, tid, is_depth_fbo, multisample, is_array, layer);
 	// Check FBO status
 	GLenum const status(glCheckFramebufferStatus(GL_FRAMEBUFFER));
 	assert(status != GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE);
 	assert(status == GL_FRAMEBUFFER_COMPLETE);
-	
-	// Switch back to window-system-provided framebuffer
-	disable_fbo();
 }
 
 
-void enable_fbo(unsigned &fbo_id, unsigned tid, bool is_depth_fbo, bool multisample, unsigned *layer) {
-
-	if (!fbo_id) {create_fbo(fbo_id, tid, is_depth_fbo, multisample, layer);}
+void enable_fbo(unsigned &fbo_id, unsigned tid, bool is_depth_fbo, bool multisample, bool is_array, unsigned *layer) {
+	if (!fbo_id) {create_fbo(fbo_id, tid, is_depth_fbo, multisample, is_array, layer);}
 	assert(fbo_id > 0);
 	bind_fbo(fbo_id); // rendering offscreen
 }
@@ -304,8 +290,6 @@ unsigned create_depth_render_buffer(unsigned xsize, unsigned ysize, bool multisa
 	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthrenderbuffer);
 	return depthrenderbuffer;
 }
-
-
 void disable_and_free_render_buffer(unsigned &render_buffer) {
 
 	glBindRenderbuffer(GL_RENDERBUFFER, 0);
@@ -318,7 +302,6 @@ void render_to_texture_t::pre_render(float xsize, float ysize, unsigned nx, unsi
 
 	assert(xsize > 0.0 && ysize > 0);
 	assert(tsize > 0 && nx > 0 && ny > 0);
-
 	// setup matrices
 	glViewport(0, 0, nx*tsize, ny*tsize);
 	fgMatrixMode(FG_PROJECTION);
@@ -340,12 +323,15 @@ void render_to_texture_t::post_render() {
 }
 
 
-void set_temp_clear_color(colorRGBA const &clear_color) {
-
-	colorRGBA orig_clear_color(BLACK);
-	glGetFloatv(GL_COLOR_CLEAR_VALUE, (float *)&orig_clear_color.R);
+colorRGBA get_clear_color() {
+	colorRGBA clear_color;
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, (float *)&clear_color.R);
+	return clear_color;
+}
+void set_temp_clear_color(colorRGBA const &clear_color, bool clear_depth, bool clear_stencil) { // and also clear color, depth, and stencil buffers
+	colorRGBA const orig_clear_color(get_clear_color());
 	glClearColor_rgba(clear_color);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+	glClear(GL_COLOR_BUFFER_BIT | (clear_depth ? GL_DEPTH_BUFFER_BIT : 0) | (clear_stencil ? GL_STENCIL_BUFFER_BIT : 0));
 	glClearColor_rgba(orig_clear_color);
 }
 
@@ -358,45 +344,19 @@ void render_to_texture_t::render(texture_pair_t &tpair, float xsize, float ysize
 	tpair.ensure_tid(tsize, mipmap);
 	colorRGBA const clear_normal(0.5, 0.5, 0.5, 0.0);
 	colorRGBA const clear_colors[2] = {bkg_color, clear_normal};
+	unsigned fbo_id(0);
+	enable_fbo(fbo_id, tpair.tids[0], 0, tpair.multisample); // too slow to create and free fbos every time?
+	unsigned render_buffer(use_depth_buffer ? create_depth_render_buffer(tsize, tsize, tpair.multisample) : 0);
 
 	for (unsigned d = 0; d < 2; ++d) { // {color, normal}
-		unsigned fbo_id(0);
-		enable_fbo(fbo_id, tpair.tids[d], 0, tpair.multisample); // too slow to create and free fbos every time?
-		unsigned render_buffer(use_depth_buffer ? create_depth_render_buffer(tsize, tsize, tpair.multisample) : 0);
-		set_temp_clear_color(clear_colors[d]);
+		if (d == 1) {bind_fbo_texture(fbo_id, tpair.tids[1], 0, tpair.multisample, 0);} // bind second texture; is_depth_fbo=0, is_array=0
+		set_temp_clear_color(clear_colors[d], use_depth_buffer);
 		draw_geom(d != 0);
 		//if (tpair.multisample) {glBlitFramebuffer(...);} // ???
-		if (use_depth_buffer) {disable_and_free_render_buffer(render_buffer);}
-		free_fbo(fbo_id);
 		if (mipmap) {build_texture_mipmaps(tpair.tids[d], 2);}
 	}
-	post_render(); // restore state
-}
-
-
-void render_to_texture_t::render(texture_atlas_t &atlas, float xsize, float ysize, point const &center, vector3d const &view_dir,
-	colorRGBA const &bkg_color, bool use_depth_buffer, bool mipmap)
-{
-	assert(!(mipmap && atlas.multisample));
-	assert(atlas.nx == 2 && atlas.ny == 1); // for now
-	pre_render(atlas.nx*xsize, atlas.ny*ysize, atlas.nx, atlas.ny, center, view_dir); // setup matrices, etc.
-	atlas.ensure_tid(tsize, mipmap);
-	unsigned fbo_id(0);
-	enable_fbo(fbo_id, atlas.tid, 0, atlas.multisample); // too slow to create and free fbos every time?
-	unsigned render_buffer(use_depth_buffer ? create_depth_render_buffer(atlas.nx*tsize, atlas.ny*tsize, atlas.multisample) : 0);
-	set_temp_clear_color(bkg_color); // TODO: can only set a single clear color; should we draw a full quad to set the clear normal?
-	vector3d xlate(2.0*xsize, 0.0, 0.0);
-	rotate_vector3d_by_vr(-plus_z, view_dir, xlate);
-	translate_to(-0.5*xlate);
-
-	for (unsigned d = 0; d < 2; ++d) {
-		draw_geom(d != 0);
-		translate_to(xlate); // shift to next sub-texture region
-	}
-	//if (tpair.multisample) {glBlitFramebuffer(...);} // ???
 	if (use_depth_buffer) {disable_and_free_render_buffer(render_buffer);}
 	free_fbo(fbo_id);
-	if (mipmap) {build_texture_mipmaps(atlas.tid, 2);} // Note: if mipmapping is enabled, we should use a buffer region between the two sub-textures
 	post_render(); // restore state
 }
 
@@ -423,6 +383,7 @@ void update_ssbo(unsigned ssbo, unsigned data_sz, void const *const data) {
 	assert(data_sz > 0 && data != nullptr);
 	bind_ssbo(ssbo);
 	void *p(glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_WRITE_ONLY));
+	assert(p != nullptr);
 	memcpy(p, data, data_sz);
 	glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 }

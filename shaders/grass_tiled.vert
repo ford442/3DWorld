@@ -4,6 +4,7 @@ uniform float x1, y1, dx_inv, dy_inv;
 uniform vec4 clip_box1, clip_box2; // {x1 y1 x2 y2} => {x y z w}
 uniform sampler2D height_tex, normal_tex, shadow_tex, weight_tex, noise_tex;
 uniform vec2 xlate = vec2(0.0);
+//uniform float height = 1.0; // from wind.part
 
 in vec2 local_translate;
 
@@ -19,12 +20,12 @@ void main() {
 	vec4 vertex = fg_Vertex;
 	vertex.xy  += local_translate;
 #ifdef ENABLE_VERTEX_CLIP
-	float vx = vertex.x + xlate.x;
-	float vy = vertex.y + xlate.y;
-	if ((vx > clip_box1.x && vy > clip_box1.y && vx < clip_box1.z && vy < clip_box1.w) ||
-	    (vx > clip_box2.x && vy > clip_box2.y && vx < clip_box2.z && vy < clip_box2.w)) {vertex.z -= height;}
+	vec2 v = vertex.xy + xlate.xy;
+	if ((v.x > clip_box1.x && v.y > clip_box1.y && v.x < clip_box1.z && v.y < clip_box1.w) ||
+	    (v.x > clip_box2.x && v.y > clip_box2.y && v.x < clip_box2.z && v.y < clip_box2.w)) {vertex.z -= 1.1*height;} // translate slightly more than height to account for wind
 #endif
-	float z_val = texture(height_tex, vec2((vertex.x - x1)*dx_inv, (vertex.y - y1)*dy_inv)).r;
+	vec2 tc2    = vec2((vertex.x - x1)*dx_inv, (vertex.y - y1)*dy_inv); // scaled same as (x2 - x1 - 1.0*DX_VAL)
+	float z_val = texture(height_tex, tc2).r;
 	float ascale= 1.0;
 #ifdef DEC_HEIGHT_WHEN_FAR
 	float dist  = length((fg_ModelViewMatrix * (vertex + vec4(xlate, z_val, 0))).xyz);
@@ -34,7 +35,6 @@ void main() {
 	ascale      = min(1.0, 10.0*(1.0 - ds_val)); // decrease alpha very far away from camera
 #endif
 	vertex.z   += z_val;
-	vec2 tc2    = vec2(vertex.x*dx_inv, vertex.y*dy_inv); // same as (x2 - x1 - 1.0*DX_VAL)
 	if (enable_grass_wind) {vertex.xyz += get_grass_wind_delta(vertex.xyz, tc.s);}
 
 	vec4 fin_vert   = (vertex + vec4(xlate, 0, 0));

@@ -10,8 +10,7 @@ extern float orig_timestep, base_gravity;
 extern int display_mode; // for debugging
 
 
-bool line_intersect_torus(double ax, double ay, double az, double bx, double by,
-						  double bz, double R, double r, double vlength, float &t);
+bool line_intersect_torus(double ax, double ay, double az, double bx, double by, double bz, double R, double r, double vlength, float &t);
 
 
 // ************ BASIC VECTOR MATH, ETC. ************
@@ -205,7 +204,6 @@ bool get_poly_zminmax(point const *const pts, unsigned npts, vector3d const &nor
 	return (num_inside[0] || num_inside[1]);
 }
 
-
 bool get_poly_zvals(vector<tquad_t> const &pts, float xv, float yv, float &z1, float &z2) {
 
 	bool coll(0);
@@ -223,15 +221,12 @@ bool get_poly_zvals(vector<tquad_t> const &pts, float xv, float yv, float &z1, f
 	return coll;
 }
 
-
 void gen_poly_planes(point const *const points, unsigned npoints, vector3d const &norm, float thick, point pts[2][4]) {
-
 	for (unsigned i = 0; i < 2; ++i) { // back face cull?
 		float const tv(0.5*(i ? -thick : thick));
 		for (unsigned j = 0; j < npoints; ++j) {pts[i][j] = points[j] + norm*tv;}
 	}
 }
-
 
 void thick_poly_to_sides(point const *const points, unsigned npoints, vector3d const &norm, float thick, vector<tquad_t> &sides) {
 
@@ -243,13 +238,15 @@ void thick_poly_to_sides(point const *const points, unsigned npoints, vector3d c
 		for (unsigned j = 0; j < npoints; ++j) {sides[i][j] = points[j] + norm*tv;}
 		sides[i].npts = npoints;
 	}
-	for (unsigned i = 0; i < npoints; ++i) { // create the <npoints> sides
-		unsigned const inext((i+1)%npoints);
-		sides[i+2].npts = 4;
-		sides[i+2][0] = sides[0][i];
-		sides[i+2][1] = sides[1][i];
-		sides[i+2][2] = sides[1][inext];
-		sides[i+2][3] = sides[0][inext];
+	if (thick != 0.0) { // no sides if polygon has zero thickness
+		for (unsigned i = 0; i < npoints; ++i) { // create the <npoints> sides
+			unsigned const inext((i+1)%npoints);
+			sides[i+2].npts = 4;
+			sides[i+2][0] = sides[0][i];
+			sides[i+2][1] = sides[1][i];
+			sides[i+2][2] = sides[1][inext];
+			sides[i+2][3] = sides[0][inext];
+		}
 	}
 	std::reverse(sides[1].pts, sides[1].pts+sides[1].npts); // reverse point order of bottom side
 }
@@ -290,7 +287,7 @@ bool sphere_intersect_poly_sides(vector<tquad_t> const &pts, point const &center
 	bool found(0);
 	dist = FAR_DISTANCE;
 
-	for (unsigned i = 0; i < pts.size(); ++i) { // test the <npoints> sides
+	for (unsigned i = 0; i < pts.size(); ++i) { // test all of the sides
 		vector3d const side_norm(pts[i].get_norm());
 		float tdist(radius - dot_product_ptv(side_norm, center, pts[i][0]));
 		if (strict && tdist < 0.0) return 0; // outside of the shape
@@ -472,9 +469,8 @@ void get_sphere_border_pts(point *qp, point const &pos, point const &viewed_from
 	}
 	for (unsigned i = 0; i < num_pts; ++i) { // center, z+, xy-, xy+, z-
 		qp[i] = pos;
-		
-		if      (i == 1 || i == 4) {qp[i].z += ((i == 1) ? radius : -radius);}
-		else if (i == 2 || i == 3) {qp[i] += vortho*((i == 2) ? radius : -radius);}
+		if      (i == 1 || i == 4) {qp[i].z +=        ((i == 1) ? radius : -radius);}
+		else if (i == 2 || i == 3) {qp[i]   += vortho*((i == 2) ? radius : -radius);}
 	}
 }
 
@@ -739,14 +735,18 @@ bool sphere_int_cylinder_pretest(point const &sc, float sr, point const &cp1, po
 	t   = get_cylinder_params(cp1, cp2, sc, v1, v2); // v1 = cylinder vector, v2 = cylinder_p1-sphere vector
 	float const t_clamped(CLIP_TO_01(t));
 	rad = (r1 + t_clamped*(r2 - r1)); // radius of cylinder at closest point to sphere
+	bool is_axis_aligned(0);
 
-	if (cp1.x == cp2.x && cp1.y == cp2.y) { // special case of a vertical cylinder
-		float const closest_z(cp1.z + t_clamped*(cp2.z - cp1.z)), sphere_dist(fabs(closest_z - sc.z));
+	for (unsigned d = 0; d < 3; ++d) {
+		unsigned const d1((d+1)%3), d2((d+2)%3);
+		if (cp1[d1] != cp2[d1] || cp1[d2] != cp2[d2]) continue; // not oriented in dim d
+		float const closest_val(cp1[d] + t_clamped*(cp2[d] - cp1[d])), sphere_dist(fabs(closest_val - sc[d]));
 		if (sphere_dist < sr) {rad += sqrt(sr*sr - sphere_dist*sphere_dist);}
-	}
-	else {
-		rad += sr; // add sphere radius (FIXME: inaccurate)
-	}
+		is_axis_aligned = 1;
+		break;
+	} // for d
+	if (!is_axis_aligned) {rad += sr;} // add sphere radius; FIXME: inaccurate
+	
 	if (check_ends || (t >= 0.0 && t <= 1.0)) {
 		v2 -= v1*t; // vector from point to collision point along cylinder axis
 		if (v2.mag_sq() <= rad*rad) return 1;
@@ -832,8 +832,6 @@ bool sphere_intersect_cylinder_ipt(point const &sc, float sr, point const &cp1, 
 }
 
 
-// line/sphere-scaled sphere/cylinder ???
-
 // torus is oriented in the z direction (for now)
 bool line_torus_intersect(point const &p1, point const &p2, point const &tc, float ri, float ro, float &t) {
 
@@ -845,9 +843,9 @@ bool line_torus_intersect(point const &p1, point const &p2, point const &tc, flo
 		if (p1[i] < (tc[i] - dist[i]) && p2[i] < (tc[i] - dist[i])) return 0;
 	}
 	//if (!sphere_test_comp(p1, tc, v1, rsum*rsum)) return 0; // clip (optional), could test bounding cube or cylinder as well
-	vector3d v1(p2, p1); // line direction
-	double const vmag(v1.mag());
+	vector3d v1(p2, p1 ); // line direction
 	vector3d l1(p1 - tc); // translate to torus center
+	double const vmag(v1.mag());
 	
 	if (p1 == tc) { // l1 is zero vector, this case doesn't work correctly
 		l1 = p2 - tc;
@@ -879,7 +877,7 @@ bool line_torus_intersect_rescale(point const &p1, point const &p2, point const 
 }
 
 
-// torus is oriented in the z direction (for now)
+// torus is oriented in the z direction (for now); p_int is the sphere center after collision resolution
 bool sphere_torus_intersect(point const &sc, float sr, point const &tc, float ri, float ro, point &p_int, vector3d &norm, bool calc_int) {
 
 	assert(sr >= 0.0 && ri >= 0.0 && ro > 0.0 && ri <= ro); // sphere radius can be 0
@@ -946,6 +944,14 @@ bool ellipse_cube_intersect(point const &pos, vector3d const &radius, cube_t con
 	UNROLL_3X(float const r2(radius[i_]*radius[i_]); DMIN_CHECK(i_));
 	return 1;
 }
+bool moving_sphere_cube_intersect_xy(point const &p1, point const &p2, cube_t const &c, float dist, float radius) {
+	if (!sphere_cube_intersect_xy(p1, (radius + dist), c)) return 0;
+	if (dist < 2.0*radius) return 1; // test is close enough
+	if (sphere_cube_intersect_xy(p1, radius, c) || sphere_cube_intersect_xy(p2, radius, c)) return 1;
+	cube_t c_exp(c);
+	c_exp.expand_by_xy(radius);
+	return check_line_clip_xy(p1, p2, c_exp.d); // conservative
+}
 
 
 void cylinder_3dw::calc_bcube(cube_t &bcube) const {
@@ -1009,7 +1015,7 @@ bool sphere_cube_intersect(point const &pos, float radius, cube_t const &cube, p
 	return found;
 }
 
-bool sphere_cube_int_update_pos(point &pos, float radius, cube_t const &cube, point const &p_last, bool check_int, bool skip_z, vector3d *cnorm_ptr) {
+bool sphere_cube_int_update_pos(point &pos, float radius, cube_t const &cube, point const &p_last, bool skip_z, vector3d *cnorm_ptr) {
 	vector3d cnorm;
 	unsigned cdir(0); // unused
 	point p_int;
@@ -1022,7 +1028,7 @@ bool sphere_cube_int_update_pos(point &pos, float radius, cube_t const &cube, po
 
 #define TEST_CLIP_T(reg, va, vb, vd, vc) \
 	if (region3 & (reg)) { \
-		assert((vd) != 0.0); /* this assertion may be removed as an optimization */ \
+		/*assert((vd) != 0.0); this assertion may be removed as an optimization or if it fails due to FP error */ \
 		float const t(((va) - (vb))/(vd)); \
 		if ((vc) > 0.0) {if (t > tmin) tmin = t;} else {if (t < tmax) tmax = t;} \
 		if (tmin >= tmax) return 0; \
@@ -1063,7 +1069,6 @@ bool get_line_clip_xy(point const &v1, point const &v2, float const d[3][2], flo
 	return 1;
 }
 
-
 // performance critical: return 1 if line intersects the cube
 bool do_line_clip(point &v1, point &v2, float const d[3][2]) {
 
@@ -1082,6 +1087,66 @@ bool do_line_clip(point &v1, point &v2, float const d[3][2]) {
 	if (tmax > TOLERANCE)         {v2  = v1 + dv*tmax;}
 	if (tmin < (1.0 - TOLERANCE)) {v1 += dv*tmin;}
 	return 1;
+}
+
+bool do_line_clip_xy(point &v1, point &v2, float const d[3][2]) {
+
+	float tmin(0.0), tmax(1.0);
+	if (!get_line_clip_xy(v1, v2, d, tmin, tmax)) return 0;
+	vector3d const dv(v2, v1);
+	if (tmax > TOLERANCE)         {v2  = v1 + dv*tmax;}
+	if (tmin < (1.0 - TOLERANCE)) {v1 += dv*tmin;}
+	return 1;
+}
+
+void add_point_to_poly(point const &pt, vector<point> &pts) {
+	unsigned const size(pts.size());
+	if (size > 0 && pt == pts.back()) return; // duplicate, skip
+	
+	if (size > 1) {
+		point &p1(pts[size-1]), &p2(pts[size-2]);
+		if (pt.x == p1.x && pt.x == p2.x) {p1.y = pt.y; return;} // colinear, update yval
+		if (pt.y == p1.y && pt.y == p2.y) {p1.x = pt.x; return;} // colinear, update xval
+	}
+	pts.push_back(pt); // add a new point
+}
+void clip_polygon_xy(vector<point> const &pts, cube_t const &c, vector<point> &pts_out) {
+	assert(pts.size() > 1);
+	point p1(pts.back());
+
+	for (point const &p2 : pts) {
+		unsigned const region1(get_region_xy(p1, c.d)), region2(get_region_xy(p2, c.d)), region3(region1 | region2);
+		if (region1 && region1 == region2) {p1 = p2; continue;} // both ends in same region, ignore
+
+		if (region3 == 0) { // entire line inside optimization
+			add_point_to_poly(p2, pts_out);
+		}
+		else {
+			point const delta(p2 - p1);
+			float tvals[4] = {};
+			unsigned cur_t(0);
+			if (!region_in_corner(region1)) {tvals[cur_t++] = 0.0;} // first point inside one/both dims
+
+			for (unsigned d = 0; d < 2; ++d) { // hi,lo
+				for (unsigned e = 0; e < 2; ++e) { // x,y
+					if ((region3 & (1<<(d+(e<<1)))) && delta[e]) {tvals[cur_t++] = (c.d[e][d] - p1[e]) / delta[e];} // plane intersection
+				}
+			}
+			std::sort(tvals, tvals+cur_t);
+			if (!region_in_corner(region2)) {tvals[cur_t++] = 1.0;} // last point inside one/both dims
+
+			for(unsigned i = 0; i < cur_t; ++i) {
+				point pt(p1 + point(tvals[i]*delta.x, tvals[i]*delta.y, 0.0));
+				c.clamp_pt_xy(pt);
+				add_point_to_poly(pt, pts_out);
+			}
+		}
+		p1 = p2;
+	} // for k
+	for (unsigned d = 0; d < 2; ++d) { // cleanup wraparound in each dim
+		while (pts_out.size() > 2 && pts_out.back()[d] == pts_out[0][d] && pts_out[0][d] == pts_out[1][d]) {pts_out.erase(pts_out.begin());}
+		while (pts_out.size() > 2 && pts_out[pts_out.size()-2][d] == pts_out.back()[d] && pts_out.back()[d] == pts_out[0][d]) {pts_out.pop_back();}
+	}
 }
 
 
@@ -1242,7 +1307,8 @@ template<typename T> void rotate_vector3d_multi(pointT<T> const &vrot, double an
 }
 
 template<typename T> void rotate_verts(vector<T> &verts, vector3d const &axis, float angle, vector3d const &about, unsigned start) {
-	assert(start < verts.size()); // nonempty range
+	if (start == verts.size()) return; // empty range
+	assert(start < verts.size()); // check for valid range
 	if (angle == 0.0) return;
 	CREATE_ROT_MATRIX(axis, angle);
 
@@ -1256,8 +1322,19 @@ template<typename T> void rotate_verts(vector<T> &verts, vector3d const &axis, f
 		v->set_norm(normal_out); // normalize not needed?
 	}
 }
+void rotate_verts(point *verts, unsigned num_verts, vector3d const &axis, float angle, vector3d const &about) {
+	if (num_verts == 0 || angle == 0.0) return;
+	CREATE_ROT_MATRIX(axis, angle);
+
+	for (unsigned i = 0; i < num_verts; ++i) {
+		point const vin(verts[i] - about); // have to cache this
+		matrix_mult(vin, verts[i], m); // rotate the point about <about>
+		verts[i] += about;
+	}
+}
 
 template void rotate_verts(vector<vert_norm_comp_tc_color> &verts, vector3d const &axis, float angle, vector3d const &about, unsigned start); // used for building room geom
+template void rotate_verts(vector<vert_norm_tc_color     > &verts, vector3d const &axis, float angle, vector3d const &about, unsigned start); // used for parking lot solar roofs
 
 
 // vrot must be normalized

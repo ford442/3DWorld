@@ -11,6 +11,7 @@ using std::swap;
 
 bool const ADD_BOOK_COVERS = 1; // cover pictures
 bool const ADD_BOOK_TITLES = 1;
+bool const USE_REAL_AUTHOR = 1; // for books
 colorRGBA const STAIRS_COLOR_TOP(0.7, 0.7, 0.7);
 colorRGBA const STAIRS_COLOR_BOT(0.9, 0.9, 0.9);
 
@@ -19,29 +20,71 @@ vect_room_object_t temp_objects;
 vect_cube_t &get_temp_cubes() {temp_cubes.clear(); return temp_cubes;}
 vect_room_object_t &get_temp_objects() {temp_objects.clear(); return temp_objects;}
 
-extern int display_mode, player_in_closet;
+extern int display_mode, player_in_closet, frame_counter;
 
 int get_rand_screenshot_texture(unsigned rand_ix);
 unsigned get_num_screenshot_tids();
-string gen_random_full_name (rand_gen_t &rgen);
+string gen_random_full_name(rand_gen_t &rgen);
 
-void gen_text_verts(vector<vert_tc_t> &verts, point const &pos, string const &text, float tsize, vector3d const &column_dir, vector3d const &line_dir, bool use_quads=0);
+void gen_text_verts(vector<vert_tc_t> &verts, point const &pos, string const &text, float tsize,
+	vector3d const &column_dir, vector3d const &line_dir, bool use_quads=0, bool include_space_chars=0);
 string const &gen_book_title(unsigned rand_id, string *author, unsigned split_len);
 void add_floor_number(unsigned floor_ix, unsigned floor_offset, bool has_parking_garage, ostringstream &oss);
 unsigned get_rgeom_sphere_ndiv(bool low_detail);
+void rotate_verts(point *verts, unsigned num_verts, vector3d const &axis, float angle, vector3d const &about);
+void rotate_xy(point &pt, point const &origin, float angle);
 
 unsigned get_face_mask(unsigned dim, bool dir) {return ~(1 << (2*(2-dim) + dir));} // draw only these faces: 1=Z1, 2=Z2, 4=Y1, 8=Y2, 16=X1, 32=X2
 unsigned get_skip_mask_for_xy(bool dim) {return (dim ? EF_Y12 : EF_X12);} // skip these faces
 tid_nm_pair_t get_tex_auto_nm(int tid, float tscale=1.0, bool shadowed=1) {return tid_nm_pair_t(tid, get_normal_map_for_bldg_tid(tid), tscale, tscale, 0.0, 0.0, shadowed);}
-int get_counter_tid    () {return get_texture_by_name("marble2.jpg");}
-int get_paneling_nm_tid() {return get_texture_by_name("normal_maps/paneling_NRM.jpg", 1);}
-int get_blinds_tid     () {return get_texture_by_name("interiors/blinds.jpg", 0, 0, 1, 8.0);} // use high aniso
-int get_money_tid      () {return get_texture_by_name("interiors/dollar20.jpg");}
+int get_counter_tid  () {return get_texture_by_name("marble2.jpg");}
+int get_blinds_tid   () {return get_texture_by_name("interiors/blinds.jpg",    0, 0, 1, 8.0);} // use high aniso
+int get_blinds_nm_tid() {return get_texture_by_name("interiors/blinds_hn.jpg", 1, 0, 1, 8.0);} // use high aniso
+int get_money_tid    () {return get_texture_by_name("interiors/dollar20.jpg");}
 
-int get_crack_tid(room_object_t const &obj, bool alpha=0) {
+struct pool_texture_params_t {
+	string fn, nm_fn;
+	int tid=-1, nm_tid=-1;
+	float tscale, spec_mag, spec_shine;
+	pool_texture_params_t(string const &f, string const &nf, float ts, float sm, float ss) : fn(f), nm_fn(nf),           tscale(ts), spec_mag(sm), spec_shine(ss) {}
+	pool_texture_params_t(int tid_, int nm_tid_,             float ts, float sm, float ss) : tid(tid_), nm_tid(nm_tid_), tscale(ts), spec_mag(sm), spec_shine(ss) {}
+
+	int get_tid() {
+		if (tid < 0) {tid = get_texture_by_name(fn);}
+		return tid;
+	}
+	int get_nm_tid() {
+		if (nm_tid < 0) {nm_tid = get_texture_by_name(nm_fn, 1);}
+		return nm_tid;
+	}
+};
+enum {POOL_TILE_INSIDE1=0, POOL_TILE_INSIDE2, POOL_TILE_WALL, POOL_TILE_FLOOR, POOL_TYPE_CEIL, NUM_POOL_TILES};
+pool_texture_params_t pool_texture_params[NUM_POOL_TILES] = {
+	pool_texture_params_t("interiors/glass_tiles.jpg",  "interiors/glass_tiles_normal.jpg",  0.5, 1.0, 100.0), // pool inside walls/floor tile
+	pool_texture_params_t(STUCCO_TEX,                 FLAT_NMAP_TEX,                         1.5, 0.2,  40.0), // pool inside walls/floor plaster; stucco texture, no normal map
+	pool_texture_params_t("interiors/glazed_tiles.jpg", "interiors/glazed_tiles_normal.jpg", 0.5, 0.8,  80.0), // room walls
+	pool_texture_params_t("interiors/mosaic_tiles.jpg", "interiors/mosaic_tiles_normal.jpg", 0.2, 1.0, 100.0), // room floor
+	pool_texture_params_t("interiors/mosaic_tiles.jpg", "interiors/mosaic_tiles_normal.jpg", 0.2, 0.2,  20.0)  // room ceiling
+};
+int get_pool_tile_type(room_object_t const &obj) {
+	if (obj.flags & RO_FLAG_ADJ_LO ) return ((obj.room_id & 1) ? POOL_TILE_INSIDE1 : POOL_TILE_INSIDE2); // select randomly based on room
+	if (obj.flags & RO_FLAG_ADJ_BOT) return POOL_TILE_FLOOR;
+	if (obj.flags & RO_FLAG_ADJ_TOP) return POOL_TYPE_CEIL;
+	return POOL_TILE_WALL;
+}
+pool_texture_params_t &get_pool_tile_params(room_object_t const &obj) {return pool_texture_params[get_pool_tile_type(obj)];}
+
+bool is_pool_tile_floor(room_object_t const &obj) {
+	if (obj.type != TYPE_POOL_TILE) return 0;
+	int const pt_type(get_pool_tile_type(obj));
+	return (pt_type == POOL_TILE_FLOOR);
+}
+
+// alpha: 0=apply as grayscale decal; 1=apply as alpha with opaque center (mirror); 2=apply as alpha with transparent center (glass)
+int get_crack_tid(room_object_t const &obj, int alpha=0) {
 	return get_texture_by_name(((5*obj.obj_id + 7*obj.room_id) & 1) ?
-		(alpha ? "interiors/cracked_glass2_alpha.jpg" : "interiors/cracked_glass2.jpg") :
-		(alpha ? "interiors/cracked_glass_alpha.jpg" : "interiors/cracked_glass.jpg"), 0, 0, 1, 0.0, 1, 1, (alpha ? 4 : 3));
+		((alpha == 2) ? "interiors/cracked_glass2_alpha_th.jpg" : (alpha ? "interiors/cracked_glass2_alpha.jpg" : "interiors/cracked_glass2.jpg")) :
+		(alpha ? "interiors/cracked_glass_alpha.jpg"  : "interiors/cracked_glass.jpg"), 0, 0, 1, 0.0, 1, 1, (alpha ? 4 : 3));
 }
 int get_box_tid() {return get_texture_by_name("interiors/box.jpg");}
 int get_crate_tid(room_object_t const &c) {return get_texture_by_name((c.obj_id & 1) ? "interiors/crate2.jpg" : "interiors/crate.jpg");}
@@ -49,38 +92,74 @@ int get_plywood_tid   () {return get_texture_by_name("interiors/plywood.jpg");}
 int get_insulation_tid() {return get_texture_by_name("interiors/insulation.jpg");}
 int get_cube_duct_tid () {return get_texture_by_name("interiors/duct.jpg");}
 int get_cylin_duct_tid() {return get_texture_by_name("buildings/metal_roof.jpg");} // metal roof is close enough
+int get_toilet_paper_nm_id() {return get_texture_by_name("interiors/toilet_paper_normal.jpg", 1);}
 
 colorRGBA get_textured_wood_color() {return WOOD_COLOR.modulate_with(texture_color(WOOD2_TEX));} // Note: uses default WOOD_COLOR, not the per-building random variant
 colorRGBA get_counter_color      () {return (get_textured_wood_color()*0.75 + texture_color(get_counter_tid())*0.25);}
 
 bool is_known_metal_color(colorRGBA const &c) {return (c == COPPER_C || c == BRASS_C || c == BRONZE_C || c == GOLD);}
 
-rgeom_mat_t &building_room_geom_t::get_wood_material(float tscale, bool inc_shadows, bool dynamic, unsigned small) {
+rgeom_mat_t &building_room_geom_t::get_wood_material(float tscale, bool inc_shadows, bool dynamic, unsigned small, bool exterior) {
 	return get_material(tid_nm_pair_t(WOOD2_TEX, get_texture_by_name("normal_maps/wood_NRM.jpg", 1),
-		3.0*tscale, 3.0*tscale, 0.0, 0.0, inc_shadows), inc_shadows, dynamic, small); // hard-coded for common material
+		3.0*tscale, 3.0*tscale, 0.0, 0.0, inc_shadows), inc_shadows, dynamic, small, 0, exterior); // hard-coded for common material
 }
 
-void get_tc_leg_cubes_abs_width(cube_t const &c, float leg_width, cube_t cubes[4]) {
+void rotate_obj_cube(cube_t &c, cube_t const &bc, bool in_dim, bool dir) { // 90 degree rotations about X or Y axis; okay if c == bc
+	point pts[2] = {c.get_llc(), c.get_urc()};
+	vector3d axis;
+	point about;
+	axis [!in_dim] = ((dir ^ in_dim) ? 1.0 : -1.0);
+	about[ in_dim] = bc.d[in_dim][!dir];
+	about.z = bc.z1();
+	rotate_verts(pts, 2, axis, PI_TWO, about);
+	c.set_from_points(pts, 2);
+}
+void get_tc_leg_cubes_abs_width(cube_t const &c, float leg_width, bool recessed, cube_t cubes[4]) {
 	for (unsigned y = 0; y < 2; ++y) {
 		for (unsigned x = 0; x < 2; ++x) {
 			cube_t leg(c);
 			leg.d[0][x] += (x ? -1.0f : 1.0f)*(c.dx() - leg_width);
 			leg.d[1][y] += (y ? -1.0f : 1.0f)*(c.dy() - leg_width);
+
+			if (recessed) { // slight recess
+				leg.d[0][!x] -= (x ? -1.0f : 1.0f)*0.1*leg_width;
+				leg.d[1][!y] -= (y ? -1.0f : 1.0f)*0.1*leg_width;
+			}
 			cubes[2*y+x] = leg;
+		} // for x
+	} // for y
+}
+void get_tc_leg_cubes(cube_t const &c, room_object_t const &obj, float width, bool recessed, cube_t cubes[4]) {
+	get_tc_leg_cubes_abs_width(c, get_tc_leg_width(c, width), recessed, cubes);
+
+	if (obj.is_on_floor()) { // handle legs of fallen over furniture
+		point const center(c.get_cube_center());
+		float const scale(c.dz()/c.get_sz_dim(obj.dim));
+
+		for (unsigned i = 0; i < 4; ++i) {
+			cubes[i] -= center;
+			swap_cube_dims(cubes[i], obj.dim, 2);
+			for (unsigned d = 0; d < 2; ++d) {cubes[i].d[2][d] *= scale; cubes[i].d[obj.dim][d] /= scale;}
+			cubes[i] += center;
 		}
 	}
 }
-void get_tc_leg_cubes(cube_t const &c, float width, cube_t cubes[4]) {
-	get_tc_leg_cubes_abs_width(c, get_tc_leg_width(c, width), cubes);
-}
-void building_room_geom_t::add_tc_legs(cube_t const &c, colorRGBA const &color, float width, float tscale, bool use_metal_mat, bool draw_tops, float frame_height) {
+void building_room_geom_t::add_tc_legs(cube_t const &c, room_object_t const &obj, colorRGBA const &color,
+	float width, bool recessed, float tscale, bool use_metal_mat, bool draw_tops, float frame_height)
+{
 	rgeom_mat_t &mat(use_metal_mat ? get_metal_material(1) : get_wood_material(tscale)); // shadowed=1, dynamic=0, small=0
 	cube_t cubes[4];
-	get_tc_leg_cubes(c, width, cubes);
-	point const llc(c.get_llc());
-	for (unsigned i = 0; i < 4; ++i) {mat.add_cube_to_verts(cubes[i], color, llc, (draw_tops ? EF_Z1 : EF_Z12));} // skip top and bottom faces
+	get_tc_leg_cubes(c, obj, width, recessed, cubes);
+	unsigned skip_faces(draw_tops ? EF_Z1 : EF_Z12);
 
-	if (frame_height > 0.0) {
+	if (obj.is_on_floor()) { // handle legs of fallen over furniture
+		assert(frame_height == 0.0); // not supported
+		skip_faces = 0; // leg ends may be visible; conservative
+	}
+	point const llc(c.get_llc());
+	for (unsigned i = 0; i < 4; ++i) {mat.add_cube_to_verts(cubes[i], color, llc, skip_faces);} // skip top and bottom faces
+
+	if (frame_height > 0.0) { // draw frame for glass table with the same material as the legs
 		float const leg_width(get_tc_leg_width(c, width));
 
 		for (unsigned dim = 0; dim < 2; ++dim) {
@@ -111,7 +190,7 @@ void get_table_cubes(room_object_t const &c, cube_t cubes[5]) {
 	top.z1() += (is_desk ? 0.85 : (is_dns ? 0.12 : 0.88))*c.dz();
 	legs_bcube.z2() = top.z1();
 	cubes[0] = top;
-	get_tc_leg_cubes(legs_bcube, (is_desk ? 0.06 : (is_dns ? 0.10 : 0.08)), (cubes+1));
+	get_tc_leg_cubes(legs_bcube, c, (is_desk ? 0.06 : (is_dns ? 0.10 : 0.08)), 1, (cubes+1)); // legs are inexact for glass tables
 }
 
 colorRGBA const table_glass_color(0.7, 1.0, 0.85, 0.25); // greenish tint, semi transparent
@@ -122,17 +201,19 @@ colorRGBA get_table_color(room_object_t const &c) {
 		return (marble ? texture_color(MARBLE_TEX) : get_textured_wood_color()); // ignore the black legs of marble tables
 	}
 	else { // rectangular or short table
-		bool const glass((c.flags & RO_FLAG_IS_HOUSE) && (c.obj_id & 1));
+		bool const glass(c.is_house() && (c.obj_id & 1));
 		return (glass ? table_glass_color : get_textured_wood_color()); // ignore the black legs of glass tables
 	}
 }
 void building_room_geom_t::add_table(room_object_t const &c, float tscale, float top_dz, float leg_width) { // 6 quads for top + 4 quads per leg = 22 quads = 88 verts
+	float const dz(c.dz());
+	min_eq(top_dz, get_tc_leg_width(c, leg_width)/dz); // reduce the top thickness of tall tables
 	cube_t top(c), legs_bcube(c);
 
 	if (c.shape == SHAPE_CYLIN) { // round table
 		bool const marble(c.obj_id & 1); // 50% marble top with metal base; else wood
 		vector3d const size(c.get_size());
-		top.z1()       += (1.0 - top_dz)*c.dz();
+		top.z1()       += (1.0 - top_dz)*dz;
 		legs_bcube.z2() = top.z1();
 		legs_bcube.expand_by_xy(-0.46*size);
 		colorRGBA const top_color(marble ? apply_light_color(c, LT_GRAY) : apply_wood_light_color(c)), base_color(marble ? BLACK : top_color);
@@ -141,7 +222,7 @@ void building_room_geom_t::add_table(room_object_t const &c, float tscale, float
 		rgeom_mat_t &base_mat(marble ? get_metal_material(1) : get_wood_material(tscale)); // shadowed=1, dynamic=0, small=0
 		base_mat.add_vcylin_to_verts(legs_bcube, base_color, 1, 1, 0, 0, 1.0, 1.0, 1.0); // support
 		cube_t feet(c);
-		feet.z2() = c.z1() + 0.1*c.dz();
+		feet.z2() = c.z1() + 0.1*dz;
 		feet.expand_by_xy(-0.2*size);
 
 		for (unsigned d = 0; d < 2; ++d) { // add crossed feet
@@ -154,26 +235,39 @@ void building_room_geom_t::add_table(room_object_t const &c, float tscale, float
 		assert(c.shape == SHAPE_CUBE || c.shape == SHAPE_SHORT);
 		// Note: glass table top and legs won't quite match the geometry used for collision detection and queries, but it's probably close enough
 		bool const glass(c.is_glass_table()); // 50% glass top with metal base; only in houses; not dressers/desks
-		top.z1()       += (1.0 - (glass ? 0.25 : 1.0)*top_dz)*c.dz(); // glass tables have a thinner top
-		legs_bcube.z2() = top.z1();
+		top       .z1() += (1.0 - (glass ? 0.25 : 1.0)*top_dz)*dz; // glass tables have a thinner top
+		legs_bcube.z2()  = top.z1();
 
 		if (glass) {
 			legs_bcube.expand_by_xy(-0.05*min(c.dx(), c.dy())); // inset the legs
-			colorRGBA const top_color(apply_light_color(c, table_glass_color));
-			rgeom_mat_t &mat(get_untextured_material(0, 0, 0, 1)); // no shadows + transparent
-			mat.add_cube_to_verts(top, top_color, c.get_llc()); // all faces drawn
-			add_tc_legs(legs_bcube, BLACK, 0.5*leg_width, tscale, glass, glass, 1.0*top.dz()); // use_metal_mat=1, draw_tops=1, frame_height=nonzero
+			add_tc_legs(legs_bcube, c, BLACK, 0.5*leg_width, 0, tscale, glass, glass, 1.0*top.dz()); // use_metal_mat=1, draw_tops=1, frame_height=nonzero
+
+			if (c.taken_level == 0) { // draw glass top surface if not taken
+				rgeom_mat_t &mat(get_untextured_material(0, 0, 0, 1)); // no shadows + transparent
+				colorRGBA const top_color(apply_light_color(c, table_glass_color));
+				mat.add_cube_to_verts_untextured(top, top_color); // all faces drawn
+
+				if (c.is_broken()) { // glass is cracked
+					cube_t crack(top);
+					crack.z1()  = top.z2();
+					crack.z2() += 0.1*top.dz(); // move up to prevent z-fighting
+					rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_crack_tid(c, 2), 0.0, 0, true), 0, 0, 0, 1)); // alpha=2, unshadowed, transparent=1
+					mat.add_cube_to_verts(crack, colorRGBA(top_color, 1.0), top.get_llc(), ~EF_Z2, c.dim, (c.obj_id&1), (c.obj_id&2)); // top only; X/Y mirror based on obj_id
+				}
+			}
 		}
 		else { // wood
 			colorRGBA const color(apply_wood_light_color(c));
 			rgeom_mat_t &mat(get_wood_material(tscale));
 			mat.add_cube_to_verts(top, color, c.get_llc()); // all faces drawn
-			add_tc_legs(legs_bcube, color, leg_width, tscale);
+			add_tc_legs(legs_bcube, c, color, leg_width, 1, tscale);
 		}
 	}
 }
 
-void get_chair_cubes(room_object_t const &c, cube_t cubes[3]) {
+void get_chair_cubes(room_object_t const &c_in, cube_t cubes[3]) {
+	room_object_t c(c_in); // copy so that we can modify it
+	if (c.is_on_floor()) {rotate_obj_cube(c, c, c.dim, !c.dir);} // inverse rotate back to upright
 	float const height(c.dz()*((c.shape == SHAPE_SHORT) ? 1.333 : 1.0)); // effective height if the chair wasn't short
 	cube_t seat(c), back(c), legs_bcube(c);
 	seat.z1() += 0.32*height;
@@ -181,6 +275,10 @@ void get_chair_cubes(room_object_t const &c, cube_t cubes[3]) {
 	legs_bcube.z2() = seat.z1();
 	back.d[c.dim][c.dir] += 0.88f*(c.dir ? -1.0f : 1.0f)*c.get_depth();
 	cubes[0] = seat; cubes[1] = back; cubes[2] = legs_bcube;
+
+	if (c.is_on_floor()) { // rotate chair
+		for (unsigned n = 0; n < 3; ++n) {rotate_obj_cube(cubes[n], c, c.dim, c.dir);}
+	}
 }
 void building_room_geom_t::add_chair(room_object_t const &c, float tscale) { // 6 quads for seat + 5 quads for back + 4 quads per leg = 27 quads = 108 verts
 	cube_t cubes[3]; // seat, back, legs_bcube
@@ -188,7 +286,7 @@ void building_room_geom_t::add_chair(room_object_t const &c, float tscale) { // 
 	get_material(tid_nm_pair_t(MARBLE_TEX, 1.2*tscale), 1).add_cube_to_verts(cubes[0], apply_light_color(c), c.get_llc()); // seat; all faces drawn
 	colorRGBA const color(apply_wood_light_color(c));
 	get_wood_material(tscale).add_cube_to_verts(cubes[1], color, c.get_llc(), EF_Z1); // back; skip bottom face
-	add_tc_legs(cubes[2], color, 0.15, tscale); // legs
+	add_tc_legs(cubes[2], c, color, CHAIR_LEG_WIDTH, 1, tscale); // legs
 }
 
 room_object_t get_dresser_middle(room_object_t const &c) {
@@ -223,7 +321,7 @@ void clip_drawer_to_interior(room_object_t const &c, cube_t &drawer, float insid
 	drawer.z1() += 0.15*drawer_height;
 	drawer.z2() -= 0.05*drawer_height;
 }
-float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_only, bool inside_only) {
+float get_drawer_cubes(room_object_t const &c, vect_cube_t &drawers, bool front_only, bool inside_only) { // Note: c is the drawers part of the object
 	assert(!(front_only && inside_only)); // these options only apply to open drawers and are mutually exclusive
 	assert(c.is_strictly_normalized());
 	drawers.clear();
@@ -316,8 +414,7 @@ void building_room_geom_t::add_drawers(room_object_t const &c, float tscale, vec
 			interior.d[!c.dim][0]      = left .d[!c.dim][1];
 			interior.d[!c.dim][1]      = right.d[!c.dim][0];
 			interior.d[ c.dim][!c.dir] = back .d[ c.dim][c.dir];
-			room_object_t const obj(get_item_in_drawer(c, interior, (drawer_index_offset + (i - drawers.begin()))));
-			if (obj.type != TYPE_NONE) {objects.push_back(obj);}
+			add_draw_items(c, interior, (drawer_index_offset + (i - drawers.begin())), objects);
 		}
 		drawer_mat.add_cube_to_verts(*i, drawer_color, tex_orig, door_skip_faces_mod, 1); // swap the texture orientation of drawers to make them stand out more
 		// add door handle
@@ -334,10 +431,9 @@ void building_room_geom_t::add_drawers(room_object_t const &c, float tscale, vec
 }
 
 void building_room_geom_t::draw_mirror_surface(room_object_t const &c, cube_t const &mirror, bool dim, bool dir, bool shadowed) {
-	tid_nm_pair_t tp(REFLECTION_TEXTURE_ID, 0.0, shadowed);
-	if (ENABLE_MIRROR_REFLECTIONS) {tp.emissive = 1.0;}
 	unsigned const skip_faces(get_face_mask(dim, dir));
-	get_material(tp, shadowed).add_cube_to_verts(mirror, WHITE, zero_vector, skip_faces, !dim); // draw only the front face; use dim/dir rather than from c
+	// draw only the front face; use dim/dir rather than from c; doesn't need to be emissive
+	get_material(tid_nm_pair_t(REFLECTION_TEXTURE_ID, 0.0, shadowed), shadowed).add_cube_to_verts(mirror, WHITE, zero_vector, skip_faces, !dim);
 
 	if (c.is_broken()) {
 		cube_t crack(mirror);
@@ -406,8 +502,16 @@ void get_closet_cubes(room_object_t const &c, cube_t cubes[5], bool for_collisio
 	} // for d
 	doors.d[c.dim][ c.dir] -= (c.dir ? 1.0 : -1.0)*0.2*wall_thick; // shift in slightly
 	doors.d[c.dim][!c.dir] += (c.dir ? 1.0 : -1.0)*(depth - 0.8*wall_thick); // make it narrow
-	if (for_collision && c.is_open() && use_small_door) {cubes[4] = get_open_closet_door(c, doors);} // include open doors for small closets
+	if (for_collision && c.is_open() && use_small_door) {cubes[4] = cube_t();} // open doors for small closets are no longer included
 	else {cubes[4] = doors;} // return closed door cube; caller must handle open door
+}
+cube_t get_open_closet_door(room_object_t const &obj) {
+	cube_t cubes[5];
+	get_closet_cubes(obj, cubes, 0); // for_collision=0
+	cube_t &door(cubes[4]);
+	// closets with sliding doors only open the inner two doors (out of 4)
+	if (!obj.is_small_closet() && !obj.is_hanging()) {door.expand_in_dim(!obj.dim, -0.25*door.get_sz_dim(!obj.dim));}
+	return door;
 }
 
 void add_quad_to_mat(rgeom_mat_t &mat, point const pts[4], float const ts[4], float const tt[4], color_wrapper const &cw) {
@@ -415,16 +519,10 @@ void add_quad_to_mat(rgeom_mat_t &mat, point const pts[4], float const ts[4], fl
 	for (unsigned n = 0; n < 4; ++n) {mat.quad_verts.emplace_back(pts[n], normal, ts[n], tt[n], cw);}
 }
 
-cube_t get_open_closet_door(room_object_t const &c, cube_t const &closed_door) {
-	assert(c.is_small_closet()); // only small closets are supported for now
-	float const door_width(closed_door.get_sz_dim(!c.dim)), door_thickness(closed_door.get_sz_dim(c.dim));
-	cube_t door(closed_door);
-	door.d[ c.dim][c.dir] += (c.dir ? 1.0 : -1.0)*door_width;
-	door.d[!c.dim][1    ] -= (door_width - door_thickness);
-	return door;
-}
-void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t const &wall_tex, bool inc_lg, bool inc_sm) { // no lighting scale, houses only
+// no lighting scale, houses/apartments/hotel rooms only
+void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t const &wall_tex, colorRGBA const &trim_color, bool inc_lg, bool inc_sm) {
 	bool const open(c.is_open()), use_small_door(c.is_small_closet()), draw_interior(open || player_in_closet);
+	float const wall_thick(get_closet_wall_thickness(c)), trim_hwidth(0.3*wall_thick);
 	cube_t cubes[5];
 	get_closet_cubes(c, cubes);
 
@@ -445,20 +543,10 @@ void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t cons
 		point const llc(doors.get_llc());
 		float const out_sign(c.dir ? 1.0 : -1.0);
 
-		if (use_small_door) { // small house closet door
-			tid_nm_pair_t const tp(get_int_door_tid(), 0.0);
-
-			if (open) {
-				cube_t const door(get_open_closet_door(c, doors));
-				get_material(tp, 1).add_cube_to_verts(door, WHITE, llc, ~get_skip_mask_for_xy(!c.dim), c.dim, !c.dir); // draw front and back faces
-				get_untextured_material(1).add_cube_to_verts_untextured(door, WHITE, ~get_skip_mask_for_xy( c.dim)); // draw edges untextured
-			}
-			else {
-				unsigned const door_skip_faces(~get_skip_mask_for_xy(c.dim)); // draw both front and back faces so that shadows are cast correctly / light doesn't leak
-				get_material(tp, 1).add_cube_to_verts(doors, WHITE, llc, door_skip_faces, !c.dim);
-			}
-		}
+		if (use_small_door) {} // small house closet door - draw as a regular door
 		else { // 4 panel folding door
+			cube_t doors_no_trim(doors);
+			doors_no_trim.expand_in_dim(!c.dim, -trim_hwidth);
 			float const doors_width(doors.get_sz_dim(!c.dim)), door_thickness(doors.get_sz_dim(c.dim));
 			float const door_spacing(0.25*doors_width), door_gap(0.01*door_spacing);
 			int const tid(get_rect_panel_tid());
@@ -470,8 +558,8 @@ void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t cons
 
 			if (doors_fold && open) { // draw open bifold doors open on both
 				// Note: this doesn't always look correct because doors can intersect other objects such as lights and dressers, and they have no edge quads
-				float const panel_len(0.2*doors.get_sz_dim(!c.dim) - 2.0*door_gap), open_amt(0.5*panel_len), extend(sqrt(panel_len*panel_len - open_amt*open_amt));
-				float const nom_pos(doors.d[c.dim][!c.dir]), front_pos(nom_pos + out_sign*extend), z1(doors.z1()), z2(doors.z2());
+				float const panel_len(0.2*doors_no_trim.get_sz_dim(!c.dim) - 2.0*door_gap), open_amt(0.5*panel_len), extend(sqrt(panel_len*panel_len - open_amt*open_amt));
+				float const nom_pos(doors_no_trim.d[c.dim][!c.dir]), front_pos(nom_pos + out_sign*extend), z1(doors.z1()), z2(doors.z2());
 				float const ts[4] = {0.0, 0.25, 0.25, 0.0}, tt[4] = {0.0, 0.0, 0.25, 0.25};
 				color_wrapper const cw(WHITE);
 				point side_pt, out_pt, inner_pt; // left side door points in this order from left to right, forming a V-shape pointing outward
@@ -479,7 +567,7 @@ void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t cons
 				out_pt [c.dim] = front_pos;
 
 				for (unsigned side = 0; side < 2; ++side) {
-					float const open_sign(side ? -1.0 : 1.0), side_pos(doors.d[!c.dim][side]);
+					float const open_sign(side ? -1.0 : 1.0), side_pos(doors_no_trim.d[!c.dim][side]);
 					side_pt [!c.dim] = side_pos;
 					out_pt  [!c.dim] = side_pos + open_sign*open_amt;
 					inner_pt[!c.dim] = side_pos + 2*open_sign*open_amt;
@@ -509,9 +597,9 @@ void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t cons
 
 				for (unsigned n = 0; n < 4; ++n) {
 					unsigned const N(open ? open_n[n] : n);
-					cube_t door(doors);
-					door.d[!c.dim][0] = doors.d[!c.dim][0] +  N   *door_spacing + gaps[N  ]; // left  edge
-					door.d[!c.dim][1] = doors.d[!c.dim][0] + (N+1)*door_spacing - gaps[N+1]; // right edge
+					cube_t door(doors_no_trim);
+					door.d[!c.dim][0] = doors_no_trim.d[!c.dim][0] +  N   *door_spacing + gaps[N  ]; // left  edge
+					door.d[!c.dim][1] = doors_no_trim.d[!c.dim][0] + (N+1)*door_spacing - gaps[N+1]; // right edge
 					if (!doors_fold && (n == 1 || n == 2)) {door.translate_dim(c.dim, -1.1*out_sign*door_thickness);} // inset the inner sliding doors
 					door_mat.add_cube_to_verts(door, WHITE, llc, skip_faces);
 				}
@@ -520,9 +608,7 @@ void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t cons
 	} // end inc_lg
 	if (inc_sm) { // add wall trim for each side of the closet door
 		float const height(c.dz()), window_vspacing(height*(1.0 + FLOOR_THICK_VAL_HOUSE));
-		float const trim_height(0.04*window_vspacing), trim_thickness(0.1*WALL_THICK_VAL*window_vspacing);
-		float const wall_thick(get_closet_wall_thickness(c)), trim_plus_wall_thick(trim_thickness + wall_thick);
-		colorRGBA const trim_color(WHITE); // assume trim is white
+		float const trim_height(0.04*window_vspacing), trim_thickness(0.1*WALL_THICK_VAL*window_vspacing), trim_plus_wall_thick(trim_thickness + wall_thick);
 		bool const draw_interior_trim(1 || draw_interior); // always enable so that we don't have to regenerate small geom when closet doors are opened or closed
 
 		for (unsigned is_side = 0; is_side < 2; ++is_side) { // front wall, side wall
@@ -561,8 +647,15 @@ void building_room_geom_t::add_closet(room_object_t const &c, tid_nm_pair_t cons
 				btrim.z2() = c.z1() + trim_height;
 				get_untextured_material(0, 0, 1).add_cube_to_verts_untextured(btrim, trim_color, skip_faces); // is_small, untextured, no shadows; both interior and exterior
 				set_cube_zvals(trim, c.z2()-trim_height, c.z2());
-				// ceiling trim, missing end caps; exterior only
-				add_wall_trim(room_object_t(trim, TYPE_WALL_TRIM, c.room_id, trim_dim, trim_dir, trim_flags, 1.0, SHAPE_ANGLED, trim_color), 1);
+				// ceiling trim for house closets, missing end caps; exterior only
+				if (c.is_house()) {add_wall_trim(room_object_t(trim, TYPE_WALL_TRIM, c.room_id, trim_dim, trim_dir, trim_flags, 1.0, SHAPE_ANGLED, trim_color), 1);}
+
+				if (!is_side && !use_small_door) { // draw vertical door frame on either side of the door; small doors have their own trim added elsewhere
+					set_cube_zvals(trim, c.z1(), c.z2()); // full z height
+					set_wall_width(trim, cubes[2*d].get_center_dim(c.dim), 0.6*wall_thick, c.dim);
+					set_wall_width(trim, trim.d[!c.dim][!d], trim_hwidth, !c.dim);
+					add_wall_trim(room_object_t(trim, TYPE_WALL_TRIM, c.room_id, trim_dim, trim_dir, (RO_FLAG_ADJ_BOT | RO_FLAG_ADJ_TOP), 1.0, SHAPE_TALL, trim_color), 1);
+				}
 			} // for d
 		} // for is_side
 		// Note: always drawn to avoid recreating all small objects when the player opens/closes a closet door, and so that objects can be seen through the cracks in the doors
@@ -578,10 +671,26 @@ void building_room_geom_t::add_hanger_rod(room_object_t const &c) { // is_small=
 	get_wood_material(1.0, 1, 0, 1).add_ortho_cylin_to_verts(c, LT_GRAY, !c.dim, 0, 0, 0, 0, 1.0, 1.0, 0.25, 1.0, 0, 16, 0.0, 1); // 16 sides, swap_txy=1
 }
 
+void building_room_geom_t::add_drain_cover(cube_t const &c, colorRGBA const &color) {
+	rgeom_mat_t &mat(get_material(tid_nm_pair_t(MANHOLE_TEX, 0.0), 0, 0, 1));
+	unsigned const ix_start(mat.itri_verts.size());
+	mat.add_vcylin_to_verts(c, color, 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // top only, unshadowed, small
+	for (auto i = mat.itri_verts.begin()+ix_start; i != mat.itri_verts.end(); ++i) {i->t[1] = 1.0 - i->t[1];} // mirror texture in Y to invert backwards text
+}
+
 void building_room_geom_t::add_drain_pipe(room_object_t const &c) { // is_small=1
 	rgeom_mat_t &mat(get_untextured_material(0, 0, 1)); // unshadowed, small
-	mat.add_vcylin_to_verts(c, apply_light_color(c), 0, 0); // draw sides only
-	mat.add_disk_to_verts(point(c.xc(), c.yc(), c.z2()), 0.5*c.dx(), 0, BLACK); // draw top as black
+	colorRGBA const color(apply_light_color(c));
+
+	if (c.dir) { // horizontal (urinal)
+		mat.add_ortho_cylin_to_verts(c, color, c.dim, 0, 0); // sides
+		mat.add_ortho_cylin_to_verts(c, BLACK, c.dim, (c.flags & RO_FLAG_ADJ_LO), (c.flags & RO_FLAG_ADJ_HI), 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // end; skip_sides=1
+	}
+	else { // vertical
+		mat.add_vcylin_to_verts(c, color, 0, 0); // draw sides only
+		if (!(c.flags & RO_FLAG_IN_POOL)) {mat.add_vert_disk_to_verts(cube_top_center(c), 0.5*c.dx(), 0, BLACK);} // draw top as black
+		else {add_drain_cover(c, color);}
+	}
 }
 
 void building_room_geom_t::add_key(room_object_t const &c) { // is_small=1
@@ -615,19 +724,6 @@ void building_room_geom_t::add_phone(room_object_t const &c) { // is_small=1
 	else {mat.add_cube_to_verts_untextured(c, apply_light_color(c, BLACK), ~EF_Z2);} // top, no shadows, unlit
 }
 
-void add_tproll_to_material(room_object_t const &c, rgeom_mat_t &mat) {
-	colorRGBA const tp_color(apply_light_color(c));
-	float const radius(0.5*c.dz()), rod_shrink(-0.7*radius), roll_shrink(0.75*rod_shrink*fract(123.456*c.obj_id)); // randomly partially empty (25-100%)
-	cube_t roll(c);
-	roll.expand_in_dim(c.dim, roll_shrink);
-	roll.expand_in_dim(2,     roll_shrink); // z
-	mat.add_ortho_cylin_to_verts(roll, tp_color, !c.dim, 1, 1); // c.dim applies to the wall; the roll is oriented perpendicular
-	cube_t square(roll); // hanging square of TP
-	set_cube_zvals(square, c.z1(), c.zc()); // starts at the centerline (tangent) and extends to the bottom
-	if (c.is_hanging()) {square.z1() -= 3.0*c.dz();} // player has pulled it down lower
-	square.d[c.dim][c.dir] = square.d[c.dim][!c.dir]; // shrink to zero thickness at outer edge
-	mat.add_cube_to_verts_untextured(square, tp_color, ~get_skip_mask_for_xy(c.dim)); // only draw front/back faces
-}
 void building_room_geom_t::add_vert_roll_to_material(room_object_t const &c, rgeom_mat_t &mat, float sz_ratio, bool player_held) { // TP and tape
 	bool const is_tape(c.type == TYPE_TAPE);
 	float const hole_shrink(is_tape ? 0.24 : 0.3);
@@ -639,31 +735,60 @@ void building_room_geom_t::add_vert_roll_to_material(room_object_t const &c, rge
 	cube_t roll(c);
 	if (sz_ratio < 1.0) {roll.expand_by_xy(-hole_shrink*(1.0 - sz_ratio)*c.dx());} // partially used
 	hole.expand_in_dim(2, 0.0025*c.dz()); // expand slightly to avoid z-fighting
+	bool const swap_txy(c.type == TYPE_TPROLL); // TP texture is horizontal rather than vertical
 	// draw top/bottom surface only to mask off the outer part of the roll when held by the player; when resting on an object, draw the top surface only
 	mat.add_vcylin_to_verts(hole, ALPHA0, player_held, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // hole
-	mat.add_vcylin_to_verts(roll, apply_light_color(c), 1, 1); // paper/plastic roll
+	mat.add_vcylin_to_verts(roll, apply_light_color(c), 1, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 32, 0.0, swap_txy); // paper/plastic roll
 }
 void building_room_geom_t::add_tproll(room_object_t const &c) { // is_small=1
 	if (c.was_expanded()) { // bare TP roll from a box
-		add_vert_roll_to_material(c, get_untextured_material(1, 0, 1)); // shadowed, small
+		rgeom_mat_t &mat(get_material(tid_nm_pair_t(WHITE_TEX, get_toilet_paper_nm_id(), 0.0, 0.0, 0.0, 0.0, 1), 1, 0, 1)); // shadowed, small
+		add_vert_roll_to_material(c, mat);
 		return;
 	}
-	if (c.taken_level == 0) {add_tproll_to_material(c, get_untextured_material(1, 0, 1));} // draw the roll if not taken
-	float const radius(0.5*c.dz()), rod_shrink(-0.7*radius), length(c.get_width());
+	float const height(c.get_height()), radius(0.5*height), side_clearance(c.get_depth() - height);
+	cube_t full_roll(c);
+	full_roll.d[c.dim][c.dir] -= (c.dir ? 1.0 : -1.0)*side_clearance;
+
+	if (c.taken_level == 0) { // draw the roll if not taken
+		float const tscale(1.0/c.get_width()); // texture fits width of roll exactly; doesn't look great on the rool ends though
+		rgeom_mat_t &mat(get_material(tid_nm_pair_t(WHITE_TEX, get_toilet_paper_nm_id(), tscale, tscale, 0.0, 0.0, 1), 1, 0, 1)); // shadowed, small
+		colorRGBA const tp_color(blend_color(c.color, apply_light_color(c), 0.5, 0.0)); // 50% mix
+		float const rod_shrink(-0.7*radius), roll_shrink(0.75*rod_shrink*fract(123.456*c.obj_id)); // randomly partially empty (25-100%)
+		cube_t roll(full_roll);
+		roll.expand_in_dim(c.dim, roll_shrink);
+		roll.expand_in_dim(2,     roll_shrink); // z
+		mat.add_ortho_cylin_to_verts(roll, tp_color, !c.dim, 1, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 24, 0.0, 1); // c.dim applies to the wall; the roll is oriented perpendicular; ndiv=24
+		cube_t square(roll); // hanging square of TP
+		set_cube_zvals(square, c.z1(), c.zc()); // starts at the centerline (tangent) and extends to the bottom
+		if (c.is_hanging()) {square.z1() -= 3.0*height;} // player has pulled it down lower
+		square.d[c.dim][c.dir] = square.d[c.dim][!c.dir]; // shrink to zero thickness at outer edge
+		mat.add_cube_to_verts(square, tp_color, all_zeros, ~get_skip_mask_for_xy(c.dim), !c.dim); // only draw front/back faces
+	}
+	float const rod_shrink(-0.7*radius), length(c.get_width());
 	// draw the holder attached to the wall
 	rgeom_mat_t &holder_mat(get_metal_material(1, 0, 1)); // untextured, shadowed, small=1
 	colorRGBA const holder_color(apply_light_color(c, GRAY));
-	cube_t rod(c), plate(c);
+	cube_t rod(full_roll), bar(c);
 	rod.expand_in_dim( c.dim, rod_shrink);
 	rod.expand_in_dim( 2,     rod_shrink); // z
 	rod.expand_in_dim(!c.dim, 0.05*length); // will go slightly outside the bounds of c
 	float const rod_end(rod.d[!c.dim][0]); // arbitrarily choose lower end
-	plate.expand_in_dim(2, -0.65*radius); // z
-	plate.d[c.dim][!c.dir] -= (c.dir ? -1.0 : 1.0)*0.6*radius;
-	plate.d[!c.dim][0] = rod_end - 0.08*length; // set thickness; will go slightly outside the bounds of c
-	plate.d[!c.dim][1] = rod_end;
-	holder_mat.add_ortho_cylin_to_verts(rod, holder_color, !c.dim, 0, 1);
-	holder_mat.add_cube_to_verts_untextured(plate, holder_color, ~get_face_mask(c.dim, c.dir)); // skip the face against the wall
+	bar.expand_in_dim(2, -0.65*radius); // z
+	bar.d[c.dim][!c.dir] -= (c.dir ? -1.0 : 1.0)*0.6*radius;
+	bar.d[!c.dim][0] = rod_end - 0.08*length; // set thickness; will go slightly outside the bounds of c
+	bar.d[!c.dim][1] = rod_end;
+	unsigned const wall_face(~get_face_mask(c.dim, c.dir));
+	holder_mat.add_ortho_cylin_to_verts    (rod, holder_color, !c.dim, 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 24); // ndiv=24
+	holder_mat.add_cube_to_verts_untextured(bar, holder_color, wall_face); // skip the face against the wall
+
+	if (side_clearance > 0.0) { // add mounting plate
+		cube_t plate(c);
+		plate.d[c.dim][!c.dir] = c.d[c.dim][c.dir] + (c.dir ? -1.0 : 1.0)*0.75*side_clearance; // set plate thickness
+		plate.d[!c.dim][0] = bar.d[!c.dim][0]; // flush with the bar
+		plate.expand_in_dim(2, -0.2*height); // shrink in Z
+		holder_mat.add_cube_to_verts_untextured(plate, holder_color, wall_face); // skip the face against the wall
+	}
 }
 void building_room_geom_t::add_tape(room_object_t const &c) { // is_small=1
 	rgeom_mat_t &mat(get_untextured_material(1, 0, 1));
@@ -679,13 +804,14 @@ void building_room_geom_t::add_tape(room_object_t const &c) { // is_small=1
 	add_vert_roll_to_material(c, mat); // shadowed, small
 }
 
-void building_room_geom_t::add_spraycan_to_material(room_object_t const &c, rgeom_mat_t &mat) {
+void building_room_geom_t::add_spraycan_to_material(room_object_t const &c, rgeom_mat_t &mat, bool draw_bottom) {
 	unsigned const dim(get_max_dim(c.get_size()));
-	bool const add_bottom(dim != 2); // if on its side
+	draw_bottom |= (dim != 2); // if on its side or held by the player
 	cube_t can(c), cap(c);
 	can.d[dim][!c.dir] = cap.d[dim][c.dir] = (c.d[dim][c.dir] + 0.7*c.get_sz_dim(dim)*(c.dir ? -1.0 : 1.0)); // point between top of can and bottom of cap
-	mat.add_ortho_cylin_to_verts(can, apply_light_color(c, DK_GRAY), dim, (add_bottom && !c.dir), (add_bottom && c.dir)); // sides + bottom (if on side)
+	mat.add_ortho_cylin_to_verts(can, apply_light_color(c, DK_GRAY), dim, 0, 0); // sides only
 	mat.add_ortho_cylin_to_verts(cap, apply_light_color(c), dim, c.dir, !c.dir); // sides + top
+	if (draw_bottom) {mat.add_ortho_cylin_to_verts(can, apply_light_color(c, LT_GRAY), dim, !c.dir, c.dir, 0, 0, 1.0, 1.0, 1.0, 1.0, 1);} // top or bottom only, no sides
 }
 void building_room_geom_t::add_spraycan(room_object_t const &c) { // is_small=1
 	add_spraycan_to_material(c, get_untextured_material(1, 0, 1));
@@ -765,11 +891,11 @@ void building_room_geom_t::add_box(room_object_t const &c) { // is_small=1
 			for (unsigned d = 0; d < 2; ++d) { // x/y
 				for (unsigned e = 0; e < 2; ++e) { // side dir
 					unsigned const side_ix(2*d+e);
-					bool const against_wall(c.flags & (RO_FLAG_ADJ_LO << side_ix)); // encoded in adj flags
+					bool const against_obj(c.flags & (RO_FLAG_ADJ_LO << side_ix)); // check obj/wall proximity encoded in adj flags
 					cube_t C(box);
 					C.d[d][!e] = C.d[d][e];
-					C.d[d][ e] = C.d[d][e] + (e ? 1.0 : -1.0)*(against_wall ? 0.05 : 1.0)*flap_len;
-					float const zbot(C.z2()), dz(against_wall ? flap_len : 0.25*min(flap_len, box_sz.z)); // tilted somewhat upward; pointing up if against wall
+					C.d[d][ e] = C.d[d][e] + (e ? 1.0 : -1.0)*(against_obj ? 0.05 : 1.0)*flap_len;
+					float const zbot(C.z2()), dz(against_obj ? flap_len : 0.25*min(flap_len, box_sz.z)); // tilted somewhat upward; pointing up if against wall
 					point const pts[4] = {point(C.x1(), C.y1(), zbot), point(C.x2(), C.y1(), zbot), point(C.x2(), C.y2(), zbot), point(C.x1(), C.y2(), zbot)};
 					unsigned const ix(mat.quad_verts.size());
 					add_quad_to_mat(mat, pts, ts, tt, cw);
@@ -787,12 +913,12 @@ void building_room_geom_t::add_box(room_object_t const &c) { // is_small=1
 }
 
 void building_room_geom_t::add_paint_can(room_object_t const &c) {
-	float const side_tscale_add(fract(11111*c.x1() + 22222*c.y1() + 33333*c.z1())); // somewhat random
+	float const side_tscale_add(fract(21111*c.x1() + 22222*c.y1() + 23333*c.z1())); // somewhat random
 	rgeom_mat_t &side_mat(get_material(tid_nm_pair_t(get_texture_by_name("interiors/paint_can_label.png")), 1, 0, 1)); // shadows, small
 	side_mat.add_vcylin_to_verts(c, apply_light_color(c), 0, 0, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 24, side_tscale_add); // draw sides only; random texture rotation
 	point top(c.get_cube_center());
 	top.z = c.z2();
-	get_metal_material(1, 0, 1).add_disk_to_verts(top, 0.5*min(c.dx(), c.dy()), 0, apply_light_color(c, LT_GRAY)); // shadowed, specular metal; small=1
+	get_metal_material(1, 0, 1).add_vert_disk_to_verts(top, 0.5*min(c.dx(), c.dy()), 0, apply_light_color(c, LT_GRAY)); // shadowed, specular metal; small=1
 }
 
 void building_room_geom_t::add_shelves(room_object_t const &c, float tscale) {
@@ -843,24 +969,255 @@ void building_room_geom_t::add_shelves(room_object_t const &c, float tscale) {
 	if (c.obj_expanded()) return; // shelves have already been expanded, don't need to create contained objects below
 	vect_room_object_t &objects(get_temp_objects());
 	get_shelf_objects(c, shelves, num_shelves, objects);
-	add_small_static_objs_to_verts(objects, 1); // is_nested=1
+	add_small_static_objs_to_verts(objects, WHITE, 1); // trim_color=WHITE (unused), inc_text=1
+}
+
+// returns num_shelves; all cubes passed in should start as zeros
+unsigned get_shelf_rack_cubes(room_object_t const &c, cube_t &back, cube_t &top, cube_t sides[2], cube_t shelves[5]) {
+	// 3-5 shelves, with optional top and sides, and central back with holes
+	unsigned const num_shelves(3 + (c.obj_id%3)); // 3-5
+	bool const add_top(c.obj_id & 4), add_sides(c.obj_id & 2);
+	float const height(c.get_height()), length(c.get_width()), depth(c.get_depth());
+	float const shelf_thickness(0.015*height), bot_gap(1.0*shelf_thickness), back_thickness(0.05*depth);
+	float const side_thickness(min(0.1f*length, 0.75f*shelf_thickness)), top_thickness(add_top ? side_thickness : 0.0);
+	float const shelf_spacing((height - bot_gap - top_thickness)/num_shelves);
+	back = c; // pegboard
+	if (add_sides) {back.expand_in_dim(!c.dim, -side_thickness);}
+	back.z2() -= top_thickness; // back is under top
+	back.expand_in_dim(c.dim, -0.5*(depth - back_thickness));
+	cube_t shelf(c);
+	shelf.expand_in_dim(!c.dim, -(add_sides ? 1.0 : 0.5)*side_thickness); // shrink a bit even if there are no sides to prevent Z-fighting
+	shelf.expand_in_dim(c.dim, -0.75*side_thickness); // slight recess at the front
+
+	for (unsigned n = 0; n < num_shelves; ++n) {
+		float const zval(c.z1() + bot_gap + n*shelf_spacing);
+		set_cube_zvals(shelf, zval, zval+shelf_thickness);
+		shelves[n] = shelf;
+	}
+	if (add_top) {
+		top = c;
+		top.z1() = c.z2() - top_thickness;
+	}
+	if (add_sides) {
+		for (unsigned d = 0; d < 2; ++d) { // {left, right}
+			sides[d] = c;
+			sides[d].z2() -= top_thickness; // end is under top
+			sides[d].d[!c.dim][!d] = c.d[!c.dim][d] + (d ? -1.0 : 1.0)*side_thickness;
+		}
+	}
+	return num_shelves;
+}
+void building_room_geom_t::add_rack(room_object_t const &c, bool add_rack, bool add_objs) {
+	if (add_rack) { // static objects
+		cube_t back, top, sides[2], shelves[5];
+		unsigned const num_shelves(get_shelf_rack_cubes(c, back, top, sides, shelves));
+		bool const add_top(!top.is_all_zeros()), add_sides(!sides[0].is_all_zeros());
+		colorRGBA const back_color(c.color*0.67); // make a bit darker
+		rgeom_mat_t &back_mat(get_material(tid_nm_pair_t(get_texture_by_name("interiors/pegboard.png"), 2.5/c.get_height(), 1), 1)); // shadowed
+		back_mat.add_cube_to_verts(back, back_color, back.get_llc(), ~get_skip_mask_for_xy(c.dim)); // front and back sides only
+		unsigned const face_mask_ends(get_skip_mask_for_xy(!c.dim));
+		unsigned const skip_faces_shelves(add_sides ? face_mask_ends : 0); // skip ends if drawing ends
+		rgeom_mat_t &mat(get_untextured_material(1)); // shadowed; no apply_light_color()
+		if (!add_sides) {mat.add_cube_to_verts_untextured(back, back_color, ~face_mask_ends);} // pegboard ends
+		if (!add_top  ) {mat.add_cube_to_verts_untextured(back, back_color, ~EF_Z2         );} // pegboard top
+		if (add_top   ) {mat.add_cube_to_verts_untextured(top,  c.color,     0             );} // draw all faces
+		for (unsigned n = 0; n < num_shelves; ++n) {mat.add_cube_to_verts_untextured(shelves[n], c.color, skip_faces_shelves);}
+
+		if (add_sides) { // if one side is valid, they should both be valid
+			for (unsigned d = 0; d < 2; ++d) { // {left, right}
+				mat.add_cube_to_verts_untextured(sides[d], c.color, (add_top ? EF_Z12 : EF_Z1)); // skip bottom and maybe top
+			}
+		}
+	}
+	if (add_objs) { // add objects to the racks; drawn as small static objects
+		if (c.obj_expanded()) return; // already been expanded, don't need to create contained objects below
+		vect_room_object_t &objects(get_temp_objects());
+		get_shelfrack_objects(c, objects);
+		add_small_static_objs_to_verts(objects, WHITE, 1); // trim_color=WHITE(unused), inc_text=1
+	}
+}
+
+void building_room_geom_t::add_chimney_cap(room_object_t const &c) {
+	float const dx(c.dx()), dy(c.dy()), dz(c.dz()), min_sz(min(dx, dy));
+	bool const long_dim(dx < dy);
+
+	if ((c.obj_id & 1) && min_sz < 1.5*max(dx, dy)) { // split top in half; could be more efficient
+		float const split_pos(c.get_center_dim(long_dim));
+		room_object_t c_sub[2] = {c, c};
+
+		for (unsigned d = 0; d < 2; ++d) {
+			c_sub[d].obj_id &= ~1; // remove LSB to avoid infinite recursion
+			c_sub[d].d[long_dim][d] = split_pos;
+			add_chimney_cap(c_sub[d]);
+		}
+		return;
+	}
+	// crown
+	bool const add_overlap(c.obj_id & 2);
+	cube_t crown(c), hole(c);
+	crown.z2() -= 0.75*dz; // shorten height
+	hole.expand_in_dim(0, -0.5*(dx - 0.4*min_sz)); // shrink
+	hole.expand_in_dim(1, -0.5*(dy - 0.4*min_sz)); // shrink
+	if (add_overlap) {crown.expand_by_xy(0.1*min_sz);} // grow
+	cube_t sides[4]; // {-y, +y, -x, +x}
+	subtract_cube_xy(crown, hole, sides);
+	rgeom_mat_t &crown_mat(get_material(tid_nm_pair_t(get_texture_by_name("roads/asphalt.jpg"), 64.0), 0, 0, 0, 0, 1)); // no shadows, exterior
+
+	for (unsigned n = 0; n < 4; ++n) { // skip Y edges of short sides
+		crown_mat.add_cube_to_verts(sides[n], LT_GRAY, tex_origin, (((n > 1) ? EF_Y12 : 0) | (add_overlap ? 0 : EF_Z1)));
+	}
+	// top
+	cube_t top(hole);
+	top.z1() = crown.z2();
+	top.expand_by_xy(0.1*min_sz);
+	subtract_cube_xy(top, hole, sides);
+	rgeom_mat_t &top_mat(get_untextured_material(0, 0, 0, 0, 1)); // no shadows, exterior
+
+	for (unsigned n = 0; n < 4; ++n) { // skip Y edges of short sides
+		top_mat.add_cube_to_verts_untextured(sides[n], colorRGBA(0.7, 0.24, 0.04), ((n > 1) ? EF_Y12 : 0)); // orange-brown
+	}
+	if (0 && (c.obj_id & 4)) { // cage/cover - not working because alpha test is disabled and drawn order is wrong for blending
+		cube_t cage(c), roof(c);
+		set_cube_zvals(cage, crown.z2(), (c   .z2() + 0.4*dz));
+		set_cube_zvals(roof, cage .z2(), (cage.z2() + 0.1*dz));
+		rgeom_mat_t &cage_mat(get_material(tid_nm_pair_t(get_texture_by_name("roads/chainlink_fence.png"), 400.0), 0, 0, 0, 0, 1)); // no shadows, exterior
+		for (unsigned inv = 0; inv < 2; ++inv) {cage_mat.add_cube_to_verts(cage, WHITE, tex_origin, EF_Z12, 0, 0, 0, inv);} // skip top and bottom surfaces
+		get_metal_material(0, 0, 0, 1).add_cube_to_verts_untextured(roof, GRAY, 0); // no shadows, exterior, all sides
+	}
+}
+
+void building_room_geom_t::add_ext_ladder(room_object_t const &c) {
+	rgeom_mat_t &mat(get_metal_material(0, 0, 0, 1)); // unshadowed, specular metal, exterior; no apply_light_color()
+	float const height(c.get_height()), depth(c.get_depth()), width(c.get_width());
+	float const side_width(0.06*width), rung_spacing(0.8*width), rung_height(0.08*rung_spacing), rung_inset(0.05*depth);
+	unsigned const num_rungs((height - rung_height)/rung_spacing); // round down
+	unsigned const sides_dim_mask(EF_Z1 | ~get_face_mask(c.dim, !c.dir)); // draw all but the bottom and back face against the wall
+	
+	for (unsigned d = 0; d < 2; ++d) { // left/right side verticals
+		cube_t side(c);
+		side.d[!c.dim][!d] = c.d[!c.dim][d] + (d ? -1.0 : 1.0)*side_width;
+		mat.add_cube_to_verts_untextured(side, c.color, sides_dim_mask);
+	}
+	cube_t rung(c);
+	rung.expand_in_dim(!c.dim, -side_width);
+	rung.expand_in_dim( c.dim, -rung_inset);
+	rung.z2() = c.z1() + rung_height; // set top
+	unsigned const rung_skip_faces(get_skip_mask_for_xy(!c.dim)); // skip ends against the sides
+
+	for (unsigned r = 0; r < num_rungs; ++r) { // draw rungs
+		rung.translate_dim(2, rung_spacing); // translate up, starting with first rung
+		mat.add_cube_to_verts_untextured(rung, c.color, rung_skip_faces);
+	}
 }
 
 void building_room_geom_t::add_obj_with_top_texture(room_object_t const &c, string const &texture_name, colorRGBA const &sides_color, bool is_small) {
 	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_texture_by_name(texture_name), 0.0), 1, 0, is_small)); // shadows
 	mat.add_cube_to_verts(c, apply_light_color(c), zero_vector, ~EF_Z2, c.dim, (c.dim ^ c.dir ^ 1), c.dir); // top face only
-	get_untextured_material(1, 0, is_small).add_cube_to_verts_untextured(c, apply_light_color(c, sides_color), EF_Z12); // sides, no shadows, small
+	unsigned const skip_faces(c.is_hanging() ? EF_Z2 : EF_Z12); // hanging keyboards nad laptops must draw the Z1 face
+	get_untextured_material(1, 0, is_small).add_cube_to_verts_untextured(c, apply_light_color(c, sides_color), skip_faces); // sides and maybe bottom, shadows
 }
 void building_room_geom_t::add_obj_with_front_texture(room_object_t const &c, string const &texture_name, colorRGBA const &sides_color, bool is_small) {
-	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_texture_by_name(texture_name), 0.0), 1, 0, is_small)); // shadows
+	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_texture_by_name(texture_name), 0.0, 1), 1, 0, is_small)); // shadows
 	unsigned const front_mask(get_face_mask(c.dim, c.dir));
 	mat.add_cube_to_verts(c, apply_light_color(c), zero_vector, front_mask, !c.dim, (c.dim ^ c.dir ^ 1), 0); // front face only
 	get_untextured_material(1, 0, is_small).add_cube_to_verts_untextured(c, apply_light_color(c, sides_color), ~front_mask); // sides, shadows
 }
 
-void building_room_geom_t::add_keyboard(room_object_t const &c) {add_obj_with_top_texture  (c, "interiors/keyboard.jpg",  BKGRAY, 1);} // is_small=1
-void building_room_geom_t::add_laptop  (room_object_t const &c) {add_obj_with_top_texture  (c, "interiors/laptop.jpg",    BKGRAY, 1);} // is_small=1
-void building_room_geom_t::add_computer(room_object_t const &c) {add_obj_with_front_texture(c, "interiors/computer.jpg",  BKGRAY, 1);} // is_small=1
+void building_room_geom_t::add_keyboard (room_object_t const &c) {add_obj_with_top_texture  (c, "interiors/keyboard.jpg",  BKGRAY, 1);} // is_small=1
+void building_room_geom_t::add_laptop   (room_object_t const &c) {add_obj_with_top_texture  (c, "interiors/laptop.jpg",    BKGRAY, 1);} // is_small=1
+void building_room_geom_t::add_computer (room_object_t const &c) {add_obj_with_front_texture(c, "interiors/computer.jpg",  BKGRAY, 1);} // is_small=1
+
+void place_pizza_toppings(cube_t const &pizza, float rmin, float rmax, float height, colorRGBA const &color, unsigned num, bool can_overlap,
+	rgeom_mat_t &mat, vector<sphere_t> &placed, rand_gen_t &rgen) {
+	assert(rmin > 0.0 && rmin <= rmax && rmax < 1.0); // rmin and rmax are relative to the pizza radius
+	float const pizza_radius(0.5*min(pizza.dx(), pizza.dy())); // should be square
+	rmin *= pizza_radius;
+	rmax *= pizza_radius;
+	cube_t area(pizza);
+	area.expand_by_xy(-(rmax + 0.1*pizza_radius)); // shrink so that any object placed will stay inside the pizza; add 10% border for crust
+	assert(area.is_strictly_normalized());
+	float const place_radius(0.5*min(area.dx(), area.dy()));
+	point const center(area.get_cube_center());
+
+	for (unsigned n = 0; n < num; ++n) {
+		for (unsigned N = 0; N < 10; ++N) { // make up to 10 attempts
+			point pos(0.0, 0.0, pizza.z2());
+			for (unsigned d = 0; d < 2; ++d) {pos[d] = rgen.rand_uniform(area.d[d][0], area.d[d][1]);} // or use gen_xy_pos_in_area()?
+			if (!dist_xy_less_than(pos, center, place_radius)) continue;
+			float const radius((rmin == rmax) ? rmin : rgen.rand_uniform(rmin, rmax));
+
+			if (!can_overlap) {
+				bool overlaps(0);
+
+				for (sphere_t const &s : placed) {
+					if (dist_xy_less_than(pos, s.pos, 1.1*(radius + s.radius))) {overlaps = 1; break;} // add 10% border
+				}
+				if (overlaps) continue;
+				placed.emplace_back(pos, radius);
+			}
+			cube_t c;
+			c.set_from_point(pos);
+			c.expand_by_xy(radius);
+			c.z2() += height*pizza.dz();
+			mat.add_vcylin_to_verts(c, color, 0, 1); // draw sides and top
+			break;
+		} // for N
+	} // for n
+}
+void building_room_geom_t::add_pizza_box(room_object_t const &c) {
+	string const pbox_tex_fn("interiors/pizzatop.jpg");
+	colorRGBA box_color(WHITE);
+
+	if (!c.is_open()) { // draw closed box
+		add_obj_with_top_texture(c, pbox_tex_fn, box_color, 1); // is_small=1
+		return;
+	}
+	// draw open box
+	unsigned const back_skip_mask(get_face_mask(c.dim, !c.dir)); // back of box/top of open box
+	float const height(c.dz()), depth(c.get_depth()); // Note: width should be equal to depth
+	box_color = apply_light_color(c, box_color);
+	cube_t bot(c), lid(c);
+	bot.z2() -= 0.98*height; // shift bottom up slightly to prevent z-fighting, but draw the top
+	lid.z2()  = c.z1() + depth; // set top edge
+	lid.d[c.dim][c.dir] = c.d[c.dim][!c.dir] + (c.dir ? 1.0 : -1.0)*height; // set thickness; width remains unchanged
+	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_texture_by_name(pbox_tex_fn), 0.0), 1, 0, 1)); // shadows, is_small=1
+	mat.add_cube_to_verts(lid, apply_light_color(c), zero_vector, back_skip_mask, !c.dim, (c.dim ^ c.dir ^ 1), 1); // top face only, upside down
+	rgeom_mat_t &untex_mat(get_untextured_material(1, 0, 1));
+	untex_mat.add_cube_to_verts_untextured(c,   box_color, (EF_Z12 | ~back_skip_mask)); // outside sides except for back
+	untex_mat.add_cube_to_verts(c, box_color, all_zeros,   (EF_Z12 | ~back_skip_mask), 0, 0, 0, 1); // inside sides except for back, inverted
+	untex_mat.add_cube_to_verts_untextured(bot, box_color, ~EF_Z2 ); // top surface of bottom of box
+	untex_mat.add_cube_to_verts_untextured(lid, box_color,  get_skip_mask_for_xy(c.dim)); // lid outside sides
+	untex_mat.add_cube_to_verts(lid, box_color, all_zeros, ~get_face_mask(c.dim, c.dir), 0, 0, 0, 1); // lid inside sides and top surface, inverted
+
+	if (c.taken_level == 0) { // draw pizza inside
+		cube_t pizza(c);
+		pizza.expand_by_xy(-0.08*depth);  // small shrink
+		pizza.z2() = c.z1() + 0.3*height; // set height
+		untex_mat.add_vcylin_to_verts(pizza, apply_light_color(c, LT_BROWN), 0, 0); // sides
+		bool const gen_ingredients = 1;
+		string const tex_name(gen_ingredients ? "interiors/cheese_pizza.png" : "interiors/pizza.png");
+		rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_texture_by_name(tex_name), 0.0), 1, 0, 1)); // shadows, small
+		mat.add_vcylin_to_verts(pizza, apply_light_color(c), 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // top only
+		
+		if (gen_ingredients) { // generate random ingredients
+			rand_gen_t rgen;
+			rgen.set_state(c.obj_id+1, (2*c.dim + c.dir + 1));
+			bool const add_pepperoni(rgen.rand_float() < 0.75), add_peppers(add_pepperoni && rgen.rand_float() < 0.75);
+
+			if (add_pepperoni || add_peppers) {
+				static vector<sphere_t> placed;
+				placed.clear();
+				rgeom_mat_t &top_mat(get_untextured_material(0, 0, 1)); // small, untextured, no shadows
+				if (add_pepperoni) {place_pizza_toppings(pizza, 0.11, 0.11, 0.05, colorRGBA(0.7, 0.2, 0.1), 32, 0, top_mat, placed, rgen);} // pepperoni
+				placed.clear(); // allow peppers on top of pepperoni
+				if (add_peppers  ) {place_pizza_toppings(pizza, 0.08, 0.08, 0.20, colorRGBA(0.3, 0.4, 0.1), 28, 0, top_mat, placed, rgen);} // peppers
+			}
+		}
+	}
+}
+void building_room_geom_t::add_pizza_top(room_object_t const &c) {
+	get_untextured_material(0, 0, 1).add_vcylin_to_verts(c, apply_light_color(c), 0, 1); // draw sides and top; unshadowed, small
+}
 
 // used for drawing open microwave and dishwasher
 void add_interior_and_front_face(room_object_t const &c, cube_t const &body, rgeom_mat_t &mat, float wall_width, unsigned front_mask, colorRGBA const &color) {
@@ -895,11 +1252,11 @@ void building_room_geom_t::add_mwave(room_object_t const &c) {
 		body.d[!c.dim][!open_dir] = panel.d[!c.dim][open_dir]; // the other half
 		// draw the sides/top/back
 		unsigned const front_mask(get_face_mask(c.dim, c.dir));
-		get_untextured_material(1).add_cube_to_verts_untextured(c, apply_light_color(c, GRAY), ~front_mask); // sides, shadows, is_small=0
+		rgeom_mat_t &untex_mat(get_untextured_material(1, 0, 1)); // shadowed, small
+		untex_mat.add_cube_to_verts_untextured(c, apply_light_color(c, GRAY), ~front_mask); // sides, shadows, is_small=1
 		// draw the interior
 		colorRGBA const interior_color(apply_light_color(c, WHITE));
 		float const wall_width(0.25*panel.get_sz_dim(!c.dim));
-		rgeom_mat_t &untex_mat(get_untextured_material(1)); // shadowed
 		add_interior_and_front_face(c, body, untex_mat, wall_width, front_mask, interior_color);
 		unsigned const door_front_mask(get_face_mask(!c.dim, open_dir));
 		colorRGBA const color(apply_light_color(c));
@@ -913,13 +1270,13 @@ void building_room_geom_t::add_mwave(room_object_t const &c) {
 		// draw the open door
 		bool const panel_mx(open_dir), door_mx(panel_mx ^ c.dim);
 		tid_nm_pair_t tex(tid, -1, (c.dim ? 0.0 : tscale), (c.dim ? tscale : 0.0));
-		get_material(tex, 1, 0, 0).add_cube_to_verts(door, color, (door_mx ? door.get_urc() : door.get_llc()), door_front_mask, c.dim, door_mx, 0); // shadows, is_small=0
+		get_material(tex, 1, 0, 1).add_cube_to_verts(door, color, (door_mx ? door.get_urc() : door.get_llc()), door_front_mask, c.dim, door_mx, 0); // shadows, is_small=1
 		// draw the front panel, front face only
 		swap(tex.tscale_x, tex.tscale_y); // clipped in other dim
-		get_material(tex, 1, 0, 0).add_cube_to_verts(panel, color, (panel_mx ? c.get_urc() : c.get_llc()), front_mask, !c.dim, panel_mx, 0); // shadows, is_small=0
+		get_material(tex, 1, 0, 1).add_cube_to_verts(panel, color, (panel_mx ? c.get_urc() : c.get_llc()), front_mask, !c.dim, panel_mx, 0); // shadows, is_small=1
 	}
 	else { // closed
-		add_obj_with_front_texture(c, texture_name, GRAY, 0); // is_small=0
+		add_obj_with_front_texture(c, texture_name, GRAY, 1); // is_small=1
 	}
 }
 
@@ -936,7 +1293,7 @@ cube_t get_mirror_surface(room_object_t const &c) {
 	return mirror;
 }
 void building_room_geom_t::add_mirror(room_object_t const &c) {
-	bool const shadowed(c.is_house()); // medicine cabinets in houses cast shadows
+	bool const shadowed(c.get_sz_dim(c.dim) > 0.05*c.dz()); // medicine cabinets cast shadows
 	colorRGBA const side_color(apply_light_color(c));
 
 	if (c.is_open()) { // open medicine cabinet
@@ -970,149 +1327,282 @@ void building_room_geom_t::add_mirror(room_object_t const &c) {
 	}
 }
 
-void building_room_geom_t::add_shower(room_object_t const &c, float tscale) {
-	bool const xdir(c.dim), ydir(c.dir), dirs[2] = {xdir, ydir}; // placed in this corner
+rgeom_mat_t &building_room_geom_t::get_shower_tile_mat(room_object_t const &c, float tscale, colorRGBA &color) {
 	bool const tile_type2(c.obj_id & 1);
-	vector3d const sz(c.get_size());
-	float const signs[2] = {(xdir ? -1.0f : 1.0f), (ydir ? -1.0f : 1.0f)};
-	colorRGBA tile_color(apply_light_color(c));
-	if (!tile_type2) {tile_color = tile_color.modulate_with(colorRGBA(0.8, 0.6, 0.4));} // darker/browner
-	// add tile material along walls and floor
-	int const skip_faces[2] = {(EF_Z1 | (xdir ? EF_X2 : EF_X1)), (EF_Z1 | (ydir ? EF_Y2 : EF_Y1))};
-	rgeom_mat_t &tile_mat(get_material(tid_nm_pair_t((tile_type2 ? TILE_TEX : get_texture_by_name("bathroom_tile.jpg")), 2.5*tscale), 0)); // no shadows
-	cube_t bottom(c), sides[2] = {c, c};
-	bottom.z2() = c.z1() + 0.025*sz.z;
-	tile_mat.add_cube_to_verts(bottom, tile_color, zero_vector, (skip_faces[0] | skip_faces[1]));
-
-	for (unsigned d = 0; d < 2; ++d) {
-		sides[d].d[d][!dirs[d]] -= signs[d]*0.98*sz[d];
-		sides[d].z1() = bottom.z2();
-		tile_mat.add_cube_to_verts(sides[d], tile_color, zero_vector, skip_faces[d]);
-	}
-	// add metal frame around glass
-	colorRGBA const metal_color(apply_light_color(c, GRAY));
-	rgeom_mat_t &metal_mat(get_metal_material(1)); // shadowed, specular metal
-	cube_t fc(c); // corner frame
-	set_cube_zvals(fc, bottom.z2(), (c.z2() - 0.05*sz.z)); // slightly shorter than tile
-	cube_t fxy[2] = {fc, fc};
-	float const glass_bot(fc.z1() + 0.02*sz.z), glass_top(fc.z2() - 0.02*sz.z);
-
-	for (unsigned d = 0; d < 2; ++d) {
-		cube_t &f(fxy[d]);
-		f.d[ d][ dirs[ d]]  = sides[d].d[d][!dirs[d]];
-		f.d[ d][!dirs[ d]]  = sides[d].d[d][!dirs[d]] + signs[d]*0.04*sz[d];
-		f.d[!d][ dirs[!d]] += signs[!d]*0.94*sz[!d];
-		f.d[!d][!dirs[!d]] -= signs[!d]*0.02*sz[!d];
-		metal_mat.add_cube_to_verts_untextured(f, metal_color, skip_faces[d]);
-		fc.d[!d][0] = f.d[!d][0]; fc.d[!d][1] = f.d[!d][1];
-	}
-	metal_mat.add_cube_to_verts_untextured(fc, metal_color, EF_Z1);
-
-	for (unsigned d = 0; d < 2; ++d) { // add top and bottom bars; these overlap with vertical frame cubes, but it should be okay and simplifies the math
-		unsigned const bar_skip_faces(get_skip_mask_for_xy(d));
-		cube_t tb_bars(fxy[d]);
-		tb_bars.union_with_cube(fc);
-		cube_t bot_bar(tb_bars), top_bar(tb_bars);
-		bot_bar.z2() = glass_bot;
-		top_bar.z1() = glass_top;
-		metal_mat.add_cube_to_verts_untextured(bot_bar, metal_color, bar_skip_faces); // the track
-		metal_mat.add_cube_to_verts_untextured(top_bar, metal_color, bar_skip_faces);
-	}
-	// add shower head
-	float const radius(0.5f*(sz.x + sz.y));
-	bool const head_dim(sz.y < sz.x);
+	color = apply_light_color(c);
+	if (!tile_type2) {color = color.modulate_with(colorRGBA(0.8, 0.6, 0.4));} // darker/browner
+	tid_nm_pair_t tex(get_tex_auto_nm((tile_type2 ? TILE_TEX : get_texture_by_name("bathroom_tile.jpg")), 2.5*tscale, 0));
+	if (tile_type2) {tex.set_specular(0.2, 40.0);} else {tex.set_specular(0.8, 60.0);} // TILE_TEX appears too shiny and wet with the default specular
+	return get_material(tex, 0); // no shadows
+}
+void building_room_geom_t::draw_shower_head(room_object_t const &shower, float radius, float wall_pos, float extent_amt, bool head_dim) { // small
+	float const shower_height(shower.dz()), center_pos(shower.get_center_dim(!head_dim));
 	point start_pos, end_pos, base_pos, head_pos;
-	start_pos.z = c.z1() + 0.75*sz.z;
-	start_pos[ head_dim] = sides[head_dim].d[head_dim][!dirs[head_dim]];
-	start_pos[!head_dim] = c.get_center_dim(!head_dim);
+	start_pos.z = shower.z1() + 0.85*shower_height;
+	start_pos[ head_dim] = wall_pos;
+	start_pos[!head_dim] = center_pos;
 	base_pos = start_pos;
-	base_pos[head_dim] += signs[head_dim]*0.06*sz[head_dim]; // move out from the wall
+	base_pos[head_dim]  += extent_amt; // move out from the wall
 	end_pos  = base_pos;
-	end_pos[head_dim] += signs[head_dim]*0.02*sz[head_dim]; // move out from the wall a bit more
+	end_pos [head_dim]  += 0.25*extent_amt; // move out from the wall a bit more
 	head_pos = base_pos;
-	head_pos.z -= 0.05*sz.z;
-	head_pos[ head_dim] += signs[head_dim]*0.09*sz[head_dim];
-	metal_mat.add_cylin_to_verts(base_pos,  head_pos, 0.02*radius, 0.10*radius, metal_color, 0, 1); // draw top/wide end only
-	metal_mat.add_cylin_to_verts(start_pos, end_pos,  0.02*radius, 0.02*radius, metal_color, 0, 0); // no ends
-	// add door handle
-	bool const hdim(c.dx() < c.dy()), hdir(dirs[hdim]), hside(!dirs[!hdim]); // hdim is the larger dim
-	float const frame_width(fc.dx()), door_width(sz[!hdim]);
-	float const wall_dist(0.77*door_width), handle_thickness(0.8*frame_width), hdir_sign(hdir ? -1.0 : 1.0), wall_pos(c.d[hdim][!hdir]);
-	cube_t handle(c);
-	handle.z1() += 0.48*sz.z;
-	handle.z2() -= 0.42*sz.z;
+	head_pos.z -= 0.05*shower_height;
+	base_pos.z += 0.012*radius;
+	base_pos[head_dim] += 0.02*extent_amt;
+	head_pos[head_dim] += 1.5*extent_amt;
+	colorRGBA const color(apply_light_color(shower, LT_GRAY));
+	rgeom_mat_t &metal_mat(get_metal_material(1, 0, 1)); // shadowed, specular metal, small
+	metal_mat.add_cylin_to_verts(base_pos,  head_pos, 0.01*radius, 0.07*radius, color, 0, 0); // shower head; draw sides only
+	metal_mat.add_cylin_to_verts(start_pos, end_pos,  0.02*radius, 0.02*radius, color, 0, 1); // pipe into wall; draw exposed end
+	// draw water control handles/knobs
+	point knob_pos;
+	knob_pos[head_dim] = wall_pos;
+	knob_pos.z = shower.z1() + 0.55*shower_height;
 
-	if (c.is_open()) { // move it into the open position; the math for this is pretty complex, so it's somewhat of a trial-and error with the constants
-		bool const odir(dirs[hdim]);
-		float const odir_sign(odir ? -1.0 : 1.0), hside_sign(hside ? 1.0 : -1.0), inner_extend(wall_pos + odir_sign*(wall_dist - 2.0*frame_width));
-		float const open_glass_pos(c.d[!hdim][!hside] + hside_sign*0.39*frame_width);
-		handle.d[!hdim][ hside] = open_glass_pos;
-		handle.d[!hdim][!hside] = open_glass_pos + hside_sign*handle_thickness; // outer edge
-		handle.d[ hdim][!odir ] = inner_extend;
-		handle.d[ hdim][ odir ] = inner_extend + odir_sign*0.03*door_width;
+	if (shower.obj_id & 8) { // single control
+		knob_pos[!head_dim] = center_pos;
+		point knob_end(knob_pos);
+		knob_end[head_dim] += 0.3*extent_amt; // move out slightly
+		metal_mat.add_cylin_to_verts(knob_pos, knob_end, 0.12*radius, 0.12*radius, color, 0, 1); // plate; draw exposed end
+		knob_end[head_dim] += 1.25*extent_amt; // move out more
+		metal_mat.add_cylin_to_verts(knob_pos, knob_end, 0.04*radius, 0.03*radius, color, 0, 1); // knob; draw exposed end
+		knob_end[head_dim] -= 0.4*extent_amt; // move back a bit
+		point handle_end(knob_end);
+		handle_end.z -= 0.12*radius; // points downward
+		metal_mat.add_cylin_to_verts(knob_end, handle_end, 0.02*radius, 0.015*radius, color, 0, 1); // draw exposed end
 	}
-	else { // closed
-		float const hside_sign(hside ? -1.0 : 1.0), glass_pos(wall_pos - hdir_sign*(0.19*frame_width + 0.02*sz[hdir])); // place on the glass but slightly offset
-		handle.d[ hdim][ hdir ]  = glass_pos;
-		handle.d[ hdim][!hdir ]  = glass_pos + hdir_sign*handle_thickness; // outer edge
-		handle.d[!hdim][ hside] += hside_sign*0.20*door_width; // distance to outer wall/corner
-		handle.d[!hdim][!hside] -= hside_sign*wall_dist;
-	}
-	metal_mat.add_cube_to_verts_untextured(handle, metal_color); // draw all faces
-	// add drain
-	cube_t drain;
-	drain.set_from_point(bottom.get_cube_center());
-	set_cube_zvals(drain, bottom.z2(), (bottom.z2() + 0.05*bottom.dz())); // very small height
-	drain.expand_by_xy(0.06*radius); // set radius
-	get_material(tid_nm_pair_t(MANHOLE_TEX, 0.0), 0).add_vcylin_to_verts(drain, metal_color, 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // draw top only, not sides, unshadowed
-	// add transparent glass
-	colorRGBA const glass_color(apply_light_color(c, colorRGBA(1.0, 1.0, 1.0, 0.25)));
-	rgeom_mat_t &glass_mat(get_untextured_material(0, 0, 0, 1)); // no shadows; transparent=1
-
-	for (unsigned d = 0; d < 2; ++d) { // for each dim
-		bool const dir(dirs[d]);
-		cube_t glass(fc); // start from the frame at the corner
-		glass.z1()  = glass_bot;
-		glass.z2()  = glass_top;
-		glass.z1() += 0.002*sz.z; // to prevent z-fighting
-		glass.z2() -= 0.002*sz.z; // to prevent z-fighting
-		glass.d[d][!dir] = glass. d[d][ dir]; // corner point; remove overlap with frame
-		glass.d[d][ dir] = fxy[d].d[d][!dir]; // edge near the wall
-		glass.expand_in_dim( d, -0.01*frame_width); // to prevent z-fighting
-		glass.expand_in_dim(!d, -0.20*frame_width); // set thickness
-
-		if (bool(d) != hdim && c.is_open()) { // draw open door
-			bool const odir(dirs[!d]);
-			float const width(glass.get_sz_dim(d)), thickness(glass.get_sz_dim(!d)), delta(width - thickness);
-			glass.d[ d][! dir] -= ( dir ? -1.0 : 1.0)*delta; // shrink width to thickness
-			glass.d[!d][!odir] += (odir ? -1.0 : 1.0)*delta; // expand thickness to width
-			// draw frame part of door
-			float const door_frame_width(0.4*frame_width);
-			cube_t top(glass), bot(glass), side(glass);
-			set_cube_zvals(top, (glass.z2() + 0.01*door_frame_width), (glass.z2() + door_frame_width)); // prevent z-fighting
-			set_cube_zvals(bot, (glass.z1() - door_frame_width), (glass.z1() - 0.01*door_frame_width));
-			side.d[!d][!odir] = top.d[!d][!odir] = bot.d[!d][!odir] = glass.d[!d][!odir] + (odir ? -1.0 : 1.0)*door_frame_width;
-			side.d[!d][ odir] = glass.d[!d][!odir]; // flush with glass on this end
-			rgeom_mat_t &metal_mat2(get_metal_material(1)); // get the metal material again, in case the reference was invaldiated
-			metal_mat2.add_cube_to_verts_untextured(top,  metal_color); // draw all faces
-			metal_mat2.add_cube_to_verts_untextured(bot,  metal_color); // draw all faces
-			metal_mat2.add_cube_to_verts_untextured(side, metal_color, EF_Z12); // skip top and bottom faces
+	else { // separate hot/cold
+		for (unsigned d = 0; d < 2; ++d) { // left/right | hot/cold
+			knob_pos[!head_dim] = center_pos + (d ? 1.0 : -1.0)*0.13*radius;
+			point knob_end(knob_pos);
+			knob_end[head_dim] += 1.5*extent_amt; // move out from the wall
+			metal_mat.add_cylin_to_verts(knob_pos, knob_end, 0.04*radius, 0.03*radius, color, 0, 1); // draw exposed end
 		}
-		glass_mat.add_cube_to_verts(glass, glass_color, all_zeros, 0, 0, 0, 0, 1); // inside surface, inverted
-		glass_mat.add_cube_to_verts_untextured(glass, glass_color, (EF_Z1 | (d ? EF_Y12 : EF_X12))); // outside surface
-	} // for d
+	}
+	// draw shower head nozzles using a custom texture
+	tid_nm_pair_t tex(get_texture_by_name("interiors/pegboard.png"), 1.0, 1); // shadowed
+	tex.set_specular_color(WHITE, 0.8, 60.0);
+	rgeom_mat_t &head_mat(get_material(tex, 1, 0, 1)); // shadowed, small
+	head_mat.add_cylin_to_verts(base_pos, head_pos, 0.01*radius, 0.07*radius, color, 0, 1, 0, 0, 1.0, 0.5, 1); // skip_sides=1; draw top/end only
 }
 
-void building_room_geom_t::add_bottle(room_object_t const &c) {
+void building_room_geom_t::add_shower(room_object_t const &c, float tscale, bool inc_lg, bool inc_sm) {
+	bool const xdir(c.dim), ydir(c.dir), dirs[2] = {xdir, ydir}; // placed in this corner
+	vector3d const sz(c.get_size());
+	float const signs[2] = {(xdir ? -1.0f : 1.0f), (ydir ? -1.0f : 1.0f)};
+	float const radius(0.5f*(sz.x + sz.y));
+	colorRGBA const metal_color(apply_light_color(c, GRAY));
+	cube_t bottom(c), sides[2] = {c, c};
+	bottom.z2() = c.z1() + 0.025*sz.z;
+
+	for (unsigned d = 0; d < 2; ++d) { // walls
+		sides[d].d[d][!dirs[d]] -= signs[d]*0.98*sz[d];
+		sides[d].z1() = bottom.z2();
+	}
+	if (inc_lg) { // frame, glass, and handle are drawn as large objects so that we don't need to update small objects when doors are opened or closed
+		// add tile material along walls and floor
+		int const skip_faces[2] = {(EF_Z1 | (xdir ? EF_X2 : EF_X1)), (EF_Z1 | (ydir ? EF_Y2 : EF_Y1))};
+		colorRGBA tile_color;
+		rgeom_mat_t &tile_mat(get_shower_tile_mat(c, tscale, tile_color));
+		tile_mat.add_cube_to_verts(bottom, tile_color, zero_vector, (skip_faces[0] | skip_faces[1]));
+		for (unsigned d = 0; d < 2; ++d) {tile_mat.add_cube_to_verts(sides[d], tile_color, zero_vector, skip_faces[d]);} // walls
+
+		if (c.item_flags) { // draw water
+			cube_t water(bottom);
+			set_cube_zvals(water, bottom.z2(), (bottom.z2() + 0.01*sz.z)); // thin layer of water
+			water.expand_by_xy(-0.01*(sz.x + sz.y)); // small shrink
+			add_water_plane(c, water, 1.0); // water_level=1.0
+		}
+		// add metal frame around glass
+		rgeom_mat_t &metal_mat(get_metal_material(1)); // shadowed, specular metal
+		cube_t fc(c); // corner frame
+		set_cube_zvals(fc, bottom.z2(), (c.z2() - 0.05*sz.z)); // slightly shorter than tile
+		cube_t fxy[2] = {fc, fc};
+		float const glass_bot(fc.z1() + 0.02*sz.z), glass_top(fc.z2() - 0.02*sz.z);
+
+		for (unsigned d = 0; d < 2; ++d) {
+			cube_t &f(fxy[d]);
+			f.d[ d][ dirs[ d]]  = sides[d].d[d][!dirs[d]];
+			f.d[ d][!dirs[ d]]  = sides[d].d[d][!dirs[d]] + signs[d]*0.04*sz[d];
+			f.d[!d][ dirs[!d]] += signs[!d]*0.94*sz[!d];
+			f.d[!d][!dirs[!d]] -= signs[!d]*0.02*sz[!d];
+			metal_mat.add_cube_to_verts_untextured(f, metal_color, skip_faces[d]);
+			fc.d[!d][0] = f.d[!d][0]; fc.d[!d][1] = f.d[!d][1];
+		}
+		metal_mat.add_cube_to_verts_untextured(fc, metal_color, EF_Z1);
+
+		for (unsigned d = 0; d < 2; ++d) { // add top and bottom bars; these overlap with vertical frame cubes, but it should be okay and simplifies the math
+			unsigned const bar_skip_faces(get_skip_mask_for_xy(d));
+			cube_t tb_bars(fxy[d]);
+			tb_bars.union_with_cube(fc);
+			cube_t bot_bar(tb_bars), top_bar(tb_bars);
+			bot_bar.z2() = glass_bot;
+			top_bar.z1() = glass_top;
+			metal_mat.add_cube_to_verts_untextured(bot_bar, metal_color, bar_skip_faces); // the track
+			metal_mat.add_cube_to_verts_untextured(top_bar, metal_color, bar_skip_faces);
+		}
+		// add door handle
+		bool const hdim(c.dx() < c.dy()), hdir(dirs[hdim]), hside(!dirs[!hdim]); // hdim is the larger dim
+		float const frame_width(fc.dx()), door_width(sz[!hdim]);
+		float const wall_dist(0.77*door_width), handle_thickness(0.8*frame_width), hdir_sign(hdir ? -1.0 : 1.0), wall_pos(c.d[hdim][!hdir]);
+		cube_t handle(c);
+		handle.z1() += 0.48*sz.z;
+		handle.z2() -= 0.42*sz.z;
+
+		if (c.is_open()) { // move it into the open position; the math for this is pretty complex, so it's somewhat of a trial-and error with the constants
+			bool const odir(dirs[hdim]);
+			float const odir_sign(odir ? -1.0 : 1.0), hside_sign(hside ? 1.0 : -1.0), inner_extend(wall_pos + odir_sign*(wall_dist - 2.0*frame_width));
+			float const open_glass_pos(c.d[!hdim][!hside] + hside_sign*0.39*frame_width);
+			handle.d[!hdim][ hside] = open_glass_pos;
+			handle.d[!hdim][!hside] = open_glass_pos + hside_sign*handle_thickness; // outer edge
+			handle.d[ hdim][!odir ] = inner_extend;
+			handle.d[ hdim][ odir ] = inner_extend + odir_sign*0.03*door_width;
+		}
+		else { // closed
+			float const hside_sign(hside ? -1.0 : 1.0), glass_pos(wall_pos - hdir_sign*(0.19*frame_width + 0.02*sz[hdir])); // place on the glass but slightly offset
+			handle.d[ hdim][ hdir ]  = glass_pos;
+			handle.d[ hdim][!hdir ]  = glass_pos + hdir_sign*handle_thickness; // outer edge
+			handle.d[!hdim][ hside] += hside_sign*0.20*door_width; // distance to outer wall/corner
+			handle.d[!hdim][!hside] -= hside_sign*wall_dist;
+		}
+		metal_mat.add_cube_to_verts_untextured(handle, metal_color); // draw all faces
+		// add transparent glass
+		colorRGBA const glass_color(apply_light_color(c, colorRGBA(1.0, 1.0, 1.0, 0.25)));
+		rgeom_mat_t &glass_mat(get_untextured_material(0, 0, 0, 1)); // no shadows; transparent=1
+
+		for (unsigned d = 0; d < 2; ++d) { // for each dim
+			bool const dir(dirs[d]);
+			cube_t glass(fc); // start from the frame at the corner
+			glass.z1()  = glass_bot;
+			glass.z2()  = glass_top;
+			glass.z1() += 0.002*sz.z; // to prevent z-fighting
+			glass.z2() -= 0.002*sz.z; // to prevent z-fighting
+			glass.d[d][!dir] = glass. d[d][ dir]; // corner point; remove overlap with frame
+			glass.d[d][ dir] = fxy[d].d[d][!dir]; // edge near the wall
+			glass.expand_in_dim( d, -0.01*frame_width); // to prevent z-fighting
+			glass.expand_in_dim(!d, -0.20*frame_width); // set thickness
+
+			if (bool(d) != hdim && c.is_open()) { // draw open door
+				bool const odir(dirs[!d]);
+				float const width(glass.get_sz_dim(d)), thickness(glass.get_sz_dim(!d)), delta(width - thickness);
+				glass.d[ d][! dir] -= ( dir ? -1.0 : 1.0)*delta; // shrink width to thickness
+				glass.d[!d][!odir] += (odir ? -1.0 : 1.0)*delta; // expand thickness to width
+				// draw frame part of door
+				float const door_frame_width(0.4*frame_width);
+				cube_t top(glass), bot(glass), side(glass);
+				set_cube_zvals(top, (glass.z2() + 0.01*door_frame_width), (glass.z2() + door_frame_width)); // prevent z-fighting
+				set_cube_zvals(bot, (glass.z1() - door_frame_width), (glass.z1() - 0.01*door_frame_width));
+				side.d[!d][!odir] = top.d[!d][!odir] = bot.d[!d][!odir] = glass.d[!d][!odir] + (odir ? -1.0 : 1.0)*door_frame_width;
+				side.d[!d][ odir] = glass.d[!d][!odir]; // flush with glass on this end
+				rgeom_mat_t &metal_mat2(get_metal_material(1)); // get the metal material again, in case the reference was invaldiated
+				metal_mat2.add_cube_to_verts_untextured(top,  metal_color); // draw all faces
+				metal_mat2.add_cube_to_verts_untextured(bot,  metal_color); // draw all faces
+				metal_mat2.add_cube_to_verts_untextured(side, metal_color, EF_Z12); // skip top and bottom faces
+			}
+			glass_mat.add_cube_to_verts(glass, glass_color, all_zeros, 0, 0, 0, 0, 1); // inside surface, inverted
+			glass_mat.add_cube_to_verts_untextured(glass, glass_color, (EF_Z1 | (d ? EF_Y12 : EF_X12))); // outside surface
+		} // for d
+	}
+	if (inc_sm) {
+		// add shower head
+		bool const head_dim(sz.y < sz.x);
+		float const inner_wall_pos(sides[head_dim].d[head_dim][!dirs[head_dim]]), extent_amt(signs[head_dim]*0.06*sz[head_dim]);
+		draw_shower_head(c, radius, inner_wall_pos, extent_amt, head_dim);
+		// add drain
+		cube_t drain;
+		drain.set_from_point(bottom.get_cube_center());
+		set_cube_zvals(drain, bottom.z2(), (bottom.z2() + 0.05*bottom.dz())); // very small height
+		drain.expand_by_xy(0.06*radius); // set radius
+		add_drain_cover(drain, metal_color);
+	}
+}
+
+cube_t get_shower_tub_wall(room_object_t const &c) {
+	bool const shower_dir(c.flags & RO_FLAG_ADJ_HI); // adjacent wall
+	float const width(c.get_width()), tub_len(width/1.05), wall_thick(width - tub_len);
+	cube_t wall(c);
+	wall.d[!c.dim][shower_dir] = c.d[!c.dim][!shower_dir] + (shower_dir ? 1.0 : -1.0)*wall_thick; // inner wall pos
+	return wall;
+}
+void building_room_geom_t::add_shower_tub(room_object_t const &c, tid_nm_pair_t const &wall_tex, colorRGBA const &trim_color, float tscale, bool inc_lg, bool inc_sm) {
+	bool const shower_dir(c.flags & RO_FLAG_ADJ_HI); // adjacent wall
+	float const width(c.get_width()), depth(c.get_depth()), height(c.dz());
+	cube_t const wall(get_shower_tub_wall(c));
+	float const inner_wall_pos(wall.d[!c.dim][shower_dir]);
+	float const crod_radius(0.025*depth);
+	cube_t crod;
+	set_wall_width(crod, (c.z1() + 0.9*height), crod_radius, 2);
+	set_wall_width(crod, (c.d[c.dim][c.dir] + (c.dir ? -1.0 : 1.0)*1.2*crod_radius), crod_radius, c.dim);
+
+	if (inc_lg) {
+		// draw end wall
+		rgeom_mat_t &wall_mat(get_material(get_scaled_wall_tex(wall_tex), 1));
+		wall_mat.add_cube_to_verts(wall, c.color, tex_origin, (EF_Z12 | ~get_face_mask(c.dim, !c.dir) | ~get_face_mask(!c.dim, shower_dir))); // draw front and outside
+		// draw tile on 3 sides
+		float const tile_thickness(0.05*wall.get_sz_dim(!c.dim)); // nonzero to avoid Z-fighing with room walls
+		colorRGBA tile_color;
+		rgeom_mat_t &tile_mat(get_shower_tile_mat(c, tscale, tile_color));
+		cube_t tiled_area(c); // must extend entier Z-range and behind the tub since the inside face of the wall isn't drawn
+		tiled_area.d[!c.dim][!shower_dir]  = inner_wall_pos;
+		tiled_area.d[!c.dim][ shower_dir] += (shower_dir ? -1.0 :  1.0)*tile_thickness;
+		tiled_area.d[ c.dim][     !c.dir] += (     c.dir ?  1.0 : -1.0)*tile_thickness;
+		tile_mat.add_cube_to_verts(tiled_area, tile_color, zero_vector, (EF_Z12 | ~get_face_mask(c.dim, c.dir)), 0, 0, 0, 1); // inverted; skip top, bottom, and front
+		// draw curtains using blinds texture
+		cube_t curtains(c);
+		curtains.z1() += 0.1*height;
+		curtains.z2()  = crod.z2() + 0.5*crod_radius;
+		curtains.d[c.dim][ c.dir] += (c.dir ? 1.0 : -1.0)*1.0*crod_radius; // outer
+		curtains.d[c.dim][!c.dir]  = crod.d[c.dim][c.dir]; // inner
+		curtains.d[!c.dim][!shower_dir] = inner_wall_pos; // shower wall
+		tid_nm_pair_t const curtains_tex(get_blinds_tid(), get_blinds_nm_tid(), 0.0, 0.0);
+		rgeom_mat_t &curtains_mat(get_material(curtains_tex, 1));
+		colorRGBA const curtains_color(apply_light_color(c, WHITE));
+
+		for (unsigned oi = 0; oi < 2; ++oi) { // {outer, inner}
+			for (unsigned d = 0; d < 2; ++d) { // each side
+				float const curtain_width(((d ? !c.is_active() : c.is_open()) ? 0.15 : 0.45)*width); // uses two different flags for low vs. high sides
+				(c.dim ? curtains_mat.tex.tscale_x : curtains_mat.tex.tscale_y) = 0.2/curtain_width; // okay to set since tscale isn't used as a key
+				cube_t curtain(curtains);
+				curtain.d[!c.dim][!d] = curtains.d[!c.dim][d] + (d ? -1.0 : 1.0)*curtain_width;
+				curtains_mat.add_cube_to_verts(curtain, curtains_color, curtain.get_llc(), EF_Z1, c.dim); // skip bottom edge
+			}
+			if (oi == 0) {curtains.translate_dim(c.dim, (c.dir ? -1.0 : 1.0)*(2.0*crod_radius + curtains.get_sz_dim(c.dim)));} // translate to inside of curtain rod
+		} // for oi
+	}
+	if (inc_sm) {
+		// draw shower head
+		float const wall_pos(c.d[!c.dim][shower_dir]), extent_amt((shower_dir ? -1.0 : 1.0)*0.05*depth);
+		draw_shower_head(c, depth, wall_pos, extent_amt, !c.dim);
+		// draw curtain rod
+		crod.d[!c.dim][ shower_dir] = c.d[!c.dim][shower_dir]; // room wall
+		crod.d[!c.dim][!shower_dir] = inner_wall_pos; // shower wall
+		rgeom_mat_t &metal_mat(get_metal_material(1, 0, 1)); // shadowed, small, specular metal
+		metal_mat.add_ortho_cylin_to_verts(crod, apply_light_color(c, GRAY_BLACK), !c.dim, 0, 0); // sides only, no ends
+		// add wall trim to the side wall
+		float const window_vspacing(height*(1.0 + FLOOR_THICK_VAL_HOUSE));
+		float const trim_height(0.04*window_vspacing), trim_thickness(0.1*WALL_THICK_VAL*window_vspacing);
+		unsigned const skip_faces(EF_Z1 | ~get_face_mask(c.dim, !c.dir)); // skip bottom and back
+		cube_t trim(wall);
+		trim.z2() = wall.z1() + trim_height;
+		trim.d[!c.dim][!shower_dir] += (shower_dir ? -1.0 : 1.0)*trim_thickness; // shift outside of wall
+		trim.d[ c.dim][ c.dir     ] += (c.dir      ? 1.0 : -1.0)*trim_thickness; // shift front edge outward
+		get_untextured_material(0, 0, 1).add_cube_to_verts_untextured(trim, trim_color, skip_faces); // is_small, untextured, no shadows
+	} // end inc_sm
+}
+
+void building_room_geom_t::add_bottle(room_object_t const &c, bool add_bottom) {
 	// obj_id: bits 1-3 for type, bits 6-7 for emptiness, bit 6 for cap color
-	unsigned const bottle_ndiv = 16; // use smaller ndiv to reduce vertex count
+	unsigned const bottle_ndiv = 16; // use smaller ndiv to reduce vertex count; must be 16 to match sphere low_detail mode
+	bool const cap_color_ix(c.obj_id & 64);
+	colorRGBA const color(apply_light_color(c));
+	colorRGBA const cap_colors[2] = {LT_GRAY, GOLD}, cap_spec_colors[2] = {WHITE, GOLD};
 	tid_nm_pair_t tex(-1, 1.0, 1); // shadowed
 	tex.set_specular(0.5, 80.0);
 	rgeom_mat_t &mat(get_material(tex, 1, 0, 1)); // inc_shadows=1, dynamic=0, small=1
-	colorRGBA const color(apply_light_color(c)), cap_colors[2] = {LT_GRAY, GOLD}; // should gold caps have gold colored specular?
 	vector3d const sz(c.get_size());
 	unsigned const dim(get_max_dim(sz)), dim1((dim+1)%3), dim2((dim+2)%3);
-	bool const is_empty(c.is_bottle_empty()), add_bottom(dim != 2); // add bottom if bottle is on its side
+	bool const is_empty(c.is_bottle_empty());
+	add_bottom |= (dim != 2); // add bottom if bottle is on its side
 	float const dir_sign(c.dir ? -1.0 : 1.0), radius(0.25f*(sz[dim1] + sz[dim2])); // base should be square (default/avg radius is 0.15*height)
 	float const length(sz[dim]); // AKA height, if standing up
 	cube_t sphere(c), body(c), neck(c);
@@ -1126,21 +1616,29 @@ void building_room_geom_t::add_bottle(room_object_t const &c) {
 	neck.d[dim][!c.dir] = cap.d[dim][c.dir] = c.d[dim][!c.dir] - dir_sign*0.08*length; // set cap thickness
 	cap.expand_in_dim(dim1, -0.006*sz[dim1]); // slightly larger radius than narrow end of neck
 	cap.expand_in_dim(dim2, -0.006*sz[dim2]); // slightly larger radius than narrow end of neck
+	float const rot_angle(c.rotates() ? (0.1*c.obj_id + PI*c.color.R + 2.0*PI*c.color.G) : 0.0);
 	// draw as a sphere
+	unsigned const verts_start(mat.itri_verts.size());
 	vector3d skip_hemi_dir(zero_vector);
 	skip_hemi_dir[dim] = -dir_sign;
 	mat.add_sphere_to_verts(sphere, color, 1, skip_hemi_dir); // low_detail=1
-	mat.add_ortho_cylin_to_verts(body, color, dim, (add_bottom && !c.dir), (add_bottom && c.dir), 0, 0, 1.0, 1.0, 1.0, 1.0, 0, bottle_ndiv);
+	mat.add_ortho_cylin_to_verts(body, color, dim, (add_bottom && !c.dir), (add_bottom && c.dir), 0, 0, 1.0, 1.0, 1.0, 1.0, 0, bottle_ndiv); // bottom
 	// draw neck of bottle as a truncated cone; draw as two sided if empty
-	mat.add_ortho_cylin_to_verts(neck, color, dim, 0, 0, is_empty, 0, (c.dir ? 0.85 : 1.0), (c.dir ? 1.0 : 0.85), 1.0, 1.0, 0, bottle_ndiv);
+	mat.add_ortho_cylin_to_verts(neck, color, dim, 0, 0, is_empty, 0, (c.dir ? 0.85 : 1.0), (c.dir ? 1.0 : 0.85), 1.0, 1.0, 0, bottle_ndiv); // neck
+	if (rot_angle != 0.0) {rotate_verts(mat.itri_verts, plus_z, rot_angle, c.get_cube_center(), verts_start);}
 
 	if (!is_empty) { // draw cap if nonempty
-		bool const draw_bot(c.was_expanded());
-		mat.add_ortho_cylin_to_verts(cap, apply_light_color(c, cap_colors[bool(c.obj_id & 64)]), dim,
+		bool const draw_bot(c.was_expanded() && !(c.flags & RO_FLAG_ON_SRACK));
+		tid_nm_pair_t cap_tex(-1, 1.0, 0); // unshadowed
+		cap_tex.set_specular_color(cap_spec_colors[cap_color_ix], 0.8, 80.0);
+		rgeom_mat_t &cap_mat(get_material(cap_tex, 0, 0, 1)); // inc_shadows=0, dynamic=0, small=1
+		unsigned const cap_verts_start(cap_mat.itri_verts.size());
+		cap_mat.add_ortho_cylin_to_verts(cap, apply_light_color(c, cap_colors[cap_color_ix]), dim,
 			(draw_bot || c.dir), (draw_bot || !c.dir), 0, 0, 1.0, 1.0, 1.0, 1.0, 0, bottle_ndiv);
+		if (rot_angle != 0.0) {rotate_verts(cap_mat.itri_verts, plus_z, rot_angle, c.get_cube_center(), cap_verts_start);}
 	}
 	// add the label
-	// Note: we could add a bottom sphere to make it a capsule, then translate below the surface in -z to flatten the bottom
+	// Note: we could add a bottom sphere to make it a capsule, then translate below the surface in -z to flatten the bottom; it wouldn't work for hoizontal bottles though
 	body.expand_in_dim(dim1, 0.03*radius); // expand slightly in radius
 	body.expand_in_dim(dim2, 0.03*radius); // expand slightly in radius
 	body.d[dim][c.dir] += dir_sign*0.24*length; body.d[dim][!c.dir] -= dir_sign*0.12*length; // shrink in length
@@ -1148,8 +1646,10 @@ void building_room_geom_t::add_bottle(room_object_t const &c) {
 	float const tscale(bp.label_tscale); // some labels are more square and scaled 2x to repeat as they're more stretched out; should we use a partial cylinder instead?
 	float const tscale_add(0.123*c.obj_id); // add a pseudo-random rotation to the label texture
 	string const &texture_fn(bp.texture_fn); // select the custom label texture for each bottle type
-	rgeom_mat_t &label_mat(get_material(tid_nm_pair_t(texture_fn.empty() ? -1 : get_texture_by_name(texture_fn)), 0, 0, 1));
+	rgeom_mat_t &label_mat(get_material(tid_nm_pair_t(texture_fn.empty() ? -1 : get_texture_by_name(texture_fn)), 0, 0, 1)); // unshadowed
+	unsigned const label_verts_start(label_mat.itri_verts.size());
 	label_mat.add_ortho_cylin_to_verts(body, apply_light_color(c, WHITE), dim, 0, 0, 0, 0, 1.0, 1.0, tscale, 1.0, 0, bottle_ndiv, tscale_add); // draw label
+	if (rot_angle != 0.0) {rotate_verts(label_mat.itri_verts, plus_z, rot_angle, c.get_cube_center(), label_verts_start);}
 }
 
 // functions reused from snake drawing
@@ -1161,12 +1661,13 @@ void building_room_geom_t::add_vase(room_object_t const &c) { // or urn
 	colorRGBA color(apply_light_color(c));
 	UNROLL_3X(min_eq(color[i_], 0.9f);); // clamp color to 90% max to avoid over saturation
 	// parametric curve rotated around the Z-axis
-	unsigned const num_stacks = 32;
+	unsigned const lod_factor(c.was_expanded() ? 2 : 1); // use lower detail for expanded vases/urns on shelf racks
+	unsigned const num_stacks(32 / lod_factor);
 	rand_gen_t rgen(c.create_rgen());
 	float tex_scale_v(1.0), tex_scale_h(1.0);
 	int tid(WHITE_TEX);
 
-	if (c.color == WHITE) { // while color, apply a texture
+	if (c.color.get_luminance() > 0.9) { // nearly white color, apply a texture
 		if (rgen.rand_bool()) { // marble
 			tid = get_texture_by_name(rgen.rand_bool() ? "marble2.jpg" : "marble.jpg");
 			tex_scale_v = tex_scale_h = (1 + (rgen.rand()&3)); // must be an integer, 1-4
@@ -1178,7 +1679,7 @@ void building_room_geom_t::add_vase(room_object_t const &c) { // or urn
 		}
 	}
 	rgeom_mat_t &side_mat(get_material(tid_nm_pair_t(tid, 0.0, 1), 1, 0, 1)); // shadowed, small
-	unsigned const ndiv(N_CYL_SIDES), itris_start(side_mat.itri_verts.size()), ixs_start(side_mat.indices.size());
+	unsigned const ndiv(N_CYL_SIDES / lod_factor), itris_start(side_mat.itri_verts.size()), ixs_start(side_mat.indices.size());
 	float const tscale(tex_scale_v/num_stacks), zstep(c.dz()/num_stacks);
 	float const rbase(c.get_radius()), rmax(rbase);
 	float rmin(rgen.rand_uniform(0.25, 0.75)*rbase);
@@ -1192,7 +1693,7 @@ void building_room_geom_t::add_vase(room_object_t const &c) { // or urn
 	float radius(start_radius);
 	unsigned data_pos(itris_start);
 	color_wrapper const cw(color);
-	point p1(c.xc(), c.yc(), c.z1()), p2(p1 + vector3d(0.0, 0.0, zstep));
+	point p1(cube_bot_center(c)), p2(p1 + vector3d(0.0, 0.0, zstep));
 
 	for (unsigned n = 0; n < num_stacks; ++n) {
 		float const taper_pos(taper_scale*(n+1));
@@ -1216,7 +1717,7 @@ void building_room_geom_t::add_paper(room_object_t const &c) {
 	unsigned const qv_start(mat.quad_verts.size());
 	mat.add_cube_to_verts(c, apply_light_color(c), zero_vector, ~EF_Z2, c.dim, (c.dim ^ c.dir ^ 1), c.dir); // unshadowed, top face only, with proper orient
 	
-	if (c.flags & RO_FLAG_RAND_ROT) { // add slight rotation to misalign the paper
+	if (c.rotates()) { // add slight rotation to misalign the paper
 		float const angle((PI/8.0)*(fract(123.456*c.obj_id) - 0.5));
 		rotate_verts(mat.quad_verts, plus_z, angle, c.get_cube_center(), qv_start);
 	}
@@ -1271,7 +1772,55 @@ int get_flooring_texture(room_object_t const &c) {
 	return -1; // shouldn't get here
 }
 void building_room_geom_t::add_flooring(room_object_t const &c, float tscale) {
-	get_material(tid_nm_pair_t(get_flooring_texture(c), 0.8*tscale)).add_cube_to_verts(c, apply_light_color(c), tex_origin, ~EF_Z2); // top face only, unshadowed
+	// open wall rooms are not colored by room lights as this can create seams in the floor lighting
+	colorRGBA const color(c.is_open() ? c.color : blend_color(c.color, apply_light_color(c), 0.5, 0.0)); // 50% mix
+	get_material(tid_nm_pair_t(get_flooring_texture(c), 0.8*tscale)).add_cube_to_verts(c, color, tex_origin, ~EF_Z2); // top face only, unshadowed
+}
+
+tquad_t get_ramp_tquad(room_object_t const &c) { // Note: normal is for the bottom surface
+	tquad_t ramp(4); // ramp top surface
+	float const zv[2] = {c.z1(), c.z2()};
+	// dim dir z0 z1 z2 z3
+	// 0   0   1  0  0  1
+	// 0   1   0  1  1  0
+	// 1   0   1  1  0  0
+	// 1   1   0  0  1  1
+	ramp.pts[0].assign(c.x1(), c.y1(), zv[!c.dir]); // LL
+	ramp.pts[1].assign(c.x2(), c.y1(), zv[c.dim ^ c.dir]); // LR
+	ramp.pts[2].assign(c.x2(), c.y2(), zv[c.dir]); // UR
+	ramp.pts[3].assign(c.x1(), c.y2(), zv[c.dim ^ c.dir ^ 1]); // UL
+	return ramp;
+}
+
+void building_room_geom_t::add_pool_tile(room_object_t const &c, float tscale) {
+	pool_texture_params_t &params(get_pool_tile_params(c));
+	tscale *= params.tscale;
+	tid_nm_pair_t tex(params.get_tid(), params.get_nm_tid(), tscale, tscale); // normal map is inverted?
+	tex.set_specular(params.spec_mag, params.spec_shine);
+	rgeom_mat_t &mat(get_material(tex, 0, 0, 1)); // unshadowed, small
+	unsigned skip_faces(0);
+	if      (c.flags & RO_FLAG_ADJ_TOP) {skip_faces = ~EF_Z1;} // on the ceiling, only draw the bottom face
+	else if (c.flags & RO_FLAG_ADJ_BOT) {skip_faces = ~EF_Z2;} // on the floor,   only draw the top    face
+	else {skip_faces = get_face_mask(c.dim, !c.dir);} // draw face opposite the wall this was added to
+
+	if (c.shape == SHAPE_ANGLED) { // sloped floor
+		assert((c.flags & RO_FLAG_ADJ_LO) && (c.flags & RO_FLAG_ADJ_BOT));
+		tquad_t const ramp(get_ramp_tquad(c)); // ramp surface
+		auto &verts(mat.quad_verts);
+		rgeom_mat_t::vertex_t v;
+		v.set_c4(c.color); // no room lighting color atten
+		v.set_norm(ramp.get_norm());
+
+		for (unsigned i = 0; i < 4; ++i) {
+			v.v    = ramp.pts[i];
+			v.t[0] = tscale*(v.v.x - tex_origin.x);
+			v.t[1] = tscale*(v.v.y - tex_origin.y);
+			verts.push_back(v);
+		}
+	}
+	else { // axis aligned wall
+		mat.add_cube_to_verts(c, c.color, tex_origin, skip_faces, !c.dim);
+	}
 }
 
 void building_room_geom_t::add_wall_trim(room_object_t const &c, bool for_closet) { // uses mats_detail
@@ -1314,15 +1863,38 @@ void building_room_geom_t::add_wall_trim(room_object_t const &c, bool for_closet
 			mat.quad_verts.push_back(v);
 		}
 	}
-	else { // cube
+	else if (c.shape == SHAPE_CYLIN) { // angled wall of a cylinder or multi-sided building
+		float const height(c.dz()), thickness(height*WALL_THICK_VAL*(0.1/0.04)); // from get_trim_thickness()/get_trim_height()
+		point const p1(c.d[0][c.dim], c.d[1][c.dir], c.z1()), p2(c.d[0][!c.dim], c.d[1][!c.dir], c.z1()), center(c.get_cube_center());
+		float const length(p2p_dist_xy(p1, p2));
+		cube_t trim(c);
+		set_wall_width(trim, center.x, 0.5*length,    0); // seg length in X
+		set_wall_width(trim, center.y, 0.5*thickness, 1); // seg width/thickness in Y
+		unsigned const qv_start(mat.quad_verts.size());
+		mat.add_cube_to_verts_untextured(trim, c.color, (EF_Z1 | EF_Y1)); // untextured
+		rotate_verts(mat.quad_verts, plus_z, (c.dir ? 1.0 : -1.0)*get_norm_angle(plus_x, (p2 - p1).get_norm()), center, qv_start);
+	}
+	else { // cube/short/tall
+		bool const is_exterior(c.is_exterior());
 		unsigned skip_faces(0);
-		if      (c.shape == SHAPE_TALL ) {skip_faces = 0;} // door/window side trim
-		else if (c.shape == SHAPE_SHORT) {skip_faces = get_skip_mask_for_xy(!c.dim);} // door top trim: skip ends
-		else                             {skip_faces = get_skip_mask_for_xy(!c.dim) | EF_Z1;} // wall trim: skip bottom surface and short sides
-		if (c.flags & RO_FLAG_ADJ_LO) {skip_faces |= ~get_face_mask(c.dim, 0);}
-		if (c.flags & RO_FLAG_ADJ_HI) {skip_faces |= ~get_face_mask(c.dim, 1);}
+		if      (c.shape == SHAPE_TALL ) {skip_faces  = 0;} // door/window side trim, or exterior wall trim
+		else if (c.shape == SHAPE_SHORT) {skip_faces  =  get_skip_mask_for_xy(!c.dim);} // door top/bottom trim: skip ends
+		else                             {skip_faces  =  get_skip_mask_for_xy(!c.dim) | EF_Z1;} // wall trim: skip bottom surface and short sides
+		if (c.flags & RO_FLAG_ADJ_LO)    {skip_faces |= ~get_face_mask(c.dim, 0);}
+		if (c.flags & RO_FLAG_ADJ_HI)    {skip_faces |= ~get_face_mask(c.dim, 1);}
 		skip_faces |= ((c.flags & RO_FLAG_ADJ_BOT) ? EF_Z1 : 0) | ((c.flags & RO_FLAG_ADJ_TOP) ? EF_Z2 : 0);
-		mat.add_cube_to_verts_untextured(c, c.color, skip_faces); // is_small, untextured, no shadows
+
+		if (is_exterior && (c.flags & RO_FLAG_HAS_EXTRA)) { // fully exterior
+			get_untextured_material(0, 0, 2, 0, 1).add_cube_to_verts_untextured(c, c.color, skip_faces); // is_small, untextured, no shadows
+		}
+		else if (is_exterior) { // half exterior half interior
+			unsigned const face_skip_flags(get_face_mask(c.dim, c.dir)); // skip exterior face
+			mat.add_cube_to_verts_untextured(c, c.color, (skip_faces | ~face_skip_flags)); // is_small, untextured, no shadows
+			get_untextured_material(0, 0, 2, 0, 1).add_cube_to_verts_untextured(c, c.color, face_skip_flags); // detail, exterior=1, ext face only
+		}
+		else {
+			mat.add_cube_to_verts_untextured(c, c.color, skip_faces); // is_small, untextured, no shadows
+		}
 	}
 }
 
@@ -1331,22 +1903,24 @@ void building_room_geom_t::add_blinds(room_object_t const &c) {
 	colorRGBA const color(c.color); // room color not applied as it looks wrong when viewed from outside the building
 	// fit the texture to the cube; blinds have a fixed number of slats that compress when they are shortened
 	// should these be partially transparent/backlit like bathroom windows? I guess not, most blinds are plastic or wood rather than material
-	int const nm_tid(get_texture_by_name("interiors/blinds_hn.jpg", 1, 0, 1, 8.0)); // use high aniso
+	int const blinds_tid(get_blinds_tid());
 	float tx(vertical ? 1.0/c.dz() : 0.0), ty(vertical ? 0.5/c.get_width() : 0.0);
 	if (c.dim) {swap(tx, ty);}
-	int const blinds_tid(get_blinds_tid());
-	rgeom_mat_t &mat(get_material(tid_nm_pair_t(blinds_tid, nm_tid, tx, ty), 1));
+	tid_nm_pair_t const tex(blinds_tid, get_blinds_nm_tid(), tx, ty);
+	rgeom_mat_t &mat(get_material(tex, 1));
 	unsigned df1(~get_skip_mask_for_xy(!c.dim)), df2(~EF_Z12);
 	if (vertical) {swap(df1, df2);} // swap sides vs. top/bottom
 	vector3d const llc(c.get_llc());
-	mat.add_cube_to_verts(c, color, llc, ~get_skip_mask_for_xy(c.dim), (c.dim ^ vertical ^ 1)); // draw front and back faces
+	bool const swap_st(c.dim ^ vertical ^ 1);
 	mat.add_cube_to_verts(c, color, llc, df1, (c.dim ^ vertical)); // draw sides / top and bottom
+	mat.add_cube_to_verts(c, color, llc, get_face_mask(c.dim, !c.dir), swap_st); // draw interior face
+	get_material(tex, 0, 0, 0, 0, 1).add_cube_to_verts(c, color, llc, get_face_mask(c.dim, c.dir), swap_st); // draw exterior face; exterior=1
 	get_untextured_material(1).add_cube_to_verts_untextured(c, texture_color(blinds_tid).modulate_with(color), df2); // draw top and bottom / front and back untextured
 }
 
 void building_room_geom_t::add_fireplace(room_object_t const &c, float tscale) {
 	float const dir_sign(c.dir ? -1.0 : 1.0), depth(c.get_depth()), width(c.get_width()), botz(c.z1() + 0.1*c.dz());
-	float const face_pos(c.d[c.dim][!c.dir] - 0.4*dir_sign*depth); // front face pos
+	float const face_pos(c.d[c.dim][!c.dir] - 0.4*dir_sign*depth); // front face pos - extends out from the front
 	cube_t base(c), front(c), bot(c), top(c);
 	base .d[c.dim][!c.dir] = front.d[c.dim][c.dir] = face_pos;
 	top  .d[c.dim][!c.dir] = face_pos + dir_sign*0.02*width;
@@ -1372,9 +1946,129 @@ void building_room_geom_t::add_fireplace(room_object_t const &c, float tscale) {
 	marble_mat.add_cube_to_verts(top, color, tex_origin,  skip_back_face); // skip back face
 }
 
+float get_filing_cabinet_drawers(room_object_t const &c, vect_cube_t &drawers) { // c is the drawers part of the object
+	cube_t drawer_area(c);
+	drawer_area.expand_in_dim(!c.dim, -0.05*c.get_width()); // shrink width
+	drawer_area.d[c.dim][!c.dir] += (c.dir ? 1.0 : -1.0)*0.33*c.get_depth(); // shift back in (shrink depth)
+	drawer_area.z1() += 0.065*c.dz();
+	drawer_area.z2() -= 0.020*c.dz();
+	drawers.clear();
+	unsigned const num_drawers = 4; // hard-coded to 4 for now, to match the texture
+	float const spacing(drawer_area.dz()/num_drawers), border(0.02*spacing), dir_sign(c.dir ? 1.0 : -1.0), drawer_extend(dir_sign*drawer_area.get_sz_dim(c.dim));
+	float vpos(drawer_area.z1());
+
+	for (unsigned n = 0; n < num_drawers; ++n, vpos += spacing) { // at most 12 drawers
+		cube_t drawer(drawer_area);
+		set_cube_zvals(drawer, (vpos + border), (vpos + spacing - border));
+		if (c.drawer_flags & (1 << n)) {drawer.translate_dim(c.dim, drawer_extend);} // make a drawer open
+		drawers.push_back(drawer);
+	}
+	return drawer_extend; // signed
+}
+void building_room_geom_t::add_filing_cabinet(room_object_t const &c, bool inc_lg, bool inc_sm) {
+	colorRGBA const color(c.get_color());
+	if (inc_lg) {add_obj_with_front_texture(c, "interiors/filing_cabinet.png", color, 0);} // is_small=0
+
+	if (inc_sm && c.drawer_flags != 0) { // add drawers and their contents if any drawer is open
+		vect_cube_t &drawers(get_temp_cubes());
+		vect_room_object_t &objects(get_temp_objects());
+		get_untextured_material(1, 0, 1); // ensure material is loaded
+		rgeom_mat_t &front_mat(get_material(tid_nm_pair_t(get_texture_by_name("interiors/filing_cabinet_drawer.png"), 0.0, 1), 1, 0, 1)); // shadows, small
+		rgeom_mat_t &sides_mat(get_untextured_material(1, 0, 1)); // shadows, small
+		unsigned const front_mask(get_face_mask(c.dim, c.dir)), fb_mask(~get_skip_mask_for_xy(c.dim)), sides_mask(~get_skip_mask_for_xy(!c.dim));
+		colorRGBA const &drawers_color(apply_light_color(c, color));
+		get_filing_cabinet_drawers(c, drawers);
+
+		for (unsigned n = 0; n < drawers.size(); ++n) {
+			if (!(c.drawer_flags & (1 << n))) continue; // closed - not drawn
+			cube_t const &drawer(drawers[n]);
+			cube_t drawer_sides(drawer), drawer_ends(drawer);
+			drawer_sides.z2() -= 0.2*drawer.dz(); // lower the sides
+			drawer_ends.d[c.dim][!c.dir] += (c.dir ? 1.0 : -1.0)*0.01*c.get_sz_dim(c.dim); // shift back outward to prevent z-fighting with cabinet front
+			front_mat.add_cube_to_verts(drawer, apply_light_color(c), zero_vector, front_mask, !c.dim, (c.dim ^ c.dir ^ 1), 0); // front face only
+			sides_mat.add_cube_to_verts_untextured(drawer_sides, drawers_color, sides_mask); // sides,  outer
+			sides_mat.add_cube_to_verts_untextured(drawer,       drawers_color, ~EF_Z1    ); // bottom, outer
+			sides_mat.add_cube_to_verts           (drawer_sides, drawers_color, all_zeros, (~fb_mask | EF_Z2), 0, 0, 0, 1); // sides + bottom, inner/inverted
+			sides_mat.add_cube_to_verts           (drawer_ends,  drawers_color, all_zeros,   fb_mask,          0, 0, 0, 1); // front + back,   inner/inverted
+			add_draw_items(c, drawer_sides, n, objects);
+		} // for i
+		add_nested_objs_to_verts(objects); // add any objects that were found in open drawers; must be small static objects
+	}
+}
+
+void building_room_geom_t::add_stapler(room_object_t const &c) {
+	rgeom_mat_t &mat(get_untextured_material(0, 0, 1)); // unshadowed, small
+	colorRGBA const color(apply_light_color(c));
+	float const length(c.get_length()), signed_len(length*(c.dir ? 1.0 : -1.0)), width(c.get_width()), height(c.get_height());
+	cube_t base(c), top(c), hinge(c), metal(c);
+	base .z2() -= 0.9*height;
+	metal.z1() += 0.4*height;
+	metal.z2() -= 0.4*height;
+	top  .z1()  = metal.z2();
+	metal.expand_in_dim(!c.dim, -0.10*width);
+	top  .expand_in_dim(!c.dim, -0.05*width);
+	metal.d[c.dim][ c.dir] -= 0.10*signed_len; // front
+	top  .d[c.dim][ c.dir] -= 0.05*signed_len; // front
+	hinge.d[c.dim][ c.dir] -= 0.70*signed_len; // front
+	metal.d[c.dim][!c.dir] = top.d[c.dim][!c.dir] = hinge.d[c.dim][c.dir]; // back
+	mat.add_cube_to_verts_untextured(base,  color, EF_Z1);
+	mat.add_cube_to_verts_untextured(top,   color, EF_Z1);
+	mat.add_cube_to_verts_untextured(hinge, color, EF_Z1);
+	mat.add_cube_to_verts_untextured(metal, apply_light_color(c, LT_GRAY), EF_Z12);
+}
+
+void building_room_geom_t::add_fire_ext_mount(room_object_t const &c) {
+	rgeom_mat_t &mat(get_untextured_material(1, 0, 1)); // shadowed, small
+	colorRGBA const color(apply_light_color(c));
+	float const plate_thickness(c.get_depth() - c.get_width()), inside_face(c.d[c.dim][!c.dir] + (c.dir ? 1.0 : -1.0)*plate_thickness), dz(c.dz());
+	assert(plate_thickness > 0.0);
+	cube_t back(c), loop(c);
+	back.d[c.dim][c.dir] = loop.d[c.dim][!c.dir] = inside_face;
+	cube_t bottom(loop);
+	loop  .z1() += 0.20*dz;
+	loop  .z2() -= 0.50*dz;
+	bottom.z2() -= 0.96*dz;
+	cube_t bot_cube(bottom);
+	bot_cube.d[c.dim][c.dir] = bottom.get_center_dim(c.dim); // half width
+	mat.add_cube_to_verts_untextured(back, color, ~get_face_mask(c.dim, !c.dir)); // skip back face against the wall
+	mat.add_vcylin_to_verts(loop,   color, 0, 0, 1); // two sided hollow cylinder
+	mat.add_vcylin_to_verts(bottom, color, 1, 1, 0); // draw top and bottom ends
+	mat.add_cube_to_verts_untextured(bot_cube, color, get_skip_mask_for_xy(c.dim)); // skip faces adjacent to back and bottom
+}
+
+void building_room_geom_t::add_fire_ext_sign(room_object_t const &c) {
+	rgeom_mat_t& mat(get_material(tid_nm_pair_t(get_texture_by_name("interiors/fire_extinguisher_sign.jpg"), 0.0), 0, 0, 1)); // unshadowed, small
+	mat.add_cube_to_verts(c, apply_light_color(c), zero_vector, get_face_mask(c.dim, c.dir), !c.dim, (c.dim ^ c.dir ^ 1)); // front face only
+}
+
+// Note: alpha mask materials, but not using mats_amask because blending works correctly without it
+void building_room_geom_t::add_teeshirt(room_object_t const &c) {
+	rgeom_mat_t& mat(get_material(tid_nm_pair_t(get_texture_by_name("interiors/teeshirt.png"), 0.0), 0, 0, 1)); // unshadowed, small
+	mat.add_cube_to_verts(c, apply_light_color(c), zero_vector, ~EF_Z2, c.dim, (c.dim ^ c.dir ^ 1), c.dir); // top face only
+}
+void building_room_geom_t::add_pants(room_object_t const &c) {
+	string const tex_name((c.room_id & 1) ? "interiors/folded_jeans.png" : "interiors/folded_jeans2.png");
+	rgeom_mat_t& mat(get_material(tid_nm_pair_t(get_texture_by_name(tex_name), 0.0), 0, 0, 1)); // unshadowed, small
+	mat.add_cube_to_verts(c, apply_light_color(c), zero_vector, ~EF_Z2, c.dim, (c.dim ^ c.dir ^ 1), c.dir); // top face only
+}
+
+void building_room_geom_t::add_ceiling_fan_light(room_object_t const &fan, room_object_t const &light) {
+	bool const is_on(light.is_light_on() && !light.is_broken());
+	if (!is_on) return; // only drawn when light is on
+	tid_nm_pair_t tp(WHITE_TEX);
+	tp.emissive = (is_on ? 1.0 : 0.0);
+	cube_t light_bcube;
+	light_bcube.set_from_sphere(light.get_cube_center(), 0.035*(fan.dx() + fan.dy()));
+	light_bcube.expand_in_dim(2, -0.4*light_bcube.dz()); // shrink in Z
+	mats_lights.get_material(tp, 0).add_sphere_to_verts(light_bcube, apply_light_color(fan), 0, plus_z); // no shadows, bottom hemisphere
+}
+
 float get_railing_height(room_object_t const &c) {
-	bool const is_u_stairs(c.flags & (RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI));
-	return (is_u_stairs ? 0.70 : 0.35)*c.dz(); // use a larger relative height for lo/hi railings on U-shaped stairs
+	bool const is_tall(c.flags & RO_FLAG_HAS_EXTRA);
+	unsigned const num_floors(c.item_flags + 1), num_stairs(c.state_flags);
+	float height((is_tall ? 0.70 : 0.35)*c.dz()/num_floors); // use a larger relative height for lo/hi railings on U/L-shaped stairs
+	if (num_stairs > 0) {height *= float(NUM_STAIRS_PER_FLOOR_L)/float(num_stairs);} // adjust height for shorter railings used in L-shaped stairs
+	return height;
 }
 cylinder_3dw get_railing_cylinder(room_object_t const &c) {
 	float const radius(0.5*c.get_width()), center(c.get_center_dim(!c.dim)), height(get_railing_height(c));
@@ -1389,11 +2083,13 @@ cylinder_3dw get_railing_cylinder(room_object_t const &c) {
 }
 void building_room_geom_t::add_railing(room_object_t const &c) {
 	cylinder_3dw const railing(get_railing_cylinder(c));
-	bool const is_u_stairs(c.flags & (RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI)), is_top_railing(c.flags & RO_FLAG_TOS), draw_ends(!(c.flags & RO_FLAG_ADJ_BOT));
+	bool const is_u_stairs(c.flags & (RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI)), is_top_railing(c.flags & RO_FLAG_TOS), is_L_seg(c.state_flags > 0); // L-railings have num_stairs set
+	bool const draw_ends(!(c.flags & RO_FLAG_ADJ_BOT)), is_exterior(c.is_exterior());
 	float const pole_radius(0.75*railing.r1), length(c.get_length()), height(get_railing_height(c));
+	unsigned const num_floors(c.item_flags + 1);
 	tid_nm_pair_t tex(-1, 1.0, 1); // shadowed
 	tex.set_specular_color(c.color, 0.7, 70.0); // use a non-white metal specular color
-	rgeom_mat_t &mat(get_material(tex, 1, 0, 1)); // inc_shadows=1, dynamic=0, small=1
+	rgeom_mat_t &mat(get_material(tex, 1, 0, !is_exterior, 0, is_exterior)); // inc_shadows=1, dynamic=0, small|exterior
 	mat.add_cylin_to_verts(railing.p1, railing.p2, railing.r1, railing.r2, c.color, draw_ends, draw_ends); // draw sloped railing
 
 	if (!is_u_stairs && !(c.flags & RO_FLAG_ADJ_TOP)) {
@@ -1402,47 +2098,90 @@ void building_room_geom_t::add_railing(room_object_t const &c) {
 			float shift_len(pole_radius);
 			if (!is_top_railing) {max_eq(shift_len, 0.01f*length);}
 			pt[c.dim] += ((c.dir ^ bool(d)) ? 1.0 : -1.0)*shift_len; // shift slightly inward toward the center
-			float const hscale((d && !is_top_railing) ? 1.25 : 1.0); // shorten for lower end, which rests on the step (unless top railing)
-			point const p1(pt - vector3d(0, 0, hscale*height)), p2(pt - vector3d(0, 0, (is_top_railing ? 0.0 : 0.02*(d ? 1.0 : -1.0)*height)));
-			mat.add_cylin_to_verts(p1, p2, pole_radius, pole_radius, c.color, 0, 0); // no top or bottom
+			float const hscale((d && !is_top_railing && !is_L_seg) ? 1.25 : 1.0); // shorten for lower end, which rests on the step (unless top railing or L-segment)
+			point const p1(pt - vector3d(0, 0, hscale*height)), p2(pt - vector3d(0, 0, (is_top_railing ? 0.0 : num_floors*0.02*(d ? 1.0 : -1.0)*height)));
+			bool const draw_bot(is_L_seg && d == 1); // only draw bottom of L-shaped stairs railing upper end (needed for landing)
+			mat.add_cylin_to_verts(p1, p2, pole_radius, pole_radius, c.color, draw_bot, 0); // no top
 		}
-		if (c.is_open()) { // add balusters
-			unsigned const num(NUM_STAIRS_PER_FLOOR - 1);
-			float const step_sz(1.0/(num+1)), radius(0.75*pole_radius), bot_radius(0.85*pole_radius);
-			vector3d const delta(0, 0, -height);
+	}
+	if (!is_u_stairs && c.is_open()) { // add balusters
+		unsigned num(0);
+		if (is_top_railing) {num = round_fp(2.0*length/height);} // 2:1 aspect ratio
+		else                {num = num_floors*NUM_STAIRS_PER_FLOOR - 1;} // one per stair; assumes straight stairs
+		float const step_sz(1.0/(num+1)), radius(0.75*pole_radius), bot_radius(0.85*pole_radius);
+		vector3d const delta(0, 0, -height);
 
-			for (unsigned n = 0; n < num; ++n) {
-				float const t((n+1)*step_sz);
-				point const pt(t*railing.p1 + (1.0 - t)*railing.p2);
-				mat.add_cylin_to_verts((pt + delta), pt, radius, radius, c.color, 0, 0, 0, 0, 1.0, 1.0, 0, 16); // only 16 sides, no top or bottom
-			}
-			mat.add_cylin_to_verts((railing.p1 + delta), (railing.p2 + delta), bot_radius, bot_radius, c.color, 1, 1); // bottom bar with both ends
+		for (unsigned n = 0; n < num; ++n) {
+			float const t((n+1)*step_sz);
+			point const pt(t*railing.p1 + (1.0 - t)*railing.p2);
+			mat.add_cylin_to_verts((pt + delta), pt, radius, radius, c.color, 0, 0, 0, 0, 1.0, 1.0, 0, 16); // only 16 sides, no top or bottom
 		}
+		mat.add_cylin_to_verts((railing.p1 + delta), (railing.p2 + delta), bot_radius, bot_radius, c.color, 1, 1); // bottom bar with both ends
 	}
 }
 
 void building_room_geom_t::add_stair(room_object_t const &c, float tscale, vector3d const &tex_origin) { // Note: no room lighting color atten
 	rgeom_mat_t &mat(get_material(tid_nm_pair_t(MARBLE_TEX, 1.5*tscale), 1));
+
+	if (c.flags & RO_FLAG_IN_POOL) { // pool stairs are simpler with no separate top vs. bottom
+		mat.add_cube_to_verts(c, WHITE, tex_origin); // all faces drawn
+		return;
+	}
 	float const width(c.get_width()); // use width as a size reference because this is constant for a set of stairs and in a relative small range
 	cube_t top(c), bot(c);
 	bot.z2() = top.z1() = c.z2() - min(0.025*width, 0.25*c.dz()); // set top thickness
-	top.d[c.dim][!c.dir] += (c.dir ? -1.0 : 1.0)*0.0125*width; // extension
-	top.expand_in_dim(!c.dim, 0.01*width); // make slightly wider
+
+	if (!(c.flags & RO_FLAG_RSTAIRS)) { // not basement stairs
+		bool const is_landing(c.shape == SHAPE_STAIRS_L), dir(c.dir ^ is_landing); // landing has the overhang on the other dim/dir
+		top.d[c.dim ^ is_landing][!dir] += (dir ? -1.0 : 1.0)*0.0125*width; // extension
+		top.expand_in_dim(!c.dim, 0.01*width); // make slightly wider
+	}
 	mat.add_cube_to_verts(top, STAIRS_COLOR_TOP, tex_origin); // all faces drawn
 	mat.add_cube_to_verts(bot, STAIRS_COLOR_BOT, tex_origin, EF_Z2); // skip top face
 }
 
+void building_room_geom_t::add_downspout(room_object_t const &c) {
+	rgeom_mat_t &mat(get_metal_material(0, 0, 0, 1)); // unshadowed, exterior
+	unsigned const wall_skip_faces(~get_face_mask(c.dim, !c.dir));
+	float const width(c.get_width()), depth(c.get_depth());
+	vector3d const rot_axis(vector_from_dim_dir(!c.dim, (c.dir ^ c.dim ^ 1)));
+	cube_t top_v(c), top_h(c), vert(c), bot(c);
+	top_h.z2() = c.z2() - 0.75*width;
+	top_h.z1() = top_h.z2() - depth;
+	top_v.z1() = top_h.z2() - 0.315*depth;
+	vert .z2() = top_h.z1() + 0.315*depth;
+	bot  .z2() = c.z1() + depth;
+	vert .z1() = bot.z2() - 0.2*depth;
+	top_v.translate_dim(c.dim, (c.dir ? 1.0 : -1.0)*1.0*width); // move away from the wall
+	top_h.d[c.dim][c.dir]  = top_v.d[c.dim][c.dir]; // extend out to meet top vertical segment
+	bot  .d[c.dim][c.dir] += (c.dir ? 1.0 : -1.0)*1.2*width; // extend away from the wall
+	top_h.expand_in_dim(c.dim, -0.09*depth); // shorten slightly to account for the rotation
+	mat.add_cube_to_verts_untextured(top_v, c.color, EF_Z12); // skip top and bottom faces
+	unsigned qv_start(mat.quad_verts.size());
+	mat.add_cube_to_verts_untextured(top_h, c.color, wall_skip_faces); // skip face against the house wall
+	rotate_verts(mat.quad_verts, rot_axis, -30.0*TO_RADIANS, top_h.get_cube_center(), qv_start);
+	mat.add_cube_to_verts_untextured(vert,  c.color, (EF_Z12 | wall_skip_faces)); // skip top and bottom faces and face against the house wall
+	qv_start = mat.quad_verts.size();
+	mat.add_cube_to_verts_untextured(bot,   c.color, (EF_Z1 | get_skip_mask_for_xy(c.dim))); // skip bottom, front, and back faces
+	rotate_verts(mat.quad_verts, rot_axis, 30.0*TO_RADIANS, bot.get_cube_center(), qv_start);
+}
+
 void building_room_geom_t::add_stairs_wall(room_object_t const &c, vector3d const &tex_origin, tid_nm_pair_t const &wall_tex) {
-	get_material(get_scaled_wall_tex(wall_tex), 1).add_cube_to_verts(c, c.color, tex_origin, EF_Z1); // skip bottom; no room lighting color atten
+	unsigned const skip_faces(c.is_hanging() ? 0 : EF_Z1); // skip bottom, unless hanging (non-exit floor)
+	get_material(get_scaled_wall_tex(wall_tex), 1).add_cube_to_verts(c, c.color, tex_origin, skip_faces); // no room lighting color atten
 }
-void building_room_geom_t::add_parking_garage_wall(room_object_t const &c, vector3d const &tex_origin, tid_nm_pair_t const &wall_tex) {
-	// small=2: drawn as detail object; no room lighting color atten
-	if      (c.item_flags == 0) {get_material(get_scaled_wall_tex(wall_tex), 1, 0, 2).add_cube_to_verts(c, c.color, tex_origin, EF_Z12);} // wall
-	else if (c.item_flags == 1) {get_material(tid_nm_pair_t(get_concrete_tid(), wall_tex.tscale_x, 1), 1, 0, 2).add_cube_to_verts(c, c.color, all_zeros, EF_Z12);} // pillar
-	else if (c.item_flags == 2) {get_material(tid_nm_pair_t(get_concrete_tid(), wall_tex.tscale_x, 0), 0, 0, 2).add_cube_to_verts(c, c.color, all_zeros, EF_Z2 );} // beam
-	else {assert(0);}
+void building_room_geom_t::add_basement_wall(room_object_t const &c, vector3d const &tex_origin, tid_nm_pair_t const &wall_tex) {
+	bool const is_concrete(c.flags & RO_FLAG_BACKROOM), draw_top(c.flags & RO_FLAG_ADJ_TOP);
+	tid_nm_pair_t const tex(is_concrete ? tid_nm_pair_t(get_concrete_tid(), wall_tex.tscale_x, 1) : get_scaled_wall_tex(wall_tex));
+	get_material(tex, 1, 0, 2).add_cube_to_verts(c, c.color, tex_origin, (draw_top ? EF_Z1 : EF_Z12)); // small=2/detail, shadowed, no color atten, sides only unless draw_top
 }
-void building_room_geom_t::add_parking_space(room_object_t const &c, vector3d const &tex_origin, float tscale) {
+void building_room_geom_t::add_basement_pillar(room_object_t const &c, tid_nm_pair_t const &wall_tex) {
+	get_material(tid_nm_pair_t(get_concrete_tid(), wall_tex.tscale_x, 1), 1, 0, 2).add_cube_to_verts(c, c.color, all_zeros, EF_Z12); // small=2/detail, shadowed, no color atten
+}
+void building_room_geom_t::add_basement_beam(room_object_t const &c, tid_nm_pair_t const &wall_tex) {
+	get_material(tid_nm_pair_t(get_concrete_tid(), wall_tex.tscale_x, 0), 0, 0, 2).add_cube_to_verts(c, c.color, all_zeros, EF_Z2 ); // small=2/detail, unshadowed, no color atten
+}
+void building_room_geom_t::add_parking_space(room_object_t const &c, float tscale) {
 	float const space_width(c.get_width()), line_width(0.04*space_width);
 	cube_t yellow_line(c);
 	yellow_line.d[!c.dim][1] -= (space_width - line_width); // shrink to line by moving the left edge
@@ -1462,40 +2201,32 @@ void building_room_geom_t::add_parking_space(room_object_t const &c, vector3d co
 	}
 }
 
-void building_room_geom_t::add_pg_ramp(room_object_t const &c, vector3d const &tex_origin, float tscale) {
-	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_concrete_tid(), tscale, 1), 1, 0, 2));
-	//mat.add_cube_to_verts(c, WHITE, all_zeros); // TESTING
-	tquad_t ramp(4); // ramp surface
-	float const length(c.get_length()), thickness(FLOOR_THICK_VAL_OFFICE*c.dz()), side_tc_y(thickness/length);
-	float const zv[2] = {c.z1(), c.z2()};
-	// dim dir z0 z1 z2 z3
-	// 0   0   1  0  0  1
-	// 0   1   0  1  1  0
-	// 1   0   1  1  0  0
-	// 1   1   0  0  1  1
-	ramp.pts[0].assign(c.x1(), c.y1(), zv[!c.dir]); // LL
-	ramp.pts[1].assign(c.x2(), c.y1(), zv[c.dim ^ c.dir]); // LR
-	ramp.pts[2].assign(c.x2(), c.y2(), zv[c.dir]); // UR
-	ramp.pts[3].assign(c.x1(), c.y2(), zv[c.dim ^ c.dir ^ 1]); // UL
-	vector3d const normal(ramp.get_norm());
+void building_room_geom_t::add_ramp(room_object_t const &c, float thickness, bool skip_bottom, rgeom_mat_t &mat) {
+	tquad_t const ramp(get_ramp_tquad(c)); // ramp surface
+	float const length(c.get_length()), width(c.get_width()), side_tc_y(thickness/length);
+	float tb_tscale[2] = {2.0, 2.0};
+	tb_tscale[c.dim]  *= length/width; // scale texture so that it repeats 2x in width and scales with aspect ratio in length
 	auto &verts(mat.quad_verts);
 	rgeom_mat_t::vertex_t v;
 	v.set_c4(c.color); // no room lighting color atten
-	v.set_norm(normal);
+	v.set_norm(ramp.get_norm());
 
 	for (unsigned tb = 0; tb < 2; ++tb) { // {top, bottom}
 		for (unsigned i = 0; i < 4; ++i) {
 			v.v    = ramp.pts[tb ? (3-i) : i]; // swap winding order for bottom surface
-			v.t[0] = 2.0*float(v.v.x == c.x2()); // stretch texture 2x in length
-			v.t[1] = 2.0*float(v.v.y == c.y2()); // stretch texture 2x in length
+			v.t[0] = tb_tscale[0]*float(v.v.x == c.x2()); // stretch texture in length
+			v.t[1] = tb_tscale[1]*float(v.v.y == c.y2()); // stretch texture in length
 			verts.push_back(v);
 			if (tb) {verts.back().v.z -= thickness;} // extrude thickness for bottom surface
 		}
-		if (tb == 0) {v.invert_normal();}
+		if (skip_bottom && tb == 0) break; // no bottom
+		if (tb == 0) {v.invert_normal();} // ramp normal is for the bottom
 	} // for tb
 	for (unsigned s = 0; s < 4; ++s) { // sides: {-y, +x, +y, -x}
+		bool const dim((s&1)^1), dir((s&1)^(s>>1));
+		if (skip_bottom && dim == c.dim) continue; // skip_bottom also skips the ends
 		point const pts[2] = {ramp.pts[s], ramp.pts[(s+1)&3]};
-		v.set_ortho_norm((s&1)^1, (s&1)^(s>>1)); // {1,0,1,0}, {0,1,1,0}
+		v.set_ortho_norm(dim, dir); // {1,0,1,0}, {0,1,1,0}
 
 		for (unsigned i = 0; i < 4; ++i) {
 			unsigned const ix(3-i); // use correct winding order
@@ -1508,8 +2239,15 @@ void building_room_geom_t::add_pg_ramp(room_object_t const &c, vector3d const &t
 		}
 	} // for s
 }
+void building_room_geom_t::add_pg_ramp(room_object_t const &c, float tscale) {
+	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_concrete_tid(), tscale, 1), 1, 0, 2)); // small=2/detail
+	float const thickness(RAMP_THICKNESS_SCALE*c.dz());
+	add_ramp(c, thickness, 0, mat); // skip_bottom=0
+}
 
-void building_room_geom_t::add_pipe(room_object_t const &c) { // should be SHAPE_CYLIN
+void building_room_geom_t::add_pipe(room_object_t const &c, bool add_exterior) { // should be SHAPE_CYLIN
+	bool const exterior(c.is_exterior());
+	if (exterior != add_exterior) return;
 	unsigned const dim(c.dir ? 2 : unsigned(c.dim)); // encoded as: X:dim=0,dir=0 Y:dim=1,dir=0, Z:dim=x,dir=1
 	float const radius(0.5*c.get_sz_dim((dim+1)%3));
 	//assert(0.5*c.get_sz_dim((dim+2)%3) == radius); // must be a square cross section, but too strong due to FP error
@@ -1529,17 +2267,19 @@ void building_room_geom_t::add_pipe(room_object_t const &c) { // should be SHAPE
 	// draw sides and possibly one or both ends
 	tid_nm_pair_t tex((is_duct ? get_cylin_duct_tid() : -1), 1.0, shadowed); // custom specular color
 	tex.set_specular_color(spec_color, 0.8, 60.0);
-	rgeom_mat_t &mat(get_material(tex, shadowed, 0, 2)); // detail object
+	rgeom_mat_t &mat(get_material(tex, shadowed, 0, (exterior ? 0 : 2), 0, exterior)); // detail or exterior object
 	// swap texture XY for ducts
 	mat.add_ortho_cylin_to_verts(c, color, dim, (flat_ends && draw_joints[0]), (flat_ends && draw_joints[1]),
 		0, 0, 1.0, 1.0, side_tscale, 1.0, 0, ndiv, 0.0, is_duct, len_tscale);
 	if (flat_ends) return; // done
 
-	for (unsigned d = 0; d < 2; ++d) {
+	for (unsigned d = 0; d < 2; ++d) { // draw round joints as spheres
 		if (!draw_joints[d]) continue;
 		point center(c.get_cube_center());
 		center[dim] = c.d[dim][d]; // move to one end along the cylinder
-		mat.add_sphere_to_verts(center, vector3d(radius, radius, radius), color);
+		vector3d skip_hemi_dir;
+		skip_hemi_dir[dim] = (d ? -1.0 : 1.0); // use the correct hemisphere
+		mat.add_sphere_to_verts(center, vector3d(radius, radius, radius), color, 0, skip_hemi_dir); // low_detail=0
 	}
 }
 
@@ -1578,8 +2318,66 @@ void building_room_geom_t::add_duct(room_object_t const &c) {
 			get_material(tex, 1, 0, 2).add_cube_to_verts(c, c.color, c.get_llc(), face_sf, swap_st); // shadowed, detail, not using lit color
 		} // for d
 	}
-	else if (c.shape == SHAPE_CYLIN) {add_pipe(c);} // draw using pipe logic
+	else if (c.shape == SHAPE_CYLIN) {add_pipe(c, 0);} // draw using pipe logic; add_exterior=0
 	else {assert(0);} // unsupported shape
+}
+
+void mirror_cube_z(cube_t &c, cube_t const &obj) {
+	c.translate_dim(2, 2.0*(obj.zc() - c.zc()));
+}
+void building_room_geom_t::add_sprinkler(room_object_t const &c) { // vertical sprinkler, from parking garage pipes
+	rgeom_mat_t &mat(get_metal_material(0, 0, 2)); // unshadowed, detail
+	colorRGBA const metal_color(apply_light_color(c, LT_GRAY));
+	unsigned const ndiv = 12;
+	cube_t bot(c), mid(c), top(c);
+	bot.z2() = mid.z1() = c.z1() + 0.58*c.dz();
+	mid.z2() = top.z1() = c.z1() + 0.96*c.dz();
+
+	if (c.dir) { // dir determines if it's facing up or down
+		mirror_cube_z(bot, c);
+		mirror_cube_z(mid, c);
+		mirror_cube_z(top, c);
+	}
+	bot.expand_by_xy(-0.25*c.get_radius()); // shrink
+	mid.expand_by_xy(-0.60*c.get_radius()); // shrink
+	mat.add_vcylin_to_verts(bot, apply_light_color(c), c.dir, !c.dir, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, ndiv); // draw top
+	mat.add_vcylin_to_verts(mid, metal_color,          0,      0,     0, 0, 1.0, 1.0, 1.0, 1.0, 0, ndiv); // no ends
+	mat.add_vcylin_to_verts(top, metal_color,          1,      1,     0, 0, 1.0, 1.0, 1.0, 1.0, 0, ndiv); // draw ends
+}
+
+void building_room_geom_t::add_valve(room_object_t const &c) {
+	// Note: we don't know which direction the pipe is in, so the valve handle must be symmetric
+	unsigned const dim(c.dir ? 2 : unsigned(c.dim)); // encoded as: X:dim=0,dir=0 Y:dim=1,dir=0, Z:dim=x,dir=1
+	float const radius(0.5*c.get_sz_dim((dim+1)%3));
+	colorRGBA const color(apply_light_color(c));
+	colorRGBA const spec_color(is_known_metal_color(c.color) ? c.color : WHITE); // special case metals
+	tid_nm_pair_t tex(WHITE_TEX, 1.0, 1); // custom specular color, shadowed
+	tex.set_specular_color(spec_color, 0.8, 60.0);
+	rgeom_mat_t &mat(get_material(tex, 1, 0, 2)); // detail object
+	// draw the outer handle
+	float const r_inner(0.12*radius), r_outer(radius - r_inner), r_bar(0.075*radius), r_shaft(0.1*radius);
+	point const center(c.get_cube_center());
+	mat.add_ortho_torus_to_verts(center, r_inner, r_outer, dim, color);
+	// draw inner sphere for handle
+	mat.add_sphere_to_verts(center, 0.2*radius, color, 1); // low_detail=1
+	// draw horizontal and vertical bars
+	unsigned const dims[2] = {(dim+1)%3, (dim+2)%3};
+	unsigned const verts_start(mat.itri_verts.size());
+	cube_t bar;
+	set_wall_width(bar, center[dim], r_bar, dim);
+	
+	for (unsigned d = 0; d < 2; ++d) {
+		set_wall_width(bar, center[dims[ d]], r_bar,   dims[ d]);
+		set_wall_width(bar, center[dims[!d]], r_outer, dims[!d]);
+		mat.add_ortho_cylin_to_verts(bar, color, dims[!d], 0, 0); // draw sides only
+	}
+	// rotate a random-ish amount
+	float const rot_angle((c.x1() + c.y1() + c.z1())/radius);
+	rotate_verts(mat.itri_verts, vector_from_dim_dir(dim, 1), rot_angle, center, verts_start);
+	// draw the shaft
+	cube_t shaft(c);
+	for (unsigned d = 0; d < 2; ++d) {set_wall_width(shaft, center[dims[d]], r_shaft, dims[d]);}
+	get_metal_material(1, 0, 2).add_ortho_cylin_to_verts(shaft, apply_light_color(c, WHITE), dim, 1, 1); // draw sides and ends
 }
 
 void building_room_geom_t::add_curb(room_object_t const &c) {
@@ -1675,7 +2473,8 @@ void building_room_geom_t::add_elevator(room_object_t const &c, elevator_t const
 	point const tex_origin(c.get_llc());
 	unsigned const front_face_mask(get_face_mask(c.dim, c.dir)), back_face_mask(get_face_mask(c.dim, !c.dir));
 	unsigned const floor_ceil_face_mask(front_face_mask & (EF_X12 | EF_Y12)); // +Z faces
-	tid_nm_pair_t const paneling(get_tex_auto_nm(PANELING_TEX, 2.0f*tscale));
+	tid_nm_pair_t paneling(get_tex_auto_nm(PANELING_TEX, 2.0f*tscale));
+	paneling.set_specular(0.1, 50.0);
 	get_material(get_tex_auto_nm(TILE_TEX, tscale), 1, 1).add_cube_to_verts(floor_, WHITE, tex_origin, floor_ceil_face_mask); // floor
 	get_material(get_tex_auto_nm(get_rect_panel_tid(), tscale), 1, 1).add_cube_to_verts(ceil_, WHITE, tex_origin, floor_ceil_face_mask); // ceiling
 	rgeom_mat_t &paneling_mat(get_material(paneling, 1, 1));
@@ -1699,7 +2498,7 @@ void building_room_geom_t::add_elevator(room_object_t const &c, elevator_t const
 	// add button panel
 	cube_t const panel(get_elevator_car_panel(c, fc_thick_scale));
 	get_untextured_material(0, 1).add_cube_to_verts_untextured(panel, DK_GRAY, ~front_face_mask);
-	// add floor numbers to either the panel (or the buttons themselves?)
+	// add floor numbers to either the panel (or the buttons themselves?); buttons are added in building_t::add_stairs_and_elevators()
 	unsigned const num_floors(c.drawer_flags), cur_floor(c.item_flags);
 	assert(num_floors > 1);
 	assert(num_floors >= floor_offset); // no sub-basement only elevators
@@ -1744,9 +2543,13 @@ void building_room_geom_t::add_elevator(room_object_t const &c, elevator_t const
 	else {
 		up_down_pos [!c.dim] += 0.8f*up_down_text_height;
 	}
+	float cur_z(panel.z1() + button_spacing - 0.5*text_height);
+
 	for (unsigned f = 0; f < num_floors; ++f) { // Note: floor number starts at 1 even if the elevator doesn't extend to the ground floor
+		if (e.skip_floor_ix(f)) continue; // also skips cur_z update to avoid a gap in the buttons, but there's still a gap in the floor numbers
 		bool const is_lit(is_powered && f == cur_floor);
-		text_pos.z = panel.z1() + (f + 1)*button_spacing - 0.5*text_height;
+		text_pos.z = cur_z;
+		cur_z += button_spacing;
 		verts.clear();
 		add_floor_number((f+1), floor_offset, has_parking_garage, oss);
 		gen_text_verts(verts, text_pos, oss.str(), 1000.0*text_height, col_dir, plus_z, 1); // use_quads=1
@@ -1774,7 +2577,7 @@ void building_room_geom_t::add_elevator(room_object_t const &c, elevator_t const
 			verts.clear();
 			gen_text_verts(verts, up_down_pos, (d ? ">" : "<"), 1000.0*up_down_text_height, plus_z, col_dir, 1); // R90, use_quads=1
 			if (need_swap) {std::reverse(verts.begin(), verts.end());} // swap vertex winding order
-			bool const is_lit(bool(d) == e.going_up && e.is_moving());
+			bool const is_lit(bool(d) == e.going_up && e.may_be_moving());
 			rgeom_mat_t &cur_ud_mat(is_lit ? get_material(lit_tp, 0, 1) : mat); // lit, as long as the elevator is powered
 			for (auto i = verts.begin(); i != verts.end(); ++i) {cur_ud_mat.quad_verts.emplace_back(i->v, nc, i->t[0], i->t[1], (is_lit ? lit_cw : cw));}
 		} // for d
@@ -1782,7 +2585,8 @@ void building_room_geom_t::add_elevator(room_object_t const &c, elevator_t const
 }
 
 void building_room_geom_t::add_elevator_doors(elevator_t const &e, float fc_thick_scale) {
-	float const spacing(e.get_wall_thickness()), closed_door_width(0.99*0.5*e.get_sz_dim(!e.dim)), open_door_width(1.12*e.get_frame_width());
+	float const spacing(e.get_wall_thickness()), open_door_width(1.12*e.get_frame_width());
+	float const closed_door_width(0.995*0.5*e.get_sz_dim(!e.dim)); // slightly smaller than width to leave a small crack for the player to see out of
 	rgeom_mat_t &mat(get_untextured_material(1, 1));
 	assert(e.car_obj_id < objs.size());
 	room_object_t const &car(objs[e.car_obj_id]); // elevator car for this elevator
@@ -1817,27 +2621,37 @@ void building_room_geom_t::add_elevator_doors(elevator_t const &e, float fc_thic
 }
 
 void building_room_geom_t::add_light(room_object_t const &c, float tscale) {
-	// Note: need to use a different texture (or -1) for is_on because emissive flag alone does not cause a material change
-	bool const is_on(c.is_light_on() && !(c.is_broken() && !c.is_open()));
+	bool const is_on(c.is_light_on()), on_but_dim(is_on && c.light_is_out());
 	tid_nm_pair_t tp(((is_on || c.shape == SHAPE_SPHERE) ? (int)WHITE_TEX : (int)PLASTER_TEX), tscale);
 	tp.emissive = (is_on ? 1.0 : 0.0);
+	colorRGBA const color(c.color*(on_but_dim ? 0.4 : 1.0));
 	rgeom_mat_t &mat(mats_lights.get_material(tp, 0)); // no shadows
-	if      (c.shape == SHAPE_CUBE  ) {mat.add_cube_to_verts  (c, c.color, c.get_llc(), EF_Z2);} // sometimes textured, skip top face
-	else if (c.shape == SHAPE_CYLIN ) {mat.add_vcylin_to_verts(c, c.color, 1, 0);} // bottom only
-	else if (c.shape == SHAPE_SPHERE) {mat.add_sphere_to_verts(c, c.color);}
+
+	if (c.flags & RO_FLAG_ADJ_HI) { // wall light
+		assert(c.shape == SHAPE_CYLIN);
+		mat.add_ortho_cylin_to_verts(c, color, c.dim, !c.dir, c.dir); // draw top but not bottom
+	}
+	else if (c.shape == SHAPE_CUBE  ) {mat.add_cube_to_verts  (c, color, c.get_llc(), EF_Z2);} // sometimes textured, skip top face
+	else if (c.shape == SHAPE_CYLIN ) {mat.add_vcylin_to_verts(c, color, 1, 0);} // bottom only
+	else if (c.shape == SHAPE_SPHERE) {mat.add_sphere_to_verts(c, color);}
 	else {assert(0);}
 
 	if ((c.flags & RO_FLAG_ADJ_TOP) && (c.shape == SHAPE_CUBE || c.shape == SHAPE_CYLIN)) { // on skylight; draw top surface
 		tid_nm_pair_t top_tp(PLASTER_TEX, tscale, 1); // yes shadows
 		rgeom_mat_t &top_mat(mats_lights.get_material(top_tp, 1)); // yes shadows
-		if (c.shape == SHAPE_CUBE) {top_mat.add_cube_to_verts  (c, c.color, c.get_llc(), ~EF_Z2);} // textured, top face only
-		else                       {top_mat.add_vcylin_to_verts(c, c.color, 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1);} // bottom only, skip sides
+		if (c.shape == SHAPE_CUBE) {top_mat.add_cube_to_verts  (c, color, c.get_llc(), ~EF_Z2);} // textured, top face only
+		else                       {top_mat.add_vcylin_to_verts(c, color, 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1);} // bottom only, skip sides
 	}
 }
 
 void building_room_geom_t::add_rug(room_object_t const &c) {
 	bool const swap_tex_st(c.dy() < c.dx()); // rug textures are oriented with the long side in X, so swap the coordinates (rotate 90 degrees) if our rug is oriented the other way
-	get_material(tid_nm_pair_t(c.get_rug_tid(), 0.0)).add_cube_to_verts(c, c.color, c.get_llc(), 61, swap_tex_st); // only draw top/+z face
+	get_material(tid_nm_pair_t(c.get_rug_tid(), 0.0)).add_cube_to_verts(c, c.color, c.get_llc(), ~EF_Z2, swap_tex_st); // only draw top/+z face
+}
+
+void building_room_geom_t::add_blanket(room_object_t const &c) {
+	bool const swap_tex_st(c.dy() < c.dx()); // same as rug
+	get_material(tid_nm_pair_t(c.get_rug_tid(), 0.0), 0, 0, 1).add_cube_to_verts(c, c.color, c.get_llc(), ~EF_Z2, swap_tex_st); // only draw top/+z face; small=1
 }
 
 void building_room_geom_t::add_picture(room_object_t const &c) { // also whiteboards; not affected by room color
@@ -1870,21 +2684,21 @@ void building_room_geom_t::add_picture(room_object_t const &c) { // also whitebo
 	if (whiteboard) { // add a marker ledge
 		cube_t ledge(c);
 		ledge.z2() = ledge.z1() + 0.016*c.dz(); // along the bottom edge
-		ledge.d[c.dim][c.dir] += (c.dir ? 1.5 : -1.5)*c.get_depth(); // extrude outward
+		ledge.d[c.dim][!c.dir] = ledge.d[c.dim][c.dir]; // flush with the face, so that it doesn't extend through the ext wall of a windowless building (should we clip the bcube?)
+		ledge.d[c.dim][ c.dir] += (c.dir ? 1.5 : -1.5)*c.get_depth(); // extrude outward
 		get_untextured_material(1).add_cube_to_verts_untextured(ledge, GRAY, (1 << (2*(2-c.dim) + !c.dir))); // shadowed
 	}
-	else if (c.flags & RO_FLAG_RAND_ROT) { // apply a random rotation
+	else if (c.rotates()) { // apply a random rotation
 		float const angle(0.2f*(fract(PI*c.obj_id + 1.61803f*c.item_flags) - 0.5f)); // random rotation based on obj_id and item flags
 		point rotate_pt(c.get_cube_center());
 		rotate_pt.z += 0.45*c.dz(); // rotate about a point near the top of the picture
-		vector3d normal(zero_vector);
-		normal[c.dim] = (c.dir ? -1.0 : 1.0);
+		vector3d const normal(vector_from_dim_dir(c.dim, !c.dir));
 		rotate_verts(picture_mat.quad_verts, normal, angle, rotate_pt, picture_qv_start);
 		rotate_verts(frame_mat  .quad_verts, normal, angle, rotate_pt, frame_qv_start  );
 	}
 }
 
-void building_room_geom_t::add_book_title(string const &title, cube_t const &title_area, rgeom_mat_t &mat, colorRGBA const &color,
+/*static*/ void building_room_geom_t::add_book_title(string const &title, cube_t const &title_area, rgeom_mat_t &mat, colorRGBA const &color,
 	unsigned hdim, unsigned tdim, unsigned wdim, bool cdir, bool ldir, bool wdir)
 {
 	vector3d column_dir(zero_vector), line_dir(zero_vector), normal(zero_vector);
@@ -1925,8 +2739,9 @@ void building_room_geom_t::add_book(room_object_t const &c, bool inc_lg, bool in
 	bool const from_book_set(c.flags & RO_FLAG_FROM_SET);
 	bool const tdir((upright && !from_book_set) ? (c.dim ^ c.dir ^ bool(c.obj_id%7)) : 1); // sometimes upside down when upright and not from a set
 	bool const ldir(!tdir), cdir(c.dim ^ c.dir ^ upright ^ ldir); // colum and line directions (left/right/top/bot) + mirror flags for front cover
-	bool const was_dropped(c.taken_level > 0); // or held
-	bool const shadowed(was_dropped && !is_held); // only shadowed if dropped by the player, since otherwise shadows are too small to have much effect; skip held objects (don't work)
+	bool const on_glass_table(c.flags & RO_FLAG_HAS_EXTRA), was_dropped(c.taken_level > 0); // or held
+	// only shadowed if dropped by the player or on a glass table, since otherwise shadows are too small to have much effect; skip held objects (don't work)
+	bool const shadowed((was_dropped || on_glass_table) && !is_held);
 	unsigned const tdim(upright ? !c.dim : 2), hdim(upright ? 2 : !c.dim); // thickness dim, height dim (c.dim is width dim)
 	float const thickness(c.get_sz_dim(tdim)), width(c.get_length()), cov_thickness(0.125*thickness), indent(0.02*width); // Note: length/width are sort of backwards here
 	cube_t bot(c), top(c), spine(c), pages(c), cover(c);
@@ -1938,8 +2753,7 @@ void building_room_geom_t::add_book(room_object_t const &c, bool inc_lg, bool in
 	shrink[c.dim] = shrink[upright ? 2 : !c.dim] = -indent;
 	pages.expand_by(shrink);
 	spine.d[c.dim][c.dir] = pages.d[c.dim][!c.dir];
-	vector3d axis, tilt_about(c.get_urc()), zrot_about(c.get_cube_center());
-	axis[c.dim] = 1.0; // along book width
+	vector3d const axis(vector_from_dim_dir(c.dim, 1)), tilt_about(c.get_urc()), zrot_about(c.get_cube_center()); // axis along book width
 	tilt_angle *= (c.dim ? -1.0 : 1.0);
 	colorRGBA const color(apply_light_color(c));
 	// skip top face, bottom face if not tilted, thickness dim if upright
@@ -1947,8 +2761,8 @@ void building_room_geom_t::add_book(room_object_t const &c, bool inc_lg, bool in
 	unsigned const spine_mask(is_open ? 0 : ~get_face_mask(c.dim, !c.dir)); // spine is drawn as part of the small faces when open
 	unsigned const skip_faces(extra_skip_faces | ((tilt_angle == 0.0) ? EF_Z1 : 0) | sides_mask);
 
-	if (z_rot_angle == 0.0 && (c.flags & RO_FLAG_RAND_ROT) && (c.obj_id%3) == 0) { // books placed on tables/desks are sometimes randomly rotated a bit
-		z_rot_angle = (PI/12.0)*(fract(123.456*c.obj_id) - 0.5);
+	if (z_rot_angle == 0.0 && c.rotates() && (c.obj_id%3) == 0) { // books placed on tables/desks are sometimes randomly rotated a bit, more when on the floor
+		z_rot_angle = (c.is_on_floor() ? PI : PI/12.0)*(fract(123.456*c.obj_id) - 0.5);
 	}
 	if ((draw_cover_as_small ? inc_sm : inc_lg) && !is_open) { // draw large faces: outside faces of covers and spine; not for open books
 		rgeom_mat_t &mat(get_untextured_material(shadowed, 0, draw_cover_as_small));
@@ -2014,7 +2828,8 @@ void building_room_geom_t::add_book(room_object_t const &c, bool inc_lg, bool in
 		bool const is_set_volume(from_book_set && c.drawer_flags > 0), add_volume_index(c.drawer_flags <= 20 && (c.flags & RO_FLAG_HAS_VOL_IX));
 		// if this is a set, but not a numbered volume, include the volume index in the title random seed so that the title is unique
 		unsigned const title_rand_id(c.obj_id + ((is_set_volume && !add_volume_index) ? (unsigned(c.drawer_flags) << 16) : 0));
-		string title(gen_book_title(title_rand_id, nullptr, SPLIT_LINE_SZ)); // select our title text
+		string author;
+		string title(gen_book_title(title_rand_id, (USE_REAL_AUTHOR ? &author : nullptr), SPLIT_LINE_SZ)); // select our title text
 		if (title.empty()) return; // no title (error?)
 		rand_gen_t rgen;
 		rgen.set_state(c.obj_id+1, c.obj_id+123);
@@ -2039,12 +2854,14 @@ void building_room_geom_t::add_book(room_object_t const &c, bool inc_lg, bool in
 		rgeom_mat_t &mat(get_material(tid_nm_pair_t(FONT_TEXTURE_ID), 0, 0, 1)); // no shadows, small=1
 		unsigned const qv_start(mat.quad_verts.size());
 		// maybe choose author
-		string author;
 		bool add_author((!from_book_set || is_set_volume) && (rgen.rand() & 3)), add_spine_author(0); // add an author 75% of the time if not from a non-volume set
 		
 		if (add_author) {
 			add_spine_author = (rgen.rand() & 3); // 75% of the time
-			if ((can_add_front_title && !has_cover) || add_spine_author) {author = gen_random_full_name(rgen);} // generate author if it will be added
+
+			if (author.empty() && ((can_add_front_title && !has_cover) || add_spine_author)) {
+				author = gen_random_full_name(rgen); // generate author if it will be added and hasn't already been filled in with the title
+			}
 		}
 		if (add_spine_title) { // add title along spine
 			cube_t title_area(c);
@@ -2109,11 +2926,11 @@ void get_bookcase_cubes(room_object_t const &c, cube_t &top, cube_t &middle, cub
 }
 
 void building_room_geom_t::add_bcase_book(room_object_t const &c, cube_t const &book, bool inc_lg, bool inc_sm, bool inc_text, bool backwards, bool in_set,
-	unsigned skip_faces, unsigned book_ix, unsigned set_start_ix, colorRGBA const &color, vect_room_object_t *books)
+	unsigned skip_faces, unsigned book_ix, unsigned set_start_ix, colorRGBA const &color, float tilt_angle, vect_room_object_t *books)
 {
 	assert(book.is_strictly_normalized());
 	bool const book_dir(c.dir ^ backwards ^ 1);
-	room_object_t obj(book, TYPE_BOOK, c.room_id, c.dim, book_dir, c.flags, c.light_amt, SHAPE_CUBE, color);
+	room_object_t obj(book, TYPE_BOOK, c.room_id, c.dim, book_dir, (c.flags & ~RO_FLAG_OPEN), c.light_amt, SHAPE_CUBE, color);
 
 	if (in_set) {
 		obj.obj_id = c.obj_id + 123*set_start_ix;
@@ -2124,26 +2941,34 @@ void building_room_geom_t::add_bcase_book(room_object_t const &c, cube_t const &
 		if (obj.dim ^ obj.dir ^ 1) {obj.flags |= RO_FLAG_HAS_VOL_IX;}
 	}
 	else { // individual book; book_ix/obj_id is unique
-		obj.obj_id = c.obj_id + 123*book_ix;
+		obj.obj_id = 777*c.obj_id + 123*book_ix;
 	}
 	obj.item_flags = (uint16_t)book_ix; // always unique per bookcase book; used for removing books from bookcases
-	if (inc_lg || inc_sm || inc_text) {add_book(obj, inc_lg, inc_sm, inc_text, 0.0, skip_faces, backwards);} // detailed book, no title if backwards
+	if (inc_lg || inc_sm || inc_text) {add_book(obj, inc_lg, inc_sm, inc_text, tilt_angle, skip_faces, backwards);} // detailed book, no title if backwards
 	if (books) {books->push_back(obj);}
 }
 
 void building_room_geom_t::add_bookcase(room_object_t const &c, bool inc_lg, bool inc_sm, bool inc_text, float tscale,
 	bool no_shelves, float sides_scale, point const *const use_this_tex_origin, vect_room_object_t *books)
 {
+	bool const fallen(c.is_on_floor());
+	if (fallen && !inc_lg) return;
 	colorRGBA const color(apply_wood_light_color(c));
 	point const tex_origin(use_this_tex_origin ? *use_this_tex_origin : c.get_llc());
-	unsigned const skip_faces(c.was_moved() ? 0 : ~get_face_mask(c.dim, !c.dir)); // skip back face, unless moved by the player and no longer against the wall
+
+	if (fallen) { // fallen bookcase; only draw back and sides, and no books
+		get_wood_material(tscale).add_cube_to_verts(c, color, tex_origin, EF_Z1); // skip bottom surface
+		return;
+	}
+	bool const draw_back_face(c.was_moved() || c.is_open()); // draw back face if moved or placed near an open wall
+	unsigned const skip_faces(draw_back_face ? 0 : ~get_face_mask(c.dim, !c.dir)); // skip back face, unless moved by the player and no longer against the wall
 	unsigned const skip_faces_shelves(skip_faces | get_skip_mask_for_xy(!c.dim)); // skip back face and sides
 	float const depth((c.dir ? -1.0 : 1.0)*c.get_depth()); // signed depth
 	cube_t top, middle, back, lr[2];
 	get_bookcase_cubes(c, top, middle, back, lr, no_shelves, sides_scale);
 
 	if (inc_lg) {
-		unsigned const back_skip_faces(c.was_moved() ? ~get_skip_mask_for_xy(c.dim) : get_face_mask(c.dim, c.dir)); // back - only face oriented outward
+		unsigned const back_skip_faces(draw_back_face ? ~get_skip_mask_for_xy(c.dim) : get_face_mask(c.dim, c.dir)); // back - only face oriented outward
 		rgeom_mat_t &wood_mat(get_wood_material(tscale));
 		wood_mat.add_cube_to_verts(top,  color, tex_origin, skip_faces_shelves); // top
 		wood_mat.add_cube_to_verts(back, color, tex_origin, back_skip_faces   ); // back
@@ -2153,10 +2978,11 @@ void building_room_geom_t::add_bookcase(room_object_t const &c, bool inc_lg, boo
 	// add shelves
 	rand_gen_t rgen(c.create_rgen());
 	unsigned const num_shelves(3 + ((17*c.room_id + int(1000.0*fabs(c.z1())))%3)); // 3-5, randomly selected by room ID and floor
+	unsigned const max_books(MAX_BCASE_BOOKS); // limited by room_object_t combined flags bits; could increase, but then book taking logic won't always be correct
 	float const shelf_dz(middle.dz()/num_shelves), shelf_thick(0.12*shelf_dz);
 	// 40% of the time lower shelves are higher than upper shelves
 	float const shelf_dz_range((rgen.rand_float() < 0.4) ? rgen.rand_uniform(0.15, 0.28)*shelf_dz : 0.0);
-	unsigned const skip_book_flags(c.get_combined_flags());
+	uint64_t const skip_book_flags(c.get_combined_flags());
 	cube_t shelves[5];
 	float cur_zval(0.0), shelf_heights[5] = {};
 	
@@ -2172,7 +2998,7 @@ void building_room_geom_t::add_bookcase(room_object_t const &c, bool inc_lg, boo
 		if (inc_lg) {get_wood_material(tscale).add_cube_to_verts(shelf, color, tex_origin, skip_faces_shelves);} // Note: mat reference may be invalidated by adding books
 	}
 	// add books
-	for (unsigned i = 0, book_ix = 0; i < num_shelves; ++i) {
+	for (unsigned i = 0, book_ix = 0; i < num_shelves && book_ix < max_books; ++i) {
 		// Future work: add vertical shelf splits as well? With recursive nesting?
 		if (rgen.rand_float() < 0.15) continue; // no books on this shelf
 		cube_t const &shelf(shelves[i]);
@@ -2202,19 +3028,22 @@ void building_room_geom_t::add_bookcase(room_object_t const &c, bool inc_lg, boo
 				colorRGBA const book_color(book_colors[rgen.rand() % NUM_BOOK_COLORS]);
 				bool const backwards((rgen.rand()%10) == 0); // spine facing out 90% of the time
 
-				if (!(skip_book_flags & (1<<(book_ix&31)))) {
-					add_bcase_book(c, book, inc_lg, inc_sm, inc_text, backwards, 0, skip_faces, book_ix, 0, book_color, books); // in_set=0, set_start_ix=0
+				if (!(skip_book_flags & c.get_book_ix_mask(book_ix))) { // works with up to 48 books
+					add_bcase_book(c, book, inc_lg, inc_sm, inc_text, backwards, 0, skip_faces, book_ix, 0, book_color, 0.0, books); // in_set=0, set_start_ix=0, tilt_angle=0.0
 				}
 				++book_ix;
 				cur_zval = next_zval;
+				if (book_ix == max_books) break; // no more books
 			} // for n
 			continue; // done with this shelf
 		}
-		unsigned const num_spaces(22 + (rgen.rand()%11)); // 22-32 books per shelf
+		unsigned const num_left(max_books - book_ix), rand_mod(min(11U, max(3U, num_left/3)));
+		unsigned const num_spaces(22 + (rgen.rand()%rand_mod)); // 22-32 book spaces per shelf, fewer when running out of books
+		float const skip_rate((num_left < max_books/3) ? 0.2 : 0.12); // skip more often when running out of books
 		unsigned skip_mask(0), set_start_ix(0);
 
 		for (unsigned n = 0; n < num_spaces; ++n) {
-			if (rgen.rand_float() < 0.12) {
+			if (rgen.rand_float() < skip_rate) {
 				unsigned const skip_end(n + (rgen.rand()%8) + 1); // skip 1-8 books
 				for (; n < skip_end; ++n) {skip_mask |= (1<<n);}
 			}
@@ -2277,13 +3106,14 @@ void building_room_geom_t::add_bookcase(room_object_t const &c, bool inc_lg, boo
 			}
 			bool const backwards(!in_set && (rgen.rand()%10) == 0); // spine facing out 90% of the time if not in a set
 
-			if (!(skip_book_flags & (1<<(book_ix&31)))) { // may have more than 32 books, and will wrap in that case
-				add_bcase_book(c, book, inc_lg, inc_sm, inc_text, backwards, in_set, skip_faces, book_ix, set_start_ix, book_color, books);
+			if (!(skip_book_flags & c.get_book_ix_mask(book_ix))) { // may have more than 48 books, and will wrap in that case
+				add_bcase_book(c, book, inc_lg, inc_sm, inc_text, backwards, in_set, skip_faces, book_ix, set_start_ix, book_color, tilt_angle, books);
 			}
 			++book_ix;
 			pos += width;
 			last_book_pos = pos;
 			prev_tilted   = (tilt_angle != 0.0); // don't tilt two books in a row
+			if (book_ix == max_books) break; // no more books
 		} // for n
 	} // for i
 }
@@ -2346,7 +3176,7 @@ void building_room_geom_t::add_desk(room_object_t const &c, float tscale, bool i
 		top.z1() += 0.85 * c.dz();
 		legs_bcube.z2() = top.z1();
 		get_wood_material(tscale).add_cube_to_verts(top, color, tex_origin); // all faces drawn
-		add_tc_legs(legs_bcube, color, 0.06, tscale);
+		add_tc_legs(legs_bcube, c, color, 0.06, 1, tscale);
 	}
 	if (c.desk_has_drawers()) { // add drawers 75% of the time
 		room_object_t drawers(get_desk_drawers_part(c));
@@ -2369,7 +3199,9 @@ void building_room_geom_t::add_reception_desk(room_object_t const &c, float tsca
 	assert(width > depth && cutlen > 0.0);
 	colorRGBA const color(apply_light_color(c));
 	// wood paneling sides
-	rgeom_mat_t &side_mat(get_material(tid_nm_pair_t(PANELING_TEX, get_paneling_nm_tid(), 4.0*tscale, 4.0*tscale), 1)); // with shadows
+	tid_nm_pair_t paneling(get_tex_auto_nm(PANELING_TEX, 4.0f*tscale));
+	paneling.set_specular(0.1, 50.0);
+	rgeom_mat_t &side_mat(get_material(paneling, 1)); // with shadows
 	point const tex_origin(c.get_llc());
 	unsigned const lr_dim_mask(~get_face_mask(c.dim, c.dir));
 	cube_t base(c);
@@ -2380,9 +3212,9 @@ void building_room_geom_t::add_reception_desk(room_object_t const &c, float tsca
 	left .d[!c.dim][1] -= (width - lr_width);
 	right.d[!c.dim][0] += (width - lr_width);
 	left .d[ c.dim][c.dir] = right.d[ c.dim][c.dir] = front.d[ c.dim][!c.dir];
-	side_mat.add_cube_to_verts(front, color, tex_origin, EF_Z2);
-	side_mat.add_cube_to_verts(left,  color, tex_origin, (EF_Z2 | lr_dim_mask)); // skip top face
-	side_mat.add_cube_to_verts(right, color, tex_origin, (EF_Z2 | lr_dim_mask)); // skip top face
+	side_mat.add_cube_to_verts(front, color, tex_origin,  EF_Z2,                0, 0, 0, 0, 1); // z_dim_uses_ty=1
+	side_mat.add_cube_to_verts(left,  color, tex_origin, (EF_Z2 | lr_dim_mask), 0, 0, 0, 0, 1); // skip top face, z_dim_uses_ty=1
+	side_mat.add_cube_to_verts(right, color, tex_origin, (EF_Z2 | lr_dim_mask), 0, 0, 0, 0, 1); // skip top face, z_dim_uses_ty=1
 	// shiny marble top
 	// Note: I wanted to add cylinders to the left and right top to round the corners like in the mapx lobby, but it's not easy to get the textures to line up here
 	tid_nm_pair_t top_tex(get_counter_tid(), 2.5*tscale);
@@ -2447,7 +3279,7 @@ void add_pillow(cube_t const &c, rgeom_mat_t &mat, colorRGBA const &color, point
 }
 
 bool bed_is_wide       (room_object_t const &c) {return (c.get_width() > 0.7*c.get_length());}
-bool bed_has_posts     (room_object_t const &c) {return (bed_is_wide   (c) && (c.obj_id & 1 ));} // no posts for twin beds
+bool bed_has_posts     (room_object_t const &c) {return (bed_is_wide   (c) && (c.obj_id & 1 ) && c.is_house());} // no posts for twin beds or hotel/apartment beds
 bool bed_has_canopy    (room_object_t const &c) {return (bed_has_posts (c) && (c.obj_id & 2 ));}
 bool bed_has_canopy_mat(room_object_t const &c) {return (bed_has_canopy(c) && (c.obj_id & 12) != 0);} // 75% of the time
 int get_canopy_texture() {return get_texture_by_name("fabrics/wool.jpg");}
@@ -2474,7 +3306,7 @@ void get_bed_cubes(room_object_t const &c, cube_t cubes[6]) { // frame, head, fo
 	legs_bcube.z2() = frame.z1();
 	mattress.expand_in_dim(!c.dim, -0.02*width); // shrink slightly
 	float const pillow_space((is_wide ? 0.08 : 0.23)*width);
-	pillow.expand_in_dim(!c.dim, -pillow_space);
+	pillow.expand_in_dim(!c.dim, -pillow_space); // shrink on sides
 	pillow.d[c.dim][ c.dir] = mattress.d[c.dim][ c.dir] + (c.dir ? -1.0 : 1.0)*0.02*length; // head
 	pillow.d[c.dim][!c.dir] = pillow  .d[c.dim][ c.dir] + (c.dir ? -1.0 : 1.0)*(is_wide ? 0.25 : 0.6)*pillow.get_sz_dim(!c.dim);
 	cubes[0] = frame; cubes[1] = head; cubes[2] = foot; cubes[3] = mattress; cubes[4] = pillow; cubes[5] = legs_bcube;
@@ -2492,7 +3324,7 @@ void building_room_geom_t::add_bed(room_object_t const &c, bool inc_lg, bool inc
 	if (inc_lg) {
 		bool const no_mattress(c.taken_level > 2);
 		colorRGBA const color(apply_wood_light_color(c));
-		add_tc_legs(legs_bcube, color, max(head_width, foot_width), tscale);
+		add_tc_legs(legs_bcube, c, color, max(head_width, foot_width), 0, tscale);
 		if (no_mattress) {get_wood_material(4.0*tscale);} // pre-allocate slats material if needed
 		rgeom_mat_t &wood_mat(get_wood_material(tscale));
 
@@ -2533,7 +3365,7 @@ void building_room_geom_t::add_bed(room_object_t const &c, bool inc_lg, bool inc
 			posts_area.z1() = foot.z2(); // start at the foot
 			posts_area.z2() = posts_area.z1() + (add_canopy ? 1.4 : 0.6)*c.dz(); // higher posts for canopy bed
 			cube_t posts[4];
-			get_tc_leg_cubes_abs_width(posts_area, post_width, posts);
+			get_tc_leg_cubes_abs_width(posts_area, post_width, 0, posts); // recessed=0
 			bool const use_cylinders(!add_canopy && (c.obj_id & 4));
 
 			for (unsigned i = 0; i < 4; ++i) {
@@ -2647,7 +3479,7 @@ void building_room_geom_t::add_trashcan(room_object_t const &c) {
 }
 
 void add_pipe_with_bend(rgeom_mat_t &mat, colorRGBA const &color, point const &bot_pt, point const &top_pt, point const &bend, unsigned ndiv, float radius, bool draw_ends) {
-	mat.add_sphere_to_verts(bend, vector3d(radius, radius, radius), color, (ndiv == 16)); // round part, low detail if ndiv==16
+	mat.add_sphere_to_verts(bend, vector3d(radius, radius, radius), color, (ndiv == 16), -plus_z); // round part, low detail if ndiv==16, top hemisphere (always bends down)
 	mat.add_cylin_to_verts (bot_pt, bend, radius, radius, color, draw_ends, 0, 0, 0, 1.0, 1.0, 0, ndiv); // vertical
 	mat.add_cylin_to_verts (top_pt, bend, radius, radius, color, draw_ends, 0, 0, 0, 1.0, 1.0, 0, ndiv); // horizontal
 }
@@ -2660,7 +3492,7 @@ void building_room_geom_t::add_water_heater(room_object_t const &c) {
 
 	for (unsigned d = 0; d < 2; ++d) {
 		point pt(c.xc(), c.yc(), 0.0); // zval will be set below
-		pt[!c.dim] += (d ? 1.0 : -1.0)*0.65*radius;
+		pt[!c.dim] += (d ? 1.0 : -1.0)*WHEATER_PIPE_SPACING*radius;
 		pipes[d].set_from_sphere(pt, pipe_radius);
 		set_cube_zvals(pipes[d], top_z, c.z2());
 	}
@@ -2684,8 +3516,8 @@ void building_room_geom_t::add_water_heater(room_object_t const &c) {
 	metal_mat.add_vcylin_to_verts(top,  apply_light_color(c, DK_GRAY), 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 64); // top - draw top; ndiv=64
 	metal_mat.add_vcylin_to_verts(vent, apply_light_color(c, LT_GRAY), 0, 0, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 16); // ndiv=16
 	metal_mat.add_vcylin_to_verts(cone, apply_light_color(c, LT_GRAY), 0, 0, 0, 0, 1.8, 0.0); // cone
-	if (!is_house) {get_metal_material(1, 0, 1, BRASS_C);} // make sure it exists in the materials
-	rgeom_mat_t &copper_mat(get_metal_material(1, 0, 1, COPPER_C)); // small=1
+	if (!is_house) {get_metal_material(1, 0, 1, 0, BRASS_C);} // make sure it exists in the materials
+	rgeom_mat_t &copper_mat(get_metal_material(1, 0, 1, 0, COPPER_C)); // small=1
 	colorRGBA const copper_color(apply_light_color(c, COPPER_C));
 	bool const low_detail = 1;
 	unsigned const pipe_ndiv(get_rgeom_sphere_ndiv(low_detail));
@@ -2694,7 +3526,7 @@ void building_room_geom_t::add_water_heater(room_object_t const &c) {
 		cube_t &pipe(pipes[d]);
 
 		if (!is_house) { // bend office building water pipes back down into the floor since routing is in the basement
-			float const bend_zval(pipe.zc()), pipe_len(0.92*radius);
+			float const bend_zval(pipe.zc()), pipe_len(WHEATER_PIPE_H_DIST*radius);
 			pipe.z2() = bend_zval; // shorten; no longer reaches the ceiling
 			cube_t v_pipe(pipe);
 			v_pipe.z1() = c.z1(); // down to the floor
@@ -2703,7 +3535,7 @@ void building_room_geom_t::add_water_heater(room_object_t const &c) {
 			copper_mat.add_vcylin_to_verts(v_pipe, copper_color, 0, 0, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, pipe_ndiv);
 			copper_mat.add_cylin_to_verts(bends[0], bends[1], pipe_radius, pipe_radius, copper_color, 0, 0, 0, 0, 1.0, 1.0, 0, pipe_ndiv);
 			// add brass fittings
-			rgeom_mat_t &brass_mat(get_metal_material(1, 0, 1, BRASS_C )); // small=1
+			rgeom_mat_t &brass_mat(get_metal_material(1, 0, 1, 0, BRASS_C )); // small=1
 			colorRGBA const brass_color(apply_light_color(c, BRASS_C));
 			float const fr(1.1*pipe_radius), extend(2.0*fr);
 			vector3d const delta((bends[0] - bends[1])*(extend/pipe_len));
@@ -2747,7 +3579,6 @@ void narrow_furnace_intake(cube_t &duct, room_object_t const &c) {
 	duct.expand_in_dim(!c.dim, -0.05*c.get_width()); // shrink slightly
 }
 void building_room_geom_t::add_furnace(room_object_t const &c) {
-	colorRGBA const duct_color(apply_light_color(c, DUCT_COLOR));
 	room_object_t main_unit(c);
 	room_object_t base(c); // base area below the furnace that connects to the ducts
 	main_unit.z1() = base.z2() = c.z1() + 0.167*c.dz();
@@ -2757,7 +3588,7 @@ void building_room_geom_t::add_furnace(room_object_t const &c) {
 	base.d[c.dim][c.dir] += (c.dir ? 1.0 : -1.0)*expand_amt; // shift slightly outward in the front
 	base.dir    = 1; // encoding for vertical
 	base.flags |= RO_FLAG_ADJ_BOT; // skip bottom face; top face is slightly visible through expanded edges
-	add_duct(base);
+	add_duct(base); // duct under the furnace
 
 	if (c.in_attic()) {
 		// add ductwork on the top ... somewhere?
@@ -2774,10 +3605,10 @@ void building_room_geom_t::add_furnace(room_object_t const &c) {
 	bool const low_detail = 1;
 	unsigned const pipe_ndiv(get_rgeom_sphere_ndiv(low_detail));
 	// insulated
-	rgeom_mat_t &insul_mat(get_metal_material(1, 0, 1, WHITE)); // black reflective tape (not actually metal); shadows=1, small=1
+	rgeom_mat_t &insul_mat(get_metal_material(1, 0, 1, 0, WHITE)); // white reflective tape (not actually metal); shadows=1, small=1
 	add_furnace_pipe_with_bend(c, insul_mat, apply_light_color(c, BLACK), pipe_ndiv, 0.02, 0.87, 0.484, 2.2);
 	// copper
-	rgeom_mat_t &copper_mat(get_metal_material(1, 0, 1, COPPER_C)); // shadows=1, small=1
+	rgeom_mat_t &copper_mat(get_metal_material(1, 0, 1, 0, COPPER_C)); // shadows=1, small=1
 	add_furnace_pipe_with_bend(c, copper_mat, apply_light_color(c, COPPER_C), pipe_ndiv, 0.007, 0.88, 0.45, 1.6);
 	// drain (2x)
 	rgeom_mat_t &plastic_mat(get_untextured_material(1, 0, 1)); // shadows=1, small=1
@@ -2785,6 +3616,63 @@ void building_room_geom_t::add_furnace(room_object_t const &c) {
 	for (unsigned d = 0; d < 2; ++d) {
 		add_furnace_pipe_with_bend(c, plastic_mat, apply_light_color(c, WHITE), pipe_ndiv, 0.016, (d ? 0.081 : 0.173), 0.2, 1.8);
 	}
+}
+
+colorRGBA get_server_color() {return texture_color(get_texture_by_name("interiors/server_rack.png"));}
+
+void building_room_geom_t::add_server(room_object_t const &c) {
+	add_obj_with_front_texture(c, "interiors/server_rack.png", get_server_color(), 1); // small=1
+}
+
+void get_pool_ball_rot_matrix(room_object_t const &c, xform_matrix &rot_matrix) {
+	rand_gen_t rgen(c.create_rgen());
+	rot_matrix  = get_rotation_matrix(plus_x, TWO_PI*rgen.rand_float()); // random rotation about the numbered face
+	rot_matrix *= get_rotation_matrix(rgen.signed_rand_vector_spherical().get_norm(), TWO_PI*rgen.rand_float()); // random rotation about random axis
+}
+tex_range_t get_pool_ball_tex_range(room_object_t const &c) {
+	// the texture atlas is 3 across by 6 high: {1,2,3}, {4,5,6}, {7,8,9}, {10,11,23}, {13,14,15}, {cue, stripe, crown}
+	unsigned const number(c.item_flags); // starts from 0; cue ball is 15
+	assert(number < 16);
+	unsigned const num_rows(6), num_cols(3);
+	unsigned const row_ix(num_rows - (number/num_cols) - 1), col_ix(number % num_cols); // rows are in inverted order
+	float const row_height(1.0/num_rows), col_width(1.0/num_cols), border(0.01);
+	float const tx1(col_ix*col_width), tx2(tx1 + col_width), ty1(row_ix*row_height), ty2(ty1 + row_height);
+	return tex_range_t(tx1+border, ty1+border, tx2-border, ty2-border);
+}
+void building_room_geom_t::add_pool_ball(room_object_t const &c) {
+	bool const dynamic(c.is_dynamic()); // either small or dynamic
+	ball_type_t const &bt(pool_ball_type);
+	tid_nm_pair_t tex(get_texture_by_name(bt.tex_fname), 1.0, 1); // shadowed
+	tex.set_specular(bt.spec, bt.shine);
+	rgeom_mat_t &mat(get_material(tex, 1, dynamic, !dynamic)); // shadowed, small/dynamic
+	// calculate rotation matrix
+	xform_matrix rot_matrix;
+	if (c.has_dstate()) {rot_matrix = get_dstate(c).rot_matrix;} // custom rotation matrix
+	else {get_pool_ball_rot_matrix(c, rot_matrix);} // random initial rotation
+	mat.add_sphere_to_verts(c, c.color, 1, zero_vector, get_pool_ball_tex_range(c), &rot_matrix); // low_detail=1; no apply_light_color()
+}
+void building_room_geom_t::add_pool_cue(room_object_t const &c) {
+	point const center(c.get_cube_center());
+	vector3d const sz(c.get_size());
+	unsigned const dim(get_max_dim(sz));
+	float const len(sz[dim]), radius(0.5*sz[(dim+1)%3]); // either other dim should work for radius
+	point tip(center), p1(center), p2(center), end(center);
+	tip[dim] = c.d[dim][ c.dir];
+	end[dim] = c.d[dim][!c.dir];
+	p1 [dim] = tip[dim] - 0.004*len*(c.dir ? 1.0 : -1.0);
+	p2 [dim] = end[dim] + 0.006*len*(c.dir ? 1.0 : -1.0);
+	tid_nm_pair_t tex(get_texture_by_name("interiors/pool_cue.png"), 1.0, 1); // shadowed
+	tex.set_specular(0.5, 50.0);
+	rgeom_mat_t &mat(get_material(tex, 1, 0, 1)); // shadowed, small
+	mat.add_cylin_to_verts(p2, p1, radius, 0.5*radius, c.color, 0, 0); // wooden body; no ends; no apply_light_color()
+	rgeom_mat_t &ends_mat(get_untextured_material(0, 0, 1)); // unshadowed, small
+	ends_mat.add_cylin_to_verts(p1,  tip, 0.50*radius, 0.5*radius, WHITE, 0, 1); // tip; draw top end only
+	ends_mat.add_cylin_to_verts(end, p2,  0.75*radius, 1.0*radius, BLACK, 1, 0); // bumper; draw bottom end only
+}
+
+// wooden block used to hold pool cues, but could be used for other purposes
+void building_room_geom_t::add_wall_mount(room_object_t const &c) {
+	get_wood_material(128.0, 1, 0, 1).add_cube_to_verts(c, apply_light_color(c), all_zeros, ~get_face_mask(c.dim, !c.dir)); // shadowed, small
 }
 
 void building_room_geom_t::add_toaster_proxy(room_object_t const &c) { // draw a simple untextured XY cube to show a lower LOD model of the toaster
@@ -2800,7 +3688,6 @@ void building_room_geom_t::add_toaster_proxy(room_object_t const &c) { // draw a
 void building_room_geom_t::add_laundry_basket(room_object_t const &c) {
 	// Note: no alpha test is enabled in the shader when drawing this, so the holes in the material may not be drawn correctly against objects such as exterior walls
 	rgeom_mat_t &tex_mat(get_material(tid_nm_pair_t(get_texture_by_name("interiors/plastic_mesh.png")), 1, 0, 1)); // inc_shadows=1, dynamic=0, small=1
-	//rgeom_mat_t &tex_mat(mats_amask.get_material(tid_nm_pair_t(get_texture_by_name("interiors/plastic_mesh.png")), 1)); // shadowed with alpha mask - doesn't look as good, need min_alpha=0.0
 	cube_t bot(c), mid(c), top(c);
 	bot.z2() = mid.z1() = c.z1() + 0.12*c.dz();
 	mid.z2() = top.z1() = c.z2() - 0.12*c.dz();
@@ -2903,18 +3790,221 @@ void building_room_geom_t::add_cubicle(room_object_t const &c, float tscale) {
 
 void add_room_obj_sign_text_verts(room_object_t const &c, colorRGBA const &color, vector<vert_norm_comp_tc_color> &verts_out);
 
-void building_room_geom_t::add_sign(room_object_t const &c, bool inc_back, bool inc_text) {
+void building_room_geom_t::add_sign(room_object_t const &c, bool inc_back, bool inc_text, bool exterior_only) {
+	bool const exterior(c.is_exterior()), small(!exterior);
+	if (exterior != exterior_only) return; // wrong pass
+
 	if (inc_back) {
 		bool const hanging(c.is_hanging()), draw_top(c.flags & RO_FLAG_ADJ_TOP); // for exit sign and floor signs
-		unsigned const skip_faces(hanging ? (draw_top ? 0 : EF_Z2) : ~get_face_mask(c.dim, !c.dir)); // skip back face, top face if hanging and !draw_top
-		// what about transparent plastic back for hanging signs?
-		get_untextured_material(0, 0, 1).add_cube_to_verts_untextured(c, apply_light_color(c, WHITE), skip_faces); // back of the sign, always white (for now); unshadowed, small
+		bool const dark_mode(c.color == WHITE); // white text on black background
+		unsigned const skip_back_face(~get_face_mask(c.dim, !c.dir));
+		unsigned const skip_faces(hanging ? (draw_top ? 0 : EF_Z2) : skip_back_face); // skip back face, top face if hanging and !draw_top
+		// back of the sign, always white (for now); unshadowed; what about transparent plastic back for hanging signs?
+		rgeom_mat_t &mat(get_untextured_material(0, 0, small, 0, exterior));
+		mat.add_cube_to_verts_untextured(c, apply_light_color(c, (dark_mode ? BKGRAY : WHITE)), skip_faces);
+
+		if (c.flags & RO_FLAG_HAS_EXTRA) { // add a black-ish frame (or white in dark mode)
+			unsigned const skip_faces_frame(hanging ? 0 : skip_back_face);
+			colorRGBA const frame_color(apply_light_color(c, (dark_mode ? WHITE : BKGRAY)));
+			float const frame_width(0.1*c.dz()), frame_thickness(0.5*c.get_sz_dim(c.dim)); // actual thickness is 2x
+			cube_t frame(c);
+			frame.d[c.dim][c.dir] += (c.dir ? 1.0 : -1.0)*frame_thickness; // extend outward
+			frame.expand_in_dim(!c.dim, frame_width);
+			frame.expand_in_dim(2,      frame_width); // z
+
+			for (unsigned d = 0; d < 2; ++d) { // top/bot an sides
+				cube_t tb(frame), side(frame);
+				tb.d[2][d] = c.d[2][!d] + (d ? 1.0 : -1.0)*frame_thickness; // clip in z
+				side.d[!c.dim][d] = c.d[!c.dim][!d] + (d ? 1.0 : -1.0)*frame_thickness; // clip
+				side.z1() = c.z1(); side.z2() = c.z2();
+				mat.add_cube_to_verts_untextured(tb,   frame_color,  skip_faces_frame);
+				mat.add_cube_to_verts_untextured(side, frame_color, (skip_faces_frame | EF_Z12));
+			} // for d
+		}
 	}
 	if (!inc_text) return;
 	// add sign text
 	tid_nm_pair_t tex(FONT_TEXTURE_ID);
 	if (c.flags & RO_FLAG_EMISSIVE) {tex.emissive = 1.0;}
-	add_room_obj_sign_text_verts(c, apply_light_color(c), get_material(tex, 0, 0, 1).quad_verts); // unshadowed, small=1
+	add_room_obj_sign_text_verts(c, apply_light_color(c), get_material(tex, 0, 0, small, 0, exterior).quad_verts); // unshadowed, small=1
+}
+
+void building_room_geom_t::add_window_sill(room_object_t const &c) {
+	rgeom_mat_t &mat(get_untextured_material(0, 0, 0, 0, 1)); // unshadowed, exterior
+	unsigned const verts_start(mat.quad_verts.size());
+	mat.add_cube_to_verts_untextured(c, apply_light_color(c), ~get_face_mask(c.dim, !c.dir));
+	float const slope_dz(0.5*c.dz());
+	vector3d v1, v2;
+	v1[!c.dim] = 1.0; // side vector
+	v2[ c.dim] = (c.dir ? 1.0 : -1.0); // front vector
+	v2.z = -slope_dz/c.get_sz_dim(c.dim); // sloped downward
+	vector3d const normal(cross_product(v1, v2).get_norm());
+	norm_comp const nc((normal.z < 0.0) ? -normal : normal);
+
+	// now make the top sloped slightly downward on the outside
+	for (auto i = mat.quad_verts.begin()+verts_start; i != mat.quad_verts.end(); ++i) {
+		if (i->v.z != c.z2()) continue; // not the top surface
+		if (i->v[c.dim] == c.d[c.dim][c.dir]) {i->v.z -= slope_dz;}
+		if (i->n[2] == 127) {i->set_norm(nc);} // upward normal
+	}
+}
+
+void building_room_geom_t::add_exterior_step(room_object_t const &c) {
+	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_concrete_tid(), 16.0), 0, 0, 0, 0, 1)); // unshadowed, exterior
+
+	if (c.shape == SHAPE_CUBE) {
+		unsigned skip_mask((c.flags & RO_FLAG_HANGING) ? 0 : ~get_face_mask(c.dim, c.dir)); // skip face that's against the building unless hanging flag is set
+		if (c.flags & RO_FLAG_ADJ_LO) {skip_mask |= EF_Z1;} // skip bottom face if at ground level and in a city
+		mat.add_cube_to_verts(c, c.color, all_zeros, skip_mask);
+	}
+	else if (c.shape == SHAPE_ANGLED) {add_ramp(c, c.dz(), 1, mat);} // skip_bottom=0
+	else {assert(0);} // unsupported shape
+}
+
+void add_spaced_vert_bars(rgeom_mat_t &mat, cube_t const &railing, colorRGBA const &color,
+	float bar_z2, float bar_hwidth, float bar_hdepth, float bar_spacing, bool dim, float rot_angle=0.0)
+{
+	float const length(railing.get_sz_dim(dim));
+	if (length < 1.6*bar_spacing) return; // no bars
+	unsigned const num_segs(round_fp(length/bar_spacing)), num_bars(num_segs - 1);
+	float const seg_spacing(length/num_segs), hwidth(0.5*railing.get_sz_dim(!dim));
+
+	for (unsigned n = 0; n < num_bars; ++n) {
+		cube_t bar(railing);
+		bar.z2() = bar_z2;
+		bar.expand_in_dim(!dim, -(hwidth - bar_hdepth));
+		set_wall_width(bar, (railing.d[dim][0] + (n+1)*seg_spacing), bar_hwidth, dim);
+		unsigned const qv_start(mat.quad_verts.size());
+		mat.add_cube_to_verts_untextured(bar, color, EF_Z12);
+		if (rot_angle != 0.0) {rotate_verts(mat.quad_verts, plus_z, rot_angle, bar.get_cube_center(), qv_start);}
+	} // for n
+}
+void get_balcony_cubes(room_object_t const &c, cube_t cubes[4]) { // {bottom, front, left side, right side}
+	float const floor_thickness(0.12*c.dz()), wall_thickness(0.08*c.get_depth()), bot_expand(0.1*wall_thickness);
+	cube_t bot(c), front(c), sides(c);
+	bot.z2() = front.z1() = sides.z1() = c.z1() + floor_thickness;
+	front.d[c.dim][!c.dir] = c.d[c.dim][c.dir] + (c.dir ? -1.0 : 1.0)*wall_thickness;
+	bot.expand_in_dim(!c.dim, bot_expand);
+	bot.d[c.dim][c.dir] += (c.dir ? 1.0 : -1.0)*bot_expand;
+
+	for (unsigned d = 0; d < 2; ++d) { // left/right sides
+		cube_t &side(cubes[d+2]);
+		side = sides;
+		side.d[!c.dim][!d]    = c.d[!c.dim][d] + (d ? -1.0 : 1.0)*wall_thickness;
+		side.d[ c.dim][c.dir] = front.d[c.dim][!c.dir]; // clip to front wall
+	}
+	cubes[0] = bot; cubes[1] = front;
+}
+void get_balcony_pillars(room_object_t const &c, float ground_floor_z1, cube_t pillar[2]) {
+	float const width(c.get_width()), depth(c.get_depth()), pillar_width(BALCONY_PILLAR_SCALE*depth);
+	cube_t pillars(c);
+	set_cube_zvals(pillars, ground_floor_z1, c.z1());
+	pillars.d[c.dim][!c.dir] -= (c.dir ? -1.0 : 1.0)*(depth - pillar_width);
+
+	for (unsigned d = 0; d < 2; ++d) {
+		pillar[d] = pillars;
+		pillar[d].d[!c.dim][!d] -= (d ? -1.0 : 1.0)*(width - pillar_width);
+	}
+}
+void building_room_geom_t::add_balcony(room_object_t const &c, float ground_floor_z1, bool is_in_city) {
+	bool const shadowed = 1; // doesn't work since exterior?
+	unsigned const skip_face_against_wall(~get_face_mask(c.dim, !c.dir));
+	unsigned const skip_face_sides(get_skip_mask_for_xy(c.dim)); // skip abutting front wall
+	unsigned const balcony_style(c.obj_id & 3); // wooden walls, metal railing + bars, metal railing + 45 deg rotated bars, metal railing + wood sides
+	cube_t cubes[4]; // {bottom, front, left side, right side}
+	get_balcony_cubes(c, cubes);
+	cube_t &bot(cubes[0]), &front(cubes[1]);
+
+	if (balcony_style == 0) { // balcony with wooden sides
+		tid_nm_pair_t tex(get_tex_auto_nm(FENCE_TEX, 32.0, shadowed));
+		tex.set_specular(0.1, 50.0);
+		rgeom_mat_t &wall_mat(get_material(tex, shadowed, 0, 0, 0, 1)); // exterior
+		wall_mat.add_cube_to_verts(front, c.color, tex_origin, EF_Z1, !c.dim); // front; skip bottom face
+		for (unsigned d = 0; d < 2; ++d) {wall_mat.add_cube_to_verts(cubes[d+2], c.color, tex_origin, (EF_Z1 | skip_face_sides), c.dim);} // skip bottom
+	}
+	else { // balcony with railings
+		unsigned const NUM_BAR_COLORS = 4;
+		colorRGBA const bar_colors[NUM_BAR_COLORS] = {WHITE, BKGRAY, GRAY, DK_BROWN};
+		colorRGBA const &bar_color(bar_colors[(c.obj_id >> 2) % NUM_BAR_COLORS]); // choose a random color
+		float const top_z1(c.z2() - 0.4*bot.dz()), wall_thickness(front.get_sz_dim(c.dim)), railing_hwidth(0.5*wall_thickness);
+		float const corner_bar_hwidth(0.75*0.5*wall_thickness), bar_hwidth(0.75*corner_bar_hwidth);
+		float const bar_spacing(0.6*c.dz());
+		cube_t front_top(front);
+		front_top.z1() = top_z1;
+		rgeom_mat_t &railing_mat(get_metal_material(shadowed, 0, 0, 1)); // exterior
+		railing_mat.add_cube_to_verts_untextured(front_top, bar_color, 0); // front; draw all sides
+		cube_t corner_bars[2];
+
+		for (unsigned d = 0; d < 2; ++d) { // draw side railings and corner bars
+			cube_t side_top(cubes[d+2]);
+			side_top.z1() = top_z1;
+			railing_mat.add_cube_to_verts_untextured(side_top, bar_color, skip_face_sides); // sides
+			corner_bars[d] = front;
+			corner_bars[d].z2() = top_z1;
+			corner_bars[d].expand_in_dim(c.dim, -(railing_hwidth - corner_bar_hwidth));
+			set_wall_width(corner_bars[d], (front.d[!c.dim][d] + (d ? -1.0 : 1.0)*railing_hwidth), corner_bar_hwidth, !c.dim);
+			railing_mat.add_cube_to_verts_untextured(corner_bars[d], bar_color, EF_Z12); // corner bar; skip top and bottom
+		}
+		if (balcony_style <= 2) { // vertical metal bars
+			float const rot_angle((balcony_style == 1) ? PI/4.0 : 0.0); // maybe rotate 45 degrees
+			for (unsigned d = 0; d < 2; ++d) {add_spaced_vert_bars(railing_mat, cubes[d+2], bar_color, top_z1, bar_hwidth, bar_hwidth, bar_spacing, c.dim, rot_angle);}
+			add_spaced_vert_bars(railing_mat, front, bar_color, top_z1, bar_hwidth, bar_hwidth, bar_spacing, !c.dim, rot_angle); // front bars
+		}
+		else { // vertical wooden sides
+			tid_nm_pair_t tex(get_tex_auto_nm(FENCE_TEX, 32.0, shadowed));
+			tex.set_specular(0.1, 50.0);
+			rgeom_mat_t &wall_mat(get_material(tex, shadowed, 0, 0, 0, 1)); // exterior
+			float const wall_shrink(0.5*railing_hwidth);
+			front.z2() = top_z1;
+			front.expand_in_dim(c.dim, -wall_shrink);
+			front.d[!c.dim][0] = corner_bars[0].d[!c.dim][1]; // end at corner bar
+			front.d[!c.dim][1] = corner_bars[1].d[!c.dim][0]; // end at corner bar
+			wall_mat.add_cube_to_verts(front, c.color, tex_origin, EF_Z12, !c.dim); // front; skip bottom face
+			
+			for (unsigned d = 0; d < 2; ++d) {
+				cube_t &side(cubes[d+2]);
+				side.z2() = top_z1;
+				side.expand_in_dim(!c.dim, -wall_shrink);
+				side.d[c.dim][c.dir] = corner_bars[d].d[c.dim][!c.dir]; // end at corner bar
+				wall_mat.add_cube_to_verts(side, c.color, tex_origin, (EF_Z12 | skip_face_sides), c.dim); // skip top/bottom
+			}
+		}
+	}
+	// draw concrete floor
+	rgeom_mat_t &floor_mat(get_material(tid_nm_pair_t(get_concrete_tid(), 16.0, shadowed), shadowed, 0, 0, 0, 1)); // exterior
+	floor_mat.add_cube_to_verts(bot, LT_GRAY, tex_origin, skip_face_against_wall);
+	
+	if (!c.is_hanging()) { // draw vertical supports if not hanging
+		rgeom_mat_t &wood_mat(get_wood_material(16.0, shadowed, 0, 0, 1)); // exterior=1
+		cube_t pillar[2];
+		get_balcony_pillars(c, ground_floor_z1, pillar);
+		unsigned const zskip(is_in_city ? EF_Z12 : EF_Z2); // draw the bottom surface if not in a city in case it's on a hill
+
+		for (unsigned d = 0; d < 2; ++d) {
+			wood_mat.add_cube_to_verts(pillar[d], WHITE, zero_vector, (zskip | EF_Y12), 0); // X sides
+			wood_mat.add_cube_to_verts(pillar[d], WHITE, zero_vector, (zskip | EF_X12), 1); // Y sides, swap texture to vertical grain orient
+		}
+	}
+}
+
+void building_room_geom_t::add_false_door(room_object_t const &c) {
+	if ((c.flags & RO_FLAG_WALKWAY) && c.is_interior()) { // interior walkway door decal
+		rgeom_mat_t &fb_mat(get_material(tid_nm_pair_t(get_bldg_door_tid(), 0.0), 0, 0, 0, 0, 1)); // unshadowed, exterior
+		fb_mat.add_cube_to_verts(c, c.color, all_zeros, get_face_mask(c.dim, c.dir), !c.dim); // draw only exterior face
+		// no sides, since they may be visible through an interior window
+		return;
+	}
+	cube_t sides[2] = {c, c}; // {interior, exterior}
+	sides[0].d[c.dim][!c.dir] = sides[1].d[c.dim][c.dir] = c.get_center_dim(c.dim);
+	
+	for (unsigned exterior = 0; exterior < 2; ++exterior) {
+		if (exterior && c.is_interior()) continue; // interior only; no exterior side to this door
+		int const tid((c.flags & RO_FLAG_WALKWAY) ? get_bldg_door_tid() : (c.is_house() ? get_int_door_tid() : get_off_door_tid()));
+		rgeom_mat_t &fb_mat(get_material(tid_nm_pair_t(tid, 0.0), 0, 0, 0, 0, exterior)); // unshadowed
+		fb_mat.add_cube_to_verts(c, c.color, all_zeros, get_face_mask(c.dim, (c.dir ^ bool(exterior) ^ 1)), !c.dim); // draw only front or back
+		rgeom_mat_t &side_mat(get_untextured_material(0, 0, 0, 0, exterior)); // unshadowed
+		side_mat.add_cube_to_verts_untextured(c, c.color, (get_skip_mask_for_xy(c.dim) | EF_Z1)); // skip front, back, and bottom faces
+	}
 }
 
 bool get_dishwasher_for_ksink(room_object_t const &c, cube_t &dishwasher) {
@@ -2990,8 +4080,10 @@ void building_room_geom_t::add_counter(room_object_t const &c, float tscale, boo
 		colorRGBA const sink_color(apply_light_color(c, GRAY));
 		rgeom_mat_t &basin_mat(get_metal_material(0));
 		basin_mat.add_cube_to_verts(sink, sink_color, tex_origin, EF_Z2, 0, 0, 0, 1); // basin: inverted, skip top face, unshadowed
+		float const water_level(c.item_flags ? 0.3 : 0.0); // may be 30% filled
+		if (water_level > 0.0) {add_water_plane(c, sink, water_level);} // draw water
 		// drain
-		cube_t drain(point(sink.xc(), sink.yc(), sink.z1()));
+		cube_t drain(cube_bot_center(sink));
 		drain.expand_by_xy(0.1*min(sink.dx(), sink.dy()));
 		drain.z2() += 0.012*sink.dz();
 		basin_mat.add_vcylin_to_verts(drain, apply_light_color(c, BKGRAY), 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 1); // top only
@@ -3087,8 +4179,8 @@ float get_cabinet_doors(room_object_t const &c, vect_cube_t &doors, vect_cube_t 
 	if (c.flags & RO_FLAG_ADJ_HI) {front.d[!c.dim][1] -= cab_depth;}
 	float const cab_width(front.get_sz_dim(!c.dim));
 	if (cab_width < 0.0) return 0.0; // this seems to happen on occasion; maybe it's a bug, or maybe the random size parameters can lead to bad values; either way, skip it
-	float door_width(0.75*door_height), door_spacing(1.2*door_width);
-	unsigned const num_doors(min((unsigned)floor(cab_width/door_spacing), 16U)); // cap to 16 as this is how many door open bits we have to work with
+	float door_width(0.8*door_height), door_spacing(1.2*door_width);
+	unsigned const num_doors(min((unsigned)round_fp(cab_width/door_spacing), 16U)); // cap to 16 as this is how many door open bits we have to work with
 	if (num_doors == 0) return 0.0; // is this possible?
 	door_spacing = cab_width/num_doors;
 	bool const add_drawers(c.type == TYPE_COUNTER && num_doors <= 8); // limit to 16 total doors + drawers; counter does not include the section with the sink
@@ -3243,22 +4335,26 @@ void building_room_geom_t::add_window(room_object_t const &c, float tscale) { //
 	//   - Can't use the stencil buffer because that's used (and cleared) by the main drawing code after drawing windows.
 	//   - Drawing windows last won't properly alpha blend with other windows, showers, water, etc., and the depth buffer may be wrong.
 	//   - Drawing windows in world space on the CPU (like blast effects) doesn't correctly handle occlusion by fragments of lower depth (such as interior walls).
-	unsigned const skip_faces(get_skip_mask_for_xy(!c.dim) | EF_Z12); // only enable faces in dim
 	cube_t window(c);
 	tid_nm_pair_t tex(get_bath_wind_tid(), 0.0); // fit texture to the window front/back faces
 	if (c.is_light_on()) {tex.emissive = 0.33;} // one third emissive
-	get_material(tex, 0).add_cube_to_verts(window, c.color, c.get_llc(), skip_faces); // no apply_light_color()
+	get_material(tex, 0, 0, 0, 0, 0).add_cube_to_verts(window, c.color, c.get_llc(), get_face_mask(c.dim, !c.dir)); // interior face, no apply_light_color()
+
+	if (c.flags & RO_FLAG_HAS_EXTRA) { // only draw exterior for buildings with exterior windows
+		get_material(tex, 0, 0, 0, 0, 1).add_cube_to_verts(window, c.color, c.get_llc(), get_face_mask(c.dim,  c.dir)); // exterior face, no apply_light_color()
+	}
 }
 
 colorRGBA const &get_outlet_or_switch_box_color(room_object_t const &c) {return (c.is_hanging() ? GRAY : c.color);} // should be silver metal
 
 void building_room_geom_t::add_switch(room_object_t const &c, bool draw_detail_pass) { // light switch, etc.
+	bool const in_attic(c.in_attic());
 	float const scaled_depth((c.is_hanging() ? 0.2 : 1.0)*c.get_length()); // non-recessed switch has smaller face plate depth
 	room_object_t plate(c);
 	plate.d[c.dim][!c.dir] -= (c.dir ? -1.0 : 1.0)*0.70*scaled_depth; // front face of plate
 
-	if (draw_detail_pass) { // draw face plate (static detail)
-		add_flat_textured_detail_wall_object(plate, get_outlet_or_switch_box_color(c), get_texture_by_name("interiors/light_switch.jpg"), 0); // draw_z1_face=0
+	if (draw_detail_pass) { // draw face plate (static detail); draw_z1_face=0, draw_all_faces=in_attic
+		add_flat_textured_detail_wall_object(plate, get_outlet_or_switch_box_color(c), get_texture_by_name("interiors/light_switch.jpg"), 0, in_attic);
 	}
 	else { // draw rocker (small object that can move/change state)
 		float const width(c.get_width());
@@ -3269,8 +4365,7 @@ void building_room_geom_t::add_switch(room_object_t const &c, bool draw_detail_p
 		rgeom_mat_t &mat(get_untextured_material(0, 0, 1)); // unshadowed, small
 		unsigned const qv_start(mat.quad_verts.size());
 		mat.add_cube_to_verts_untextured(rocker, c.color, (~get_face_mask(c.dim, c.dir) | EF_Z1)); // skip bottom face and face that's against the wall
-		vector3d rot_axis(zero_vector);
-		rot_axis[!c.dim] = ((c.dir ^ c.is_open()) ? 1.0 : -1.0);
+		vector3d const rot_axis(vector_from_dim_dir(!c.dim, (c.dir ^ c.is_open())));
 		rotate_verts(mat.quad_verts, rot_axis, 0.015*PI, plate.get_cube_center(), qv_start); // rotate rocker slightly about base plate center; could be optimized by caching
 	}
 }
@@ -3287,14 +4382,14 @@ void building_room_geom_t::add_breaker(room_object_t const &c) {
 	mat.add_cube_to_verts_untextured(plate, apply_light_color(c), skip_faces);
 	unsigned const qv_start(mat.quad_verts.size());
 	mat.add_cube_to_verts_untextured(rocker, apply_light_color(c, WHITE), skip_faces);
-	vector3d const rot_axis(0.0, 0.0, (c.is_open() ? 1.0 : -1.0));
+	vector3d const rot_axis(0.0, 0.0, (c.is_open() ? 1.0 : -1.0)); // Z
 	rotate_verts(mat.quad_verts, rot_axis, 0.12*PI, plate.get_cube_center(), qv_start); // rotate rocker slightly about base plate center
 }
 
-void building_room_geom_t::add_flat_textured_detail_wall_object(room_object_t const &c, colorRGBA const &side_color, int tid, bool draw_z1_face) { // uses mats_detail
+void building_room_geom_t::add_flat_textured_detail_wall_object(room_object_t const &c, colorRGBA const &side_color, int tid, bool draw_z1_face, bool draw_all_faces) {
 	rgeom_mat_t &front_mat(get_material(tid_nm_pair_t(tid, 0.0, 0), 0, 0, 2)); // small=2/detail
 	front_mat.add_cube_to_verts(c, c.color, zero_vector, get_face_mask(c.dim, !c.dir), !c.dim); // textured front face; always fully lit to match wall
-	unsigned const skip_faces(get_skip_mask_for_xy(c.dim) | (draw_z1_face ? EF_Z1 : 0)); // skip front/back and maybe bottom faces
+	unsigned const skip_faces(draw_all_faces ? 0 : (get_skip_mask_for_xy(c.dim) | (draw_z1_face ? EF_Z1 : 0))); // skip front/back and maybe bottom faces
 	get_untextured_material(0, 0, 2).add_cube_to_verts_untextured(c, side_color, skip_faces); // sides: unshadowed, small
 }
 void building_room_geom_t::add_outlet(room_object_t const &c) {
@@ -3330,34 +4425,81 @@ void building_room_geom_t::add_plate(room_object_t const &c) { // is_small=1
 	untex_mat.add_ortho_cylin_to_verts(c, color, cylin_dim, (vertical && top_dir), (vertical && !top_dir), 0, 0, (top_dir ? 0.8 : 1.0), (top_dir ? 1.0 : 0.8));
 }
 
+void building_room_geom_t::add_water_plane(room_object_t const &c, cube_t const &water_area, float water_level) {
+	cube_t water(water_area);
+	water.z2() = water_area.z1() + min(water_level, 1.0f)*water_area.dz();
+	get_untextured_material(0, 0, 0, 1).add_cube_to_verts_untextured(water, apply_light_color(c, colorRGBA(0.4, 0.6, 1.0, 0.5)), ~EF_Z2); // no shadows + transparent, top only
+}
+float get_tub_water_level(room_object_t const &c) {
+	return min(0.84f, 0.21f*c.item_flags);
+}
 void building_room_geom_t::add_tub_outer(room_object_t const &c) {
-	colorRGBA const color(apply_light_color(c));
-	get_untextured_material(1).add_cube_to_verts_untextured(c, color, EF_Z12); // shadowed, no top/bottom faces
+	unsigned skip_faces(EF_Z12);
+	if (c.flags & (RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI)) {skip_faces = get_face_mask(c.dim, c.dir);} // shower+tub combo, draw front face only
+	get_untextured_material(1).add_cube_to_verts_untextured(c, c.color, skip_faces); // shadowed, no top/bottom faces; no apply_light_color()
+	float const water_level(get_tub_water_level(c));
+	if (water_level <= 0.0) return; // no water
+	cube_t water_area(c);
+	water_area.expand_by_xy(-0.01*c.dz()); // small shrink
+	add_water_plane(c, water_area, water_level); // draw water
+}
+void building_room_geom_t::add_sink_water(room_object_t const &c) {
+	float water_level(c.item_flags ? 0.3 : 0.0); // may be 30% filled
+	if (water_level <= 0.0) return; // no water
+	water_level = (0.7 + 0.1*water_level); // adjust for top of sink
+	float const width(c.get_width()), signed_depth((c.dir ? -1.0 : 1.0)*c.get_depth());
+	cube_t water_area(c);
+	water_area.expand_in_dim(!c.dim, -0.1*width); // shrink sides
+	water_area.d[c.dim][ c.dir] += 0.12*signed_depth; // shrink front
+	water_area.d[c.dim][!c.dir] -= 0.30*signed_depth; // shrink back
+	cube_t wa1(water_area), wa2(water_area);
+	wa1.d[c.dim][c.dir] = wa2.d[c.dim][!c.dir] = water_area.d[c.dim][c.dir] + 0.1*signed_depth; // split into front and back halfs
+	wa2.expand_in_dim(!c.dim, -0.1*width); // shrink front more
+	add_water_plane(c, wa1, water_level); // back
+	add_water_plane(c, wa2, water_level); // front
 }
 
 void building_room_geom_t::add_crack(room_object_t const &c) { // in window? (TV and computer monitor cracks are drawn below)
-	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_crack_tid(c), 0.0, 0), 0, 0, 1)); // unshadowed, small
+	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_crack_tid(c), 0.0, 0, true), 0, 0, 1)); // unshadowed, small, transparent
 	mat.add_cube_to_verts(c, apply_light_color(c), all_zeros, get_face_mask(c.dim, c.dir), !c.dim, (c.obj_id&1), (c.obj_id&2)); // X/Y mirror based on obj_id
 }
 
-void building_room_geom_t::add_tv_picture(room_object_t const &c) {
-	if ((c.obj_id & 1) && !c.is_broken()) return; // TV is off half the time
+cube_t get_tv_screen(room_object_t const &c) {
 	cube_t screen(c);
 	screen.d[c.dim][c.dir] += (c.dir ? -1.0 : 1.0)*0.35*c.get_depth();
 	screen.expand_in_dim(!c.dim, -0.03*c.get_width()); // shrink the sides in
 	screen.z1() += 0.09*c.dz();
 	screen.z2() -= 0.04*c.dz();
-	unsigned skip_faces(get_face_mask(c.dim, c.dir)); // only the face oriented outward
+	return screen;
+}
+void add_tv_or_monitor_screen(room_object_t const &c, rgeom_mat_t &mat, std::string const &onscreen_text="", rgeom_mat_t *text_mat=nullptr) {
+	cube_t const screen(get_tv_screen(c));
+	bool const miry(!(c.dim ^ c.dir));
+	mat.add_cube_to_verts(screen, WHITE, c.get_llc(), get_face_mask(c.dim, c.dir), !c.dim, miry); // draw outward face
 
-	if (c.is_broken()) {
-		rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_crack_tid(c), 0.0)));
-		mat.add_cube_to_verts(screen, apply_light_color(c, WHITE), c.get_llc(), skip_faces, !c.dim, (c.obj_id&1), (c.obj_id&2)); // X/Y mirror based on obj_id
+	if (text_mat != nullptr && !onscreen_text.empty()) { // onscreen text is drawn the same as book titles
+		float const width(screen.get_sz_dim(!c.dim)), height(screen.dz());
+		cube_t text_area(screen);
+		text_area.translate_dim( c.dim, -0.01*(c.dir ? -1.0 : 1.0)*c.get_width()); // move outward slightly
+		text_area.expand_in_dim(!c.dim, -0.05*width);
+		text_area.d[!c.dim][!miry] -= (miry ? -1.0 : 1.0)*0.8*width; // left part of the screen
+		text_area.z1() += 0.05*height;
+		text_area.z2() -= 0.90*height; // shrink to a small strip at the bottom
+		building_room_geom_t::add_book_title(onscreen_text, text_area, *text_mat, WHITE, !c.dim, 2, c.dim, miry, 0, !c.dir); // {columns, lines, normal}
 	}
-	else {
-		tid_nm_pair_t tex(((c.shape == SHAPE_SHORT) ? c.get_comp_monitor_tid() : c.get_tv_tid()), 0.0); // computer monitor vs. TV
-		tex.emissive = 1.0;
-		get_material(tex).add_cube_to_verts(screen, WHITE, c.get_llc(), skip_faces, !c.dim, !(c.dim ^ c.dir));
+}
+void building_room_geom_t::add_tv_picture(room_object_t const &c) {
+	if (c.is_broken()) { // draw cracks for broken screen
+		unsigned skip_faces(get_face_mask(c.dim, c.dir)); // only the face oriented outward
+		rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_crack_tid(c), 0.0, 0, true))); // unshadowed, transparent
+		mat.add_cube_to_verts(get_tv_screen(c), apply_light_color(c, WHITE), c.get_llc(), skip_faces, !c.dim, (c.obj_id&1), (c.obj_id&2)); // X/Y mirror based on obj_id
+		return;
 	}
+	bool const is_off(c.obj_id & 1); // TV/monitor is off if obj_id LSB is set
+	if (is_off || c.is_active()) return; // skip if turned off or active security monitor (not drawn here)
+	tid_nm_pair_t tex(((c.shape == SHAPE_SHORT) ? c.get_comp_monitor_tid() : c.get_tv_tid()), 0.0); // computer monitor vs. TV
+	tex.emissive = 1.0;
+	add_tv_or_monitor_screen(c, get_material(tex));
 }
 
 void building_room_geom_t::add_potted_plant(room_object_t const &c, bool inc_pot, bool inc_plant) {
@@ -3374,7 +4516,7 @@ void building_room_geom_t::add_potted_plant(room_object_t const &c, bool inc_pot
 		
 		if (!no_dirt) { // draw dirt in the pot as a disk if not taken
 			rgeom_mat_t &dirt_mat(get_material(tid_nm_pair_t(get_texture_by_name("rock2.png")), 1)); // use dirt texture
-			dirt_mat.add_disk_to_verts(base_pos, 0.947*pot_radius, 0, apply_light_color(c, WHITE));
+			dirt_mat.add_vert_disk_to_verts(base_pos, 0.947*pot_radius, 0, apply_light_color(c, WHITE));
 		}
 	}
 	if (inc_plant && c.taken_level == 0) { // plant not taken
@@ -3394,27 +4536,42 @@ void building_room_geom_t::add_potted_plant(room_object_t const &c, bool inc_pot
 	}
 }
 
-int get_lg_ball_tid   (room_object_t const &c) {return get_texture_by_name((c.item_flags & 1) ? "interiors/basketball.png" : "interiors/soccer_ball_diffuse.png");}
-int get_lg_ball_nm_tid(room_object_t const &c) {return ((c.item_flags & 1) ? -1 : get_texture_by_name("interiors/soccer_ball_normal.png", 1));}
+int get_ball_tid   (room_object_t const &c) {return get_texture_by_name(c.get_ball_type().tex_fname  );}
+int get_ball_nm_tid(room_object_t const &c) {return get_texture_by_name(c.get_ball_type().nm_fname, 1);}
 
-xform_matrix get_player_cview_rot_matrix() {
-	float const angle(atan2(cview_dir.y, cview_dir.x)); // angle of camera view in XY plane, for rotating about Z
+xform_matrix get_player_cview_rot_matrix(bool invert) {
+	float const scale(invert ? -1.0 : 1.0);
+	float const angle(atan2(scale*cview_dir.y, scale*cview_dir.x)); // angle of camera view in XY plane, for rotating about Z
 	return get_rotation_matrix(plus_z, angle);
 }
 
+void apply_thin_plastic_effect(room_object_t const &c, tid_nm_pair_t &tex) {
+	tex.emissive = min(0.25f, 1.0f*c.light_amt); // make slightly emissive to fake light transmission
+}
+tid_nm_pair_t get_ball_tex_params(room_object_t const &c, bool shadowed) {
+	ball_type_t const &bt(c.get_ball_type());
+	tid_nm_pair_t tex(get_ball_tid(c), get_ball_nm_tid(c), 0.0, 0.0, 0.0, 0.0, shadowed);
+	tex.set_specular(bt.spec, bt.shine);
+	//if (c.item_flags == BALL_TYPE_BEACH) {apply_thin_plastic_effect(c, tex);} // doesn't look right in rooms with windows where light_amt > 0 when the lights are off
+	return tex;
+}
 void building_room_geom_t::add_lg_ball(room_object_t const &c) { // is_small=1
 	bool const dynamic(c.is_dynamic()); // either small or dynamic
-	rgeom_mat_t &mat(get_material(tid_nm_pair_t(get_lg_ball_tid(c), get_lg_ball_nm_tid(c), 0.0, 0.0), 1, dynamic, !dynamic));
-	// rotate the texture coords when the ball is rolling
-	mat.add_sphere_to_verts(c, apply_light_color(c), 0, zero_vector, (c.has_dstate() ? &get_dstate(c).rot_matrix : nullptr)); // low_detail=0
+	rgeom_mat_t &mat(get_material(get_ball_tex_params(c, 1), 1, dynamic, !dynamic)); // shadowed=1
+	float ts_off(0.0);
+	if (c.rotates()) {ts_off = fract(21111*c.x1() + 22222*c.y1());} // ball placed with random rotation
+	// rotate the texture coords using rot_matrix when the ball is rolling
+	mat.add_sphere_to_verts(c, apply_light_color(c), 0, zero_vector, tex_range_t(), (c.has_dstate() ? &get_dstate(c).rot_matrix : nullptr), ts_off, 0.0); // low_detail=0
 }
-/*static*/ void building_room_geom_t::draw_lg_ball_in_building(room_object_t const &c, shader_t &s) {
+/*static*/ void building_room_geom_t::draw_ball_in_building(room_object_t const &c, shader_t &s) {
 	//highres_timer_t timer("Draw Ball"); // 0.105ms
-	xform_matrix const rot_matrix(get_player_cview_rot_matrix());
-	// Note: since we're using indexed triangles now, we can't simply call draw_quad_verts_as_tris(); instead we create temp VBO/IBO; not the most efficient solution, but it should work
+	xform_matrix const rot_matrix(get_player_cview_rot_matrix(c.type == TYPE_POOL_BALL)); // invert for pool ball so that numbers are facing toward the player
+	tex_range_t tr;
+	if (c.type == TYPE_POOL_BALL) {tr = get_pool_ball_tex_range(c);}
+	// Note: since we're using indexed triangles, we can't simply call draw_quad_verts_as_tris(); instead we create temp VBO/IBO; not the most efficient solution, but should work
 	static rgeom_mat_t mat = rgeom_mat_t(tid_nm_pair_t()); // allocated memory is reused across frames; VBO/IBO are recreated every time
-	mat.tex = tid_nm_pair_t(get_lg_ball_tid(c), get_lg_ball_nm_tid(c), 0.0, 0.0);
-	mat.add_sphere_to_verts(c, apply_light_color(c), 0, zero_vector, &rot_matrix); // low_detail=0
+	mat.tex = get_ball_tex_params(c, 0); // shadowed=0
+	mat.add_sphere_to_verts(c, apply_light_color(c), 0, zero_vector, tr, &rot_matrix); // low_detail=0
 	tid_nm_pair_dstate_t state(s);
 	mat.upload_draw_and_clear(state);
 }
@@ -3448,9 +4605,7 @@ void building_room_geom_t::add_toy(room_object_t const &c) { // is_small=1
 	assert(c.taken_level <= 4);
 	unsigned const rings_to_draw(num_rings - c.taken_level); // remove rings from the top if they're taken by the player
 	unsigned colors_used(0);
-	rand_gen_t rgen;
-	rgen.set_state(c.obj_id, c.obj_id);
-	rgen.rand_mix();
+	rand_gen_t rgen(c.create_rgen());
 
 	for (unsigned n = 0; n < rings_to_draw; ++n) {
 		unsigned color_id(0);
@@ -3474,14 +4629,331 @@ void building_room_geom_t::add_pan(room_object_t const &c) { // is_small=1
 	// add handle
 	float const diameter(c.get_sz_dim(!c.dim)), handle_radius(0.08*diameter), edge_pos(c.d[!c.dim][c.dir]);
 	cube_t handle;
-	handle.d[!c.dim][!c.dir] = edge_pos;
-	handle.d[!c.dim][ c.dir] = edge_pos + (c.dir ? 1.0 : -1.0)*0.6*diameter;
+	handle.d[!c.dim][!c.dir] = edge_pos - (c.dir ? 1.0 : -1.0)*0.02*diameter; // inner edge - shift slightly
+	handle.d[!c.dim][ c.dir] = edge_pos + (c.dir ? 1.0 : -1.0)*0.60*diameter; // outer edge
 	set_wall_width(handle, c.get_center_dim(c.dim), handle_radius, c.dim);
 	set_cube_zvals(handle, (c.z2() - 2.0*handle_radius), c.z2());
 	unsigned const base_start(mat.itri_verts.size());
 	mat.add_ortho_cylin_to_verts(handle, color, !c.dim, 1, 1);
 	// squish in Z by 50% from z2
 	for (auto i = mat.itri_verts.begin()+base_start; i != mat.itri_verts.end(); ++i) {i->v.z = c.z2() - 0.5*(c.z2() - i->v.z);}
+}
+
+void building_room_geom_t::add_pool_float(room_object_t const &c) {
+	// make the float transparent and/or two sided lighting? same with beach balls;
+	// the problem is that it's drawn before water and doesn't blend, and is also drawn as part of static objects rather than small objects
+	bool const deflated(c.is_broken());
+	float const ri(0.5*c.dz()*(deflated ? 10.0 : 1.0)), ro(c.get_radius() - ri); // inner hole radius is (ro - ri)
+	float const alpha(1.0); // making transparent looks better, but doesn't blend well with other objects
+	assert(ro > 0.0);
+	tid_nm_pair_t tex(-1, 1.0, 1);
+	tex.set_specular(0.6, 80.0);
+	if (!deflated) {apply_thin_plastic_effect(c, tex);}
+	rgeom_mat_t &mat(get_material(tex, 1, 0, 1, (alpha < 1.0)));
+	unsigned const verts_start(mat.itri_verts.size());
+	mat.add_vert_torus_to_verts(c.get_cube_center(), ri, ro, colorRGBA(c.color, alpha), 1.0, 0); // shadowed, small
+	
+	for (auto v = mat.itri_verts.begin()+verts_start; v != mat.itri_verts.end(); ++v) {
+		if (deflated) {v->v.z = c.z1() + 0.1*(v->v.z - c.z1());} // flatten to 10% height
+		else {
+			float const nz(v->n[2]/127.0);
+			if (nz < 0.0) {v->n[2] = char(-127.0*nz);} // invert normal.z if needed to point up toward the light
+		}
+	}
+}
+
+void get_bench_cubes(room_object_t const &c, cube_t cubes[3]) { // seat, lo side, hi side
+	float const width(c.get_width());
+	cube_t top(c);
+	top.z1() += 0.8*c.dz();
+	cubes[0] = top;
+
+	for (unsigned d = 0; d < 2; ++d) { // add legs on each side
+		cube_t leg(c);
+		leg.z2() = top.z1();
+		leg.expand_in_dim(!c.dim, -0.1*c.get_depth()); // shrink depth
+		set_wall_width(leg, (c.d[!c.dim][d] + (d ? -1.0 : 1.0)*0.03*width), 0.02*width, !c.dim);
+		cubes[d+1] = leg;
+	}
+}
+void building_room_geom_t::add_bench(room_object_t const &c) {
+	rgeom_mat_t &mat(get_untextured_material(1, 0, 1)); // shadowed, small
+	cube_t cubes[3]; // seat, lo side, hi side
+	get_bench_cubes(c, cubes);
+	mat.add_cube_to_verts_untextured(cubes[0], apply_light_color(c)); // top
+	// add legs on each side; draw sides of legs, always light gray
+	for (unsigned d = 0; d < 2; ++d) {mat.add_cube_to_verts_untextured(cubes[d+1], apply_light_color(c, LT_GRAY), EF_Z12);}
+}
+
+void get_diving_board_cubes(room_object_t const &c, cube_t cubes[2]) { // board, base
+	float const length(c.get_length());
+	cube_t board(c), base(c);
+	board.z1() = base.z2() = c.z1() + 0.85*c.dz();
+	base.expand_in_dim(!c.dim, -0.1*c.get_width()); // shrink width
+	base.d[c.dim][ c.dir] -= (c.dir ? 1.0 : -1.0)*0.75*length; // shorten end
+	base.d[c.dim][!c.dir] += (c.dir ? 1.0 : -1.0)*0.05*length; // inset other end
+	cubes[0] = board; cubes[1] = base;
+}
+void building_room_geom_t::add_diving_board(room_object_t const &c) {
+	rgeom_mat_t &mat(get_untextured_material(1, 0, 1)); // shadowed, small
+	cube_t cubes[2]; // board, base
+	get_diving_board_cubes(c, cubes);
+	mat.add_cube_to_verts_untextured(cubes[0], apply_light_color(c)); // board
+	mat.add_cube_to_verts_untextured(cubes[1], apply_light_color(c, WHITE), EF_Z12); // base; draw sides of base, always white
+}
+
+void building_room_geom_t::add_flashlight(room_object_t const &c) {
+	colorRGBA const color(apply_light_color(c));
+	rgeom_mat_t &mat(get_metal_material(1, 0, 1)); // shadowed, small
+	cube_t bot(c), top(c);
+	unsigned const dim(get_max_dim(c.get_size())), d1((dim+1)%3), d2((dim+2)%3);
+	bot.d[dim][!c.dir] = top.d[dim][c.dir] = (c.d[dim][c.dir] + 0.25*c.get_sz_dim(dim)*(c.dir ? -1.0 : 1.0));
+	top.expand_in_dim(d1, -0.15*c.get_sz_dim(d1));
+	top.expand_in_dim(d2, -0.15*c.get_sz_dim(d2));
+	mat.add_ortho_cylin_to_verts(bot, color, dim, (dim != 2), 1); // draw sides, top, and bottom if horizontal
+	mat.add_ortho_cylin_to_verts(top, color, dim, c.dir, !c.dir); // draw sides and top
+}
+
+void building_room_geom_t::add_candle(room_object_t const &c) {
+	cube_t candle(c), wick(c);
+	candle.z2() = wick.z1() = c.z1() + 0.8*c.dz();
+	wick.expand_by_xy(-0.94*c.get_radius()); // very thin
+	cube_t tip(wick);
+	wick.z2() = tip.z1() = wick.z1() + 0.6*wick.dz();
+	tid_nm_pair_t tp; // untextured
+	if (c.is_lit()) {tp.emissive = 0.5;} // somewhat emissive to simulate subsurface scattering
+	get_material(tp, 1, 0, 1).add_vcylin_to_verts(candle, (c.is_lit() ? c.color : apply_light_color(c)), 0, 1); // draw sides and top
+	rgeom_mat_t &mat(get_untextured_material(1, 0, 1)); // shadowed, small
+	mat.add_vcylin_to_verts(wick, apply_light_color(c, WHITE), 0, 0, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 12); // draw sides only, ndiv=12
+	mat.add_vcylin_to_verts(tip,  apply_light_color(c, BLACK), 0, 1, 0, 0, 1.0, 1.0, 1.0, 1.0, 0, 12); // draw sides and top, ndiv=12
+}
+
+void get_security_camera_parts(room_object_t const &c, cube_t &mount, cube_t &body, cube_t &shaft) {
+	float const width(c.get_width()), height(c.get_height());
+	mount = body = c;
+	mount.d[c.dim][c.dir] = c.d[c.dim][!c.dir] + (c.dir ? 1.0 : -1.0)*width; // make it square and near the back
+	shaft = mount;
+	shaft.expand_by_xy(-0.3*width); // shrink
+	mount.z1() = shaft.z2() = c.z2() - 0.1*height;
+	shaft.z1() = body .z2() = c.z2() - 0.4*height;
+}
+void get_security_camera_info(room_object_t const &c, point &lens_pt, point &rot_pt, vector3d &camera_dir, vector3d &rot_axis, float &rot_angle) {
+	float const dir_scale(c.dir ? 1.0 : -1.0);
+	cube_t mount, body, shaft;
+	get_security_camera_parts(c, mount, body, shaft);
+	camera_dir[c.dim] = dir_scale;
+	lens_pt = body.get_cube_center();
+	lens_pt [ c.dim] = body.d[c.dim][c.dir] + 0.01*c.get_length()*dir_scale;
+	rot_axis[!c.dim] = 1.0;
+	rot_pt.assign(mount.xc(), mount.yc(), body.zc());
+	rot_angle = ((c.dim ^ c.dir) ? -1.0 : 1.0)*15*TO_RADIANS; // in radians
+}
+void building_room_geom_t::add_camera(room_object_t const &c) { // Note: camera does not cast shadows because it's too high up
+	rgeom_mat_t &mat(get_metal_material(0, 0, 1)); // unshadowed, small
+	colorRGBA const color(apply_light_color(c));
+	cube_t mount, body, shaft;
+	get_security_camera_parts(c, mount, body, shaft);
+	mat.add_vcylin_to_verts(shaft, color, 0, 0); // draw sides only
+	mat.add_cube_to_verts_untextured(mount, color, EF_Z2); // skip top surface against the ceiling
+	unsigned const qv_start(mat.quad_verts.size()), tv_start(mat.itri_verts.size());
+	mat.add_cube_to_verts_untextured(body,  color, 0    ); // draw all sides
+	// add the lens
+	point lens_pt, rot_pt;
+	vector3d camera_dir, rot_axis;
+	float rot_angle(0.0);
+	get_security_camera_info(c, lens_pt, rot_pt, camera_dir, rot_axis, rot_angle);
+	float const lens_radius(0.45*min(body.dz(), c.get_width()));
+	mat.add_disk_to_verts(lens_pt, lens_radius, camera_dir, BLACK);
+	// tilt downward
+	rotate_verts(mat.quad_verts, rot_axis, rot_angle, rot_pt, qv_start);
+	rotate_verts(mat.itri_verts, rot_axis, rot_angle, rot_pt, tv_start);
+	// add a red blinking light
+	point light_pt(lens_pt);
+	light_pt.z += 0.9*lens_radius; // shift up
+	light_pt[!c.dim] += ((c.dim ^ c.dir) ? 1.0 : -1.0)*1.0*lens_radius; // shift to the side
+	rgeom_mat_t &light_mat(get_material(tid_nm_pair_t(RED_TEX), 0, 0, 1)); // unshadowed, small
+	unsigned const tvl_start(light_mat.itri_verts.size());
+	light_mat.add_disk_to_verts(light_pt, 0.2*lens_radius, camera_dir, RED);
+	rotate_verts(light_mat.itri_verts, rot_axis, rot_angle, rot_pt, tvl_start);
+}
+
+void building_room_geom_t::add_food_box(room_object_t const &c) {
+	int const tid(c.get_food_box_tid());
+	rgeom_mat_t &mat(get_material(tid_nm_pair_t(tid, 0.0, 1), 1, 0, 1)); // shadows, small
+	colorRGBA const bkg_color(apply_light_color(c, texture_color(tid))); // use average texture color for the top and edges
+	unsigned const front_back_mask(~get_skip_mask_for_xy(c.dim));
+	mat.add_cube_to_verts(c, apply_light_color(c), zero_vector, front_back_mask, !c.dim, (c.dim ^ c.dir ^ 1), 0); // front face only
+	get_untextured_material(1, 0, 1).add_cube_to_verts_untextured(c, bkg_color, (~front_back_mask | EF_Z1)); // sides, shadows, small
+}
+
+void building_room_geom_t::add_safe(room_object_t const &c) {
+	add_obj_with_front_texture(c, "interiors/room_safe.jpg", c.color, 1);
+	// see add_mwave() for code to draw the open door
+}
+
+void building_room_geom_t::add_checkout(room_object_t const &c, float tscale) {
+	cube_t base(c), top(c);
+	base.z2() = top.z1() = c.z1() + 0.94*c.dz();
+	colorRGBA const color(apply_light_color(c));
+	// wood paneling sides
+	tid_nm_pair_t paneling(get_tex_auto_nm(PANELING_TEX, 4.0f*tscale));
+	paneling.set_specular(0.1, 50.0);
+	base.expand_by_xy(-0.025*c.get_width()); // recessed overhang
+	get_material(paneling, 1).add_cube_to_verts(base, color, tex_origin, EF_Z12, 0, 0, 0, 0, 1); // skip top and bottom faces; z_dim_uses_ty=1; with shadows
+	// shiny marble top
+	tid_nm_pair_t top_tex(get_counter_tid(), 2.5*tscale);
+	top_tex.set_specular(0.5, 80.0);
+	get_material(top_tex, 1).add_cube_to_verts(top, color, tex_origin, 0); // all faces drawn (Z1 for overhang); with shadows
+}
+
+void building_room_geom_t::add_fishtank(room_object_t const &c) { // unshadowed, except for bottom; can't be small
+	float const height(c.dz()), glass_thickness(0.02*height), trim_height(0.05*height), trim_thickness(0.04*height);
+	cube_t glass(c), bottom(c), top(c);
+	bottom.z2() = glass.z1() = c.z1() + trim_height;
+	glass .z2() = top  .z1() = c.z2() - trim_height;
+	// draw bottom and upper trim
+	colorRGBA const trim_color(apply_light_color(c, BKGRAY));
+	rgeom_mat_t &trim_mat(get_untextured_material(1));
+	trim_mat.add_cube_to_verts_untextured(bottom, trim_color, EF_Z1); // bottom, shadowed
+	cube_t trim_hole(top);
+	cube_t sides[4]; // {-y, +y, -x, +x}
+	trim_hole.expand_by_xy(-trim_thickness); // shrink
+	subtract_cube_xy(top, trim_hole, sides);
+	for (unsigned n = 0; n < 4; ++n) {trim_mat.add_cube_to_verts_untextured(sides[n], trim_color, 0);}
+
+	if (c.flags & RO_FLAG_ADJ_TOP) { // draw the lid and light; these extend above z2
+		cube_t lid(c);
+		lid.z1()  = top.z2();
+		lid.z2() += 0.75*trim_height;
+		lid.expand_by_xy(0.1*trim_thickness); // slight overhang
+		trim_mat.add_cube_to_verts_untextured(lid, trim_color, 0);
+		cube_t light(lid);
+		light.z1()  = lid.z2();
+		light.z2() += 0.075*height;
+		for (unsigned d = 0; d < 2; ++d) {light.expand_in_dim(d, -0.3*c.get_sz_dim(d));}
+		trim_mat.add_cube_to_verts_untextured(light, trim_color, EF_Z1); // skip bottom
+	}
+	// draw the sides
+	glass.expand_by_xy(-0.5*glass_thickness); // shrink slightly
+	cube_t hole(glass);
+	hole.expand_by_xy(-glass_thickness); // shrink
+	subtract_cube_xy(glass, hole, sides);
+	colorRGBA const glass_color(apply_light_color(c, table_glass_color));
+	rgeom_mat_t &trans_mat(get_untextured_material(0, 0, 0, 1)); // no shadows, transparent; for glass and water
+	unsigned const back_wall_ix(2*(!c.dim) + (!c.dir));
+	if (back_wall_ix > 0) {swap(sides[back_wall_ix], sides[0]);} // back wall should be first for improved back-to-front alpha blending
+	for (unsigned n = 0; n < 4; ++n) {trans_mat.add_cube_to_verts_untextured(sides[n], glass_color, EF_Z12);} // skip top and bottom
+	
+	if (!c.is_broken()) { // draw water
+		cube_t water(c);
+		water.z2() -= 0.1*height; // 90% filled
+		trans_mat.add_cube_to_verts_untextured(water, apply_light_color(c, colorRGBA(0.7, 0.85, 1.0, 0.15)), ~EF_Z2); // top surface
+	}
+	// draw gravel bottom; this won't be in the correct blend order and won't be visible when outside the building looking in through a window
+	cube_t gravel(glass);
+	gravel.z2() = glass.z1() + 0.05*height; // shallow
+	gravel.expand_by_xy(-0.1*glass_thickness); // shrink slightly to prevent Z-fighting
+	rgeom_mat_t &gravel_mat(get_material(tid_nm_pair_t(get_texture_by_name("gravel.jpg"), 3.0/height), 1));
+	gravel_mat.add_cube_to_verts(gravel, apply_light_color(c, WHITE), c.get_llc(), EF_Z1);
+}
+
+void building_room_geom_t::add_lava_lamp(room_object_t const &c) {
+	float const height(c.get_height());
+	// draw top and bottom
+	colorRGBA const color(apply_light_color(c));
+	rgeom_mat_t &metal_mat(get_metal_material(1, 0, 1)); // untextured, shadowed, small=1
+	cube_t base_bot(c), base_top(c), center(c), top(c);
+	base_bot.z2() = base_top.z1() = c.z1() + 0.21 *height;
+	base_top.z2() = center  .z1() = c.z1() + 0.42 *height;
+	center  .z2() = top     .z1() = c.z2() - 0.167*height;
+	metal_mat.add_vcylin_to_verts(base_bot, color, 0, 0, 0, 0, 1.0, 0.5); // draw sides
+	metal_mat.add_vcylin_to_verts(base_top, color, 0, 0, 0, 0, 0.5, 1.0); // draw sides
+	metal_mat.add_vcylin_to_verts(top,      color, 0, 1, 0, 0, 0.5, 0.3); // draw sides and top
+	// the lava interior part is drawn elsewhere since it's dynamic, but it doesn't cast a shadow, and it's not visible from outside the house through a window;
+	// so draw it here as an inverted truncated cone with a reversed winding order so that it's always behind the interior billboard quad with the magic shader;
+	// it must be drawn twice, first for the shadow map (since emissive materials don't cast shadows), then again with the emissive material for viewing outside the house
+	colorRGBA const lit_color(apply_light_color(c, colorRGBA(1.0, 0.99, 0.8)*(c.is_light_on() ? 1.0 : 0.5)));
+	// draw shadow casting inverted geometry
+	rgeom_mat_t &back_mat(get_untextured_material(1, 0, 1)); // shadowed, small
+	unsigned const ixs1_start(back_mat.indices.size());
+	back_mat.add_vcylin_to_verts(center, lit_color, 1, 1, 0, 0, 1.0, 0.5);
+	reverse(back_mat.indices.begin()+ixs1_start, back_mat.indices.end()); // reverse the winding order to swap which sides are drawn
+	// draw center part emissive inverted geometry; should be drawn over the previous cylinder
+	tid_nm_pair_t tp;
+	tp.emissive = 1.0; // always emissive, to match the shader
+	rgeom_mat_t &mat(get_material(tp, 0, 0, 1)); // unshadowed, small; emissive materials can't cast shadows
+	unsigned const vix_start(mat.itri_verts.size()), ixs2_start(mat.indices.size());
+	mat.add_vcylin_to_verts(center, lit_color, 1, 1, 0, 0, 1.0, 0.5); // draw sides, top, and bottom
+	reverse(mat.indices.begin()+ixs2_start, mat.indices.end()); // reverse the winding order to swap which sides are drawn
+	for (auto i = mat.itri_verts.begin()+vix_start; i != mat.itri_verts.end(); ++i) {i->set_norm(-plus_z);} // normals point down
+}
+
+void building_room_geom_t::add_trash(room_object_t const &c) {
+	// add a ball of wrinkled paper; could be based on obj_id
+	rgeom_mat_t &mat(get_untextured_material(1, 0, 1)); // shadowed, small
+	unsigned const verts_start(mat.itri_verts.size());
+	mat.add_sphere_to_verts(c, apply_light_color(c), 1); // initial sphere; low_detail=1
+	// add some random variation to each sphere vertex to crumple the paper;
+	// this would be better with face normals than vertex normals, but we don't support that here
+	point const center(c.get_cube_center());
+	float const radius(c.get_radius());
+	rand_gen_t rgen(c.create_rgen());
+
+	for (auto i = mat.itri_verts.begin()+verts_start; i != mat.itri_verts.end(); ++i) {
+		i->v += rgen.signed_rand_vector(0.2*radius); // should be good enough, and faster than signed_rand_vector_spherical()
+		i->set_norm((i->v - center).get_norm());
+	}
+}
+
+void building_room_geom_t::add_door_handle(door_t const &door) {
+	bool const dim(door.dim), dir(dim ^ door.open_dir ^ door.hinge_side ^ 1);
+	float const width(door.get_width()), height(door.dz()), thickness(door.get_thickness());
+	cube_t const bc(door.get_true_bcube());
+	cube_t base(bc);
+	base.z1() += 0.44*height;
+	base.z2() -= 0.45*height;
+	base.expand_in_dim(dim, 0.25*thickness);
+	float const handle_pos(door.get_center_dim(!dim) + (dir ? -1.0 : 1.0)*0.438*width);
+	set_wall_width(base, handle_pos, 0.032*width, !dim);
+	tid_nm_pair_t tex(-1, 1.0, 1); // untextured, shadowed
+	tex.set_specular_color(WHITE, 0.7, 60.0); // metal
+	rgeom_mat_t &mat(mats_doors.get_material(tex, 1)); // untextured, shadowed
+	unsigned const qv_start(mat.quad_verts.size());
+	mat.add_cube_to_verts_untextured(base, GRAY); // all faces
+
+	for (unsigned side = 0; side < 2; ++side) { // add handles to each side
+		// TODO: draw as two cubes to mats_doors
+	} // for side
+	if (door.open_amt > 0.0) { // rotate around door pivot point
+		float const signed_width(width*(dir ? 1.0 : -1.0)), shift(0.07*signed_width*door.open_amt);
+		unsigned max_angle(75); // in degrees
+		// TODO: pass max_angle in?
+		float const angle((max_angle + 90.0)*door.open_amt); // can be positive or negative
+		// similar to rotate_and_shift_door()
+		float const rot_angle(-float(angle)*TO_RADIANS*(door.hinge_side ? -1.0 : 1.0));
+		point pivot(bc.get_cube_center());
+		pivot[!dim] = bc.d[!dim][dir];
+
+		for (auto v = mat.quad_verts.begin()+qv_start; v != mat.quad_verts.end(); ++v) {
+			rotate_xy(v->v, pivot, rot_angle);
+			v->v[dim] += shift;
+			vector3d normal(v->get_norm());
+			rotate_xy(normal, pivot, rot_angle);
+			v->set_norm(normal); // normalize not needed
+		}
+	}
+}
+
+void building_room_geom_t::add_debug_shape(room_object_t const &c) {
+	rgeom_mat_t &mat(get_untextured_material(0, 0, 1)); // unshadowed, small
+
+	if (c.shape == SHAPE_CUBE) {
+		mat.add_cube_to_verts_untextured(c, c.color); // all faces
+		mat.add_cube_to_verts(c, c.color, all_zeros, 0, 0, 0, 0, 1); // all faces, inner
+	}
+	else if (c.shape == SHAPE_CYLIN ) {mat.add_vcylin_to_verts(c, c.color, 1, 1);} // draw top and bottom
+	else if (c.shape == SHAPE_SPHERE) {mat.add_sphere_to_verts(c, c.color, 1);} // low_detail=1
+	else {assert(0);} // unsupported shape
 }
 
 colorRGBA room_object_t::get_color() const {
@@ -3491,6 +4963,8 @@ colorRGBA room_object_t::get_color() const {
 	case TYPE_STAIR:    return (STAIRS_COLOR_TOP*0.5 + STAIRS_COLOR_BOT*0.5).modulate_with(texture_color(MARBLE_TEX));
 	case TYPE_STAIR_WALL: return texture_color(STUCCO_TEX);
 	case TYPE_PG_WALL:    return texture_color(STUCCO_TEX);
+	case TYPE_PG_PILLAR:  return texture_color(get_concrete_tid());
+	case TYPE_PG_BEAM:    return texture_color(get_concrete_tid());
 	case TYPE_PARK_SPACE: return LT_GRAY; // texture_color(...)?
 	case TYPE_ELEVATOR: return LT_BROWN; // ???
 	case TYPE_RUG:      return texture_color(get_rug_tid());
@@ -3518,19 +4992,30 @@ colorRGBA room_object_t::get_color() const {
 	case TYPE_MWAVE:    return GRAY;
 	case TYPE_SHOWER:   return colorRGBA(WHITE, 0.25); // partially transparent - does this actually work?
 	case TYPE_BLINDS:   return texture_color(get_blinds_tid()).modulate_with(color);
-	case TYPE_LG_BALL:  return texture_color(get_lg_ball_tid(*this));
+	case TYPE_LG_BALL:  return texture_color(get_ball_tid(*this));
 	case TYPE_HANGER_ROD:return get_textured_wood_color();
 	case TYPE_MONEY:    return texture_color(get_money_tid());
 	case TYPE_PHONE:    return color*0.5; // 50% case color, 50% black
 	case TYPE_LAPTOP:   return BKGRAY; // black-gray case, ignore logo colors
+	case TYPE_PIZZA_BOX:return texture_color(get_texture_by_name("interiors/pizzatop.jpg"));
 	case TYPE_TPROLL:   return (WHITE*0.75  + GRAY*0.25);
 	case TYPE_SPRAYCAN: return (DK_GRAY*0.5 + color*0.5);
 	case TYPE_CRACK:    return ALPHA0; // transparent
 	case TYPE_FPLACE:   return texture_color(BRICK2_TEX).modulate_with(color);
 	case TYPE_WHEATER:  return GRAY;
 	case TYPE_FURNACE:  return get_furnace_color();
+	case TYPE_SERVER:   return get_server_color ();
 	case TYPE_ATTIC_DOOR:return get_textured_wood_color();
 	case TYPE_DUCT:     return texture_color((shape == SHAPE_CYLIN) ? get_cylin_duct_tid() : get_cube_duct_tid()).modulate_with(color);
+	case TYPE_FCABINET: return texture_color(get_texture_by_name("interiors/filing_cabinet.png"));
+	case TYPE_FEXT_SIGN:return colorRGBA(1.0, 0.4, 0.4, 1.0); // close enough
+	case TYPE_FIRE_EXT: return RED;
+	case TYPE_PANTS:    return LT_BLUE; // close enough, don't need to use the texture color
+	case TYPE_POOL_TABLE: return (BROWN*0.75 + GREEN*0.25);
+	case TYPE_POOL_TILE: return texture_color(get_pool_tile_params(*this).get_tid());
+	case TYPE_FOOD_BOX:  return texture_color(get_food_box_tid());
+	case TYPE_FISHTANK:  return table_glass_color; // glass
+	//case TYPE_POOL_BALL: return ???; // texture_color(get_ball_tid(*this))? uses a texture atlas, so unclear what color to use here; use white by default
 	//case TYPE_CHIMNEY:  return texture_color(get_material().side_tex); // should modulate with texture color, but we don't have it here
 	default: return color; // TYPE_LIGHT, TYPE_TCAN, TYPE_BOOK, TYPE_BOTTLE, TYPE_PEN_PENCIL, etc.
 	}

@@ -38,11 +38,9 @@ extern float grass_length, water_plane_z, tree_scale, far_clip_ratio;
 
 class lightning_strike_t {
 
-	int time;
+	int time=0;
 	line3d path;
-
 public:
-	lightning_strike_t() : time(0) {}
 	bool enabled() const {return (time > 0);}
 	void clear() {path.points.clear(); time = 0;}
 	point get_pos() const;
@@ -54,13 +52,11 @@ public:
 
 
 struct ix_sz_pair {
-	unsigned short ix, sz;
-	ix_sz_pair() : ix(0), sz(0) {}
+	unsigned short ix=0, sz=0;
 };
 
 class crack_ibuf_t {
 	vector<ix_sz_pair> offsets;
-
 public:
 	void gen_offsets(vector<unsigned> &indices, unsigned size);
 	unsigned get_index(unsigned dim, unsigned dir, unsigned cur_lod, unsigned adj_lod) const;
@@ -72,12 +68,12 @@ class tile_t;
 
 struct tile_smap_data_t : public smap_data_t {
 
-	int dxoff, dyoff;
+	int dxoff=0, dyoff=0;
 	unsigned lod_level;
 	tile_t *tile;
 
 	tile_smap_data_t(unsigned tu_id_, unsigned smap_sz_, unsigned lod_level_, tile_t *tile_, smap_data_state_t const &init_state=smap_data_state_t())
-		: smap_data_t(tu_id_, smap_sz_, init_state), dxoff(0), dyoff(0), lod_level(lod_level_), tile(tile_) {}
+		: smap_data_t(tu_id_, smap_sz_, init_state), lod_level(lod_level_), tile(tile_) {}
 	virtual void render_scene_shadow_pass(point const &lpos);
 	virtual bool needs_update(point const &lpos);
 };
@@ -119,11 +115,10 @@ tile_t *get_tile_from_xy(tile_xy_pair const &tp);
 
 struct tile_cloud_t : public volume_part_cloud {
 
-	float pos_hash;
+	float pos_hash=0.0;
 	point pos;
 	vector3d size; // {x, y, z}
 
-	tile_cloud_t(void) : pos_hash(0.0), pos(all_zeros), size(zero_vector) {}
 	float get_rmax() const {return size.get_max_val();}
 	cube_t get_bcube() const {cube_t bcube(pos, pos); bcube.expand_by(size); return bcube;}
 	void draw(vpc_shader_t &s, vector3d const &xlate, float alpha_mult=1.0) const;
@@ -140,9 +135,9 @@ typedef vector<cloud_inst_t> cloud_draw_list_t;
 
 class tile_cloud_manager_t : public vector<tile_cloud_t> {
 
-	bool generated;
-	unsigned num_clouds;
-	float cur_move_dist;
+	bool generated=0;
+	unsigned num_clouds=0;
+	float cur_move_dist=0.0;
 	cube_t bcube, range;
 	rand_gen_t rgen;
 
@@ -150,7 +145,6 @@ class tile_cloud_manager_t : public vector<tile_cloud_t> {
 	void populate_clouds();
 	void choose_num_clouds();
 public:
-	tile_cloud_manager_t() : generated(0), num_clouds(0), cur_move_dist(0.0) {}
 	void gen_new_cloud();
 	void gen(int x1, int y1, int x2, int y2);
 	void move_by_wind(tile_t const &tile);
@@ -160,20 +154,19 @@ public:
 
 
 class tile_t {
-
 public:
 	struct tree_map_val {
 		unsigned char ao, sh;
 		tree_map_val() : ao(255), sh(255) {}
 	};
-
+	mutable bool vis_ref_call=0; // cached visited flag for tile_draw_t::can_have_reflection_recur()
 private:
-	int x1, y1, x2, y2, wx1, wy1, wx2, wy2, last_occluded_frame;
-	unsigned weight_tid, height_tid, normal_tid, shadow_tid;
-	unsigned size, stride, zvsize, base_tsize, gen_tsize, smap_lod_level;
-	float radius, mzmin, mzmax, mesh_dz, ptzmax, dtzmax, trmax, xstart, ystart, min_normal_z, deltax, deltay;
-	bool sun_shadows_invalid, moon_shadows_invalid, recalc_tree_grass_weights, mesh_height_invalid, in_queue, last_occluded, has_any_grass;
-	bool is_distant, no_trees, just_cleared, has_tunnel;
+	int x1=0, y1=0, x2=0, y2=0, wx1=0, wy1=0, wx2=0, wy2=0, last_occluded_frame=0, inside_city=0; // inside_city: 0=no, 1=partial, 2=fully
+	unsigned weight_tid=0, height_tid=0, normal_tid=0, shadow_tid=0;
+	unsigned size=0, stride=0, zvsize=0, base_tsize=0, gen_tsize=0, smap_lod_level=0;
+	float radius=0, mzmin=0, mzmax=0, mesh_dz=0, ptzmax=0, dtzmax=0, trmax=0, xstart=0, ystart=0, min_normal_z=0, deltax=0, deltay=0;
+	bool sun_shadows_invalid=1, moon_shadows_invalid=1, recalc_tree_grass_weights=1, mesh_height_invalid=0, in_queue=0, last_occluded=0, has_any_grass=0;
+	bool is_distant=0, no_trees=0, just_cleared=0, has_tunnel=0;
 	colorRGB avg_mesh_tex_color;
 	tile_offset_t mesh_off, ptree_off, dtree_off, scenery_off;
 	float sub_zmin[4][4] = {0}, sub_zmax[4][4] = {0};
@@ -222,6 +215,7 @@ public:
 	float get_zval(int x, int y) const {assert(!zvals.empty()); assert(x >= 0 && y >= 0 && x < (int)zvsize && y < (int)zvsize); return zvals[y*zvsize + x];}
 	bool has_water() const {return (mzmin < water_plane_z);}
 	bool all_water() const {return (mzmax < water_plane_z);} // get_tile_zmax()? - grass and trees should not be underwater
+	bool is_inside_city() const {return inside_city;}
 	bool can_have_trees() const {return (!no_trees && !is_distant && !all_water());}
 	bool can_have_pine_palm_trees() const;
 	bool can_have_decid_trees    () const;
@@ -275,7 +269,7 @@ public:
 	void fill_adj_mask(bool mask[3][3], int x, int y) const;
 	float get_min_dist_to_pt(point const &pt, bool xy_only=0, bool mesh_only=1) const;
 	float get_max_xy_dist_to_pt(point const &pt) const;
-	bool contains_point(point const &pos) const {return get_bcube().contains_pt_xy(pos);}
+	bool contains_point(point const &pos) const {return get_bcube().contains_pt_xy(pos);} // XY only
 	bool contains_camera() const {return contains_point(get_camera_pos());}
 	unsigned get_gpu_mem() const;
 	unsigned get_smap_mem() const;
@@ -325,6 +319,7 @@ public:
 	void check_shadow_map_and_normal_texture(bool no_push=0);
 	void upload_normal_texture(bool tid_is_valid);
 	void upload_shadow_map_texture(bool tid_is_valid);
+	void draw_smap_debug_vis(shader_t &s) const;
 	void setup_shadow_maps(tile_shadow_map_manager &smap_manager, bool cleanup_only);
 	bool shadow_maps_allocated() const;
 	bool using_shadow_maps() const {return !smap_data.empty();}
@@ -407,17 +402,18 @@ public:
 
 	// *** rendering ***
 	void pre_draw(mesh_xy_grid_cache_t &height_gen);
-	void shader_shadow_map_setup(shader_t &s, xform_matrix const *const mvm=nullptr) const;
+	void shader_shadow_map_setup(shader_t &s) const;
 	void bind_and_setup_shadow_map(shader_t &s) const;
-	bool try_bind_shadow_map(shader_t &s, bool check_only) const;
+	bool try_bind_shadow_map(shader_t &s, bool check_only, unsigned *lod_level) const;
 	void bind_textures() const;
 	void draw_mesh_vbo(indexed_vbo_manager_t const &vbo_mgr, unsigned const ivbo_ixs[NUM_LODS+1], unsigned lod_level) const;
 	void draw(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned const ivbo_ixs[NUM_LODS+1], crack_ibuf_t const &crack_ibuf, int reflection_pass, int shader_locs[2]) const;
-	void draw_shadow_pass(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned const ivbo_ixs[NUM_LODS+1]);
+	void draw_shadow_pass(shader_t &s, indexed_vbo_manager_t const &vbo_mgr, unsigned const ivbo_ixs[NUM_LODS+1], int xlate_loc);
 	void draw_water_cap(shader_t &s, bool textures_already_set) const;
 	void draw_water(shader_t &s, float z) const;
 	bool is_water_visible() const;
 	bool check_sphere_collision(point &pos, float sradius, bool inc_dtrees=1, bool inc_ptrees=1, bool inc_scenery=1) const;
+	bool check_cube_int_trees(cube_t const &c) const;
 	int get_tid_under_point(point const &pos) const;
 	bool line_intersect_mesh(point const &v1, point const &v2, float &t, int &xpos, int &ypos, float inc_trees) const;
 }; // tile_t
@@ -426,14 +422,13 @@ public:
 class tile_draw_t : public indexed_vbo_manager_t {
 
 	typedef unordered_map<tile_xy_pair, unique_ptr<tile_t>, hash_tile_xy_pair> tile_map;
-	typedef unordered_set<tile_xy_pair, hash_tile_xy_pair> tile_set_t;
 	typedef vector<pair<float, tile_t *> > draw_vect_t;
 
 	tile_map tiles;
-	bool buildings_valid;
+	bool buildings_valid=0;
 	unsigned ivbo_ixs[NUM_LODS+1] = {0};
-	unsigned tiles_gen_prev_frame;
-	float terrain_zmin;
+	unsigned tiles_gen_prev_frame=0;
+	float terrain_zmin=0.0;
 	draw_vect_t to_draw, to_gen_zvals;
 	vector<tile_t *> occluded_tiles, to_draw_trunk_pts;
 	cloud_draw_list_t to_draw_clouds;
@@ -443,6 +438,8 @@ class tile_draw_t : public indexed_vbo_manager_t {
 	crack_ibuf_t crack_ibuf;
 	tile_shadow_map_manager smap_manager;
 	vector<pair<float, tile_xy_pair>> shadow_recomp_queue;
+	vect_cube_t occluder_cubes;
+	vector<vector<vector2d> > grass_insts[NUM_GRASS_LODS];
 
 	struct occluder_pts_t {
 		point cube_pts[4];
@@ -468,12 +465,14 @@ private:
 	static void shared_shader_lighting_setup(shader_t &s, unsigned lighting_shader);
 	static void lighting_with_cloud_shadows_setup(shader_t &s, unsigned lighting_shader, bool cloud_shadows);
 	void setup_mesh_draw_shaders(shader_t &s, bool reflection_pass, bool enable_shadow_map) const;
-	bool can_have_reflection_recur(tile_t const *const tile, point const corners[3], tile_set_t &tile_set, unsigned dim_ix);
-	bool can_have_reflection(tile_t const *const tile, tile_set_t &tile_set);
+	bool can_have_reflection_recur(tile_t const *const tile, point const corners[3], unsigned dim_ix);
+	bool can_have_reflection(tile_t const *const tile);
 public:
+	uint64_t show_debug_stats(bool calc_mem_only) const;
 	void pre_draw();
 	void draw(int reflection_pass);
 	void draw_shadow_pass(point const &lpos, tile_t *tile, bool decid_trees_only=0);
+	void draw_smap_debug_vis() const;
 	void draw_decid_tree_shadows() {draw_shadow_pass(camera_pdu.pos, nullptr, 1);}
 	void draw_water(shader_t &s, float zval) const;
 	static void billboard_tree_shader_setup(shader_t &s);
@@ -481,7 +480,6 @@ public:
 private:
 	void draw_tiles(int reflection_pass, bool enable_shadow_map) const;
 	void draw_tiles_shadow_pass(point const &lpos, tile_t const *const tile);
-	bool find_and_bind_any_valid_shadow_map(shader_t &s) const;
 	static void set_noise_tex(shader_t &s, unsigned tu_id);
 	static void set_tree_dither_noise_tex(shader_t &s, unsigned tu_id);
 	static void set_pine_tree_shader(shader_t &s, string const &vs, bool use_texgen=1);
@@ -503,9 +501,10 @@ public:
 	bool remove_tile(tile_xy_pair const &tp) {return (tiles.erase(tp) > 0);} // okay if tile doesn't exist; unused
 	tile_t *get_tile_from_xy(tile_xy_pair const &tp) const;
 	tile_t *get_tile_containing_point(point const &pos) const;
-	void invalidate_tile_smap_at_pt(point const &pos, float radius);
-	bool try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only) const;
+	void invalidate_tile_smap_in_region(cube_t region);
+	bool try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only, unsigned *lod_level) const;
 	bool check_sphere_collision(point &pos, float radius) const;
+	bool check_cube_int_trees(cube_t const &c) const;
 	bool check_player_collision() const;
 	int get_tid_under_point(point const &pos) const;
 	bool line_intersect_mesh(point const &v1, point const &v2, float &t, tile_t *&intersected_tile, int &xpos, int &ypos, float inc_trees) const;

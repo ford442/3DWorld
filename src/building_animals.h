@@ -9,15 +9,16 @@
 struct building_animal_t {
 	point pos, last_pos;
 	vector3d dir;
-	float radius, speed, anim_time, wake_time, dist_since_sleep;
-	unsigned id;
+	float radius=0.0, speed=0.0, anim_time=0.0, wake_time=0.0, dist_since_sleep=0.0;
+	unsigned id=0;
+	bool shadow_non_visible=0;
 
-	building_animal_t(float xval) : pos(xval, 0.0, 0.0), radius(0), speed(0), anim_time(0), wake_time(0), dist_since_sleep(0), id(0) {}
-	building_animal_t(point const &pos_, float radius_, vector3d const &dir_, unsigned id_) :
-		pos(pos_), dir(dir_), radius(radius_), speed(0.0), anim_time(0.0), wake_time(0), dist_since_sleep(0), id(id_) {}
+	building_animal_t(float xval) : pos(xval, 0.0, 0.0) {}
+	building_animal_t(point const &pos_, float radius_, vector3d const &dir_, unsigned id_) : pos(pos_), dir(dir_), radius(radius_), id(id_) {}
 	bool operator<(building_animal_t const &a) const {return (pos.x < a.pos.x);} // compare only xvals
 	bool is_moving  () const {return (speed     > 0.0);}
 	bool is_sleeping() const {return (wake_time > 0.0);}
+	vector3d get_upv() const {return plus_z;}
 	void sleep_for(float time_secs_min, float time_secs_max);
 	float move(float timestep, bool can_move_forward=1);
 	bool detailed_sphere_coll(point const &sc, float sr, point &coll_pos, float &coll_radius) const {return 1;} // defaults to true
@@ -32,7 +33,8 @@ struct rat_t : public building_animal_t {
 	rat_t(float xval) : building_animal_t(xval) {}
 	rat_t(point const &pos_, float radius_, vector3d const &dir_, unsigned id_, bool dead_=0);
 	bool operator<(rat_t const &r) const {return (pos.x < r.pos.x);} // compare only xvals
-	static bool allow_in_attic() {return 1;}
+	static bool allow_in_attic () {return 1;}
+	static bool not_by_ext_door() {return 0;}
 	float get_hlength() const {return radius;} // this is the bounding radius, so it represents the longest dim (half length)
 	float get_height () const {return height;}
 	float get_xy_radius() const {return radius;}
@@ -46,15 +48,17 @@ struct spider_t : public building_animal_t {
 	vector3d upv;
 	point last_valid_pos;
 	float update_time=0.0, web_start_zval=0.0, jump_vel_z=0.0, jump_dist=0.0;
-	bool on_web=0, squished=0;
+	bool on_web=0, web_dir=0, squished=0; // web_dir: 0=going down, 1=going up
 	// this first constructor is for the lower_bound() call in vect_rat_t::get_first_rat_with_x2_gt()
 	spider_t(float xval) : building_animal_t(xval) {}
 	spider_t(point const &pos_, float radius_, vector3d const &dir_, unsigned id_);
-	static bool allow_in_attic() {return 1;}
+	static bool allow_in_attic () {return 1;}
+	static bool not_by_ext_door() {return 1;}
 	float get_xy_radius() const {return 2.0*radius;}
 	float get_height   () const {return 2.0*radius;}
 	vector3d get_size  () const;
 	cube_t get_bcube   () const; // used for collision detection and VFC
+	vector3d get_upv   () const {return upv;}
 	void choose_new_dir(rand_gen_t &rgen);
 	// jumping logic
 	void jump(float vel);
@@ -73,7 +77,8 @@ struct snake_t : public building_animal_t {
 
 	snake_t(float xval) : building_animal_t(xval) {}
 	snake_t(point const &pos_, float radius_, vector3d const &dir_, unsigned id_);
-	static bool allow_in_attic() {return 0;}
+	static bool allow_in_attic () {return 0;}
+	static bool not_by_ext_door() {return 1;}
 	void  calc_xy_radius();
 	float get_xy_radius () const {return xy_radius;} // must be fast
 	float get_height    () const {return radius;}
@@ -89,20 +94,27 @@ struct snake_t : public building_animal_t {
 	float get_curve_factor() const;
 };
 
-enum {INSECT_TYPE_FLY=0, NUM_INSECT_TYPES};
+enum {INSECT_TYPE_FLY=0, INSECT_TYPE_ROACH, INSECT_TYPE_CENTIPEDE, NUM_INSECT_TYPES};
 
 struct insect_t : public building_animal_t {
 	vector3d delta_dir;
-	unsigned char type;
-	float accel=0.0;
-	bool has_target=0, target_player=0;
+	float accel=0.0; // for flies
+	float dist_to_sleep=0.0; // for roaches
+	unsigned char type=0, stuck_counter=0;
+	bool has_target=0, target_player=0; // for flies
+	bool is_scared=0, no_scare=0, squished=0; // for roaches
 
 	insect_t(point const &pos_, float radius_, vector3d const &dir_, unsigned id_, unsigned char type_=INSECT_TYPE_FLY) :
 		building_animal_t(pos_, radius_, dir_, id_), type(type_) {}
-	static bool allow_in_attic() {return 0;} // could allow it?
+	static bool allow_in_attic () {return 0;} // could allow it for flies but not cockroaches?
+	static bool not_by_ext_door() {return 0;}
+	bool flies() const {return (type == INSECT_TYPE_FLY);}
 	float get_xy_radius() const {return radius;}
-	float get_height   () const {return 2.0*radius;}
-	cube_t get_bcube   () const;
+	float get_height   () const;
+	float get_z2       () const {return (pos.z + 0.5*get_height());}
+	vector3d get_orient() const {return vector3d(dir.x, dir.y, 0.0).get_norm();} // XY plane for all insects
+	cube_t get_bcube () const; // used for collision detection and VFC; bounding cube across rotations
+	cube_t get_bcube_with_dir() const; // used for model drawing; must be correct aspect ratio
 };
 
 template<typename T> struct vect_animal_t : public vector<T> {

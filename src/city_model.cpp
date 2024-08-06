@@ -9,9 +9,35 @@ extern city_params_t city_params;
 bool read_assimp_model(string const &filename, model3d &model, geom_xform_t const &xf, string const &anim_name, int recalc_normals, bool verbose);
 
 
+bool read_keyword(FILE *fp, string &str) {
+	str.clear();
+	
+	while (1) {
+		int c(getc(fp));
+		if (is_EOF(c) || c == '\n') break;
+
+		if (isspace(c)) {
+			if (str.empty()) continue; // leading whitespace
+			break; // end of string
+		}
+		if (c == '=') {
+			if (str.empty()) {
+				cerr << "Error: Found stray '=' with no keyword in config file" << endl;
+				return 0;
+			}
+			return 1; // done/success
+		}
+		if (c == '#' || (!isalpha(c) && c != '_')) {ungetc(c, fp); break;} // end of string
+		str.push_back(c);
+	} // end while
+	if (str.empty()) return 1;
+	cerr << "Error: Found keyword string in config file with missing '=': " << str << endl;
+	return 0;
+}
+
 bool city_model_t::read(FILE *fp, bool is_helicopter, bool is_person) {
 
-	// filename recalc_normals two_sided centered body_material_id fixed_color_id xy_rot swap_xy scale lod_mult <blade_mat_id for helicopter> [shadow_mat_ids]
+	// filename recalc_normals two_sided centered body_material_id fixed_color_id xy_rot swap_xy scale lod_mult <blade_mat_id for helicopter> [keywords] [shadow_mat_ids]
 	assert(fp);
 	unsigned swap_xyz(0), shadow_mat_id(0);
 	fn = read_quoted_string(fp);
@@ -26,12 +52,29 @@ bool city_model_t::read(FILE *fp, bool is_helicopter, bool is_person) {
 	if (!read_uint(fp, swap_xyz))        return 0; // {swap none, swap Y with Z, swap X with Z}
 	if (!read_float(fp, scale))          return 0;
 	if (!read_float(fp, lod_mult) || lod_mult < 0.0)  return 0;
-	if (is_helicopter && !read_int(fp, blade_mat_id)) return 0; // helicopter model is special because it has a blade material
-
+	
+	if (is_helicopter) { // helicopter model is special because it has a blade_mat_id
+		if (!read_int(fp, blade_mat_id)) return 0;
+	}
 	if (is_person) { // read animation data, etc.
 		if (!read_float(fp, anim_speed)) return 0;
 		if (!read_bool (fp, is_zombie))  return 0;
 	}
+	// read any keywords; must be before reading shadow_mat_ids, before the newline is encountered
+	string keyword;
+
+	while (1) {
+		if (!read_keyword(fp, keyword)) return 0;
+		if (keyword.empty()) break;
+
+		if (keyword == "reverse_winding") {
+			if (!read_uint64(fp, rev_winding_mask)) return 0;
+		}
+		else {
+			cerr << "Error: Unrecognized keyword " << keyword << " in config file" << endl;
+			return 0;
+		}
+	} // end while
 	shadow_mat_ids.clear();
 	while (read_uint(fp, shadow_mat_id)) {shadow_mat_ids.push_back(shadow_mat_id);}
 	swap_xz = bool(swap_xyz & 2);
@@ -97,11 +140,14 @@ void city_model_loader_t::load_model_id(unsigned id) {
 		if (can_skip_model(id) || model.fn.empty()) continue;
 		int const def_tid(-1); // should this be a model parameter?
 		colorRGBA const def_color(WHITE); // should this be a model parameter?
-		model.tried_to_load = 1; // flag, even if load fails
-		model.model3d_id    = size(); // set before adding the model
-		bool const verbose = 1;
+		model.tried_to_load   = 1; // flag, even if load fails
+		model.model3d_id      = size(); // set before adding the model
+		bool const verbose    = 1;
+		float const lod_scale = 1.0; // or use model.lod_mult directly and not use it during drawing?
 
-		if (!load_model_file(model.fn, *this, geom_xform_t(), model.default_anim_name, def_tid, def_color, 0, 0.0, model.recalc_normals, 0, city_params.convert_model_files, verbose)) {
+		if (!load_model_file(model.fn, *this, geom_xform_t(), model.default_anim_name, def_tid, def_color, 0, 0.0,
+			lod_scale, model.recalc_normals, 0, city_params.convert_model_files, verbose, model.rev_winding_mask))
+		{
 			cerr << "Error: Failed to read model file '" << model.fn << "'; Skipping this model";
 			if (has_low_poly_model()) {cerr << " (will use default low poly model)";}
 			cerr << "." << endl;
@@ -138,34 +184,77 @@ bool object_model_loader_t::can_skip_model(unsigned id) const {
 	else if (dir.x < 0.0) {fgRotate(180.0, 0.0, 0.0, 1.0);}
 }
 
+void enable_animations_for_shader(shader_t &s) {
+	if (city_params.use_animated_people && city_params.any_model_has_animations) {s.set_prefix("#define USE_BONE_ANIMATIONS", 0);} // VS
+	s.add_property("animation_shader", "pedestrian_animation.part+"); // this shader part now contains model bone animations as well
+}
+void set_anim_id(shader_t &s, bool enable_animations, int animation_id, unsigned model_anim_id, unsigned model_anim_id2, bool has_bone_animations) {
+	if (!enable_animations) return;
+
+	if (city_params.use_animated_people && has_bone_animations && animation_id == ANIM_ID_WALK) { // select bone animation rather than walking
+		animation_id = ANIM_ID_SKELETAL; // used in the shader to select skeletal animation
+		assert(model_anim_id < NUM_MODEL_ANIMS);
+		s.add_property("animation_name", animation_names[model_anim_id]);
+
+		if (model_anim_id2 != model_anim_id) { // blended animation
+			assert(model_anim_id2 < NUM_MODEL_ANIMS);
+			s.add_property("animation_name2", animation_names[model_anim_id2]);
+		}
+	}
+	s.add_uniform_int("animation_id", animation_id);
+}
+
+// walking animations used by people use animation blending and shader animation_name properties; other animations use the stored model_anim_id
+int animation_state_t::get_anim_id_for_setup_bone_transforms () const {return ((anim_id == ANIM_ID_WALK) ? -1 : model_anim_id );}
+int animation_state_t::get_anim_id2_for_setup_bone_transforms() const {return ((anim_id == ANIM_ID_WALK) ? -1 : model_anim_id2);}
+
+void animation_state_t::set_animation_id_and_time(shader_t &s, bool has_bone_animations, float anim_speed) const {
+	set_anim_id(s, enabled, anim_id, model_anim_id, model_anim_id2, has_bone_animations);
+	if (enabled && !(city_params.use_animated_people && has_bone_animations)) {s.add_uniform_float("animation_time", anim_speed*anim_time);} // only for custom animations
+}
+void animation_state_t::clear_animation_id(shader_t &s) const {set_anim_id(s, enabled, ANIM_ID_NONE, 0, 0, 0);} // has_bone_animations not needed here
+
+bool city_model_loader_t::check_anim_wrapped(unsigned model_id, unsigned model_anim_id, float old_time, float new_time) {
+	bool const is_valid(is_model_valid(model_id));
+	assert(is_valid); // caller should have checked this previously
+	return get_model3d(model_id).check_anim_wrapped(model_anim_id, old_time, new_time);
+}
+float city_model_loader_t::get_anim_duration(unsigned model_id, unsigned model_anim_id) { // in seconds
+	bool const is_valid(is_model_valid(model_id));
+	assert(is_valid); // caller should have checked this previously
+	return get_model3d(model_id).get_anim_duration(model_anim_id);
+}
+
 void city_model_loader_t::draw_model(shader_t &s, vector3d const &pos, cube_t const &obj_bcube, vector3d const &dir, colorRGBA const &color,
 	vector3d const &xlate, unsigned model_id, bool is_shadow_pass, bool low_detail, animation_state_t *anim_state, unsigned skip_mat_mask,
-	bool untextured, bool force_high_detail, bool upside_down, bool emissive)
+	bool untextured, bool force_high_detail, bool upside_down, bool emissive, bool do_local_rotate)
 {
 	assert(!(low_detail && force_high_detail));
-	bool const is_valid(is_model_valid(model_id));
+	bool const is_valid(is_model_valid(model_id)); // first 8 bits is model ID, last 8 bits is sub-model ID
+	if (!is_valid) {cerr << "Invalid model ID: " << model_id << endl;}
 	assert(is_valid); // must be loaded
 	city_model_t const &model_file(get_model(model_id));
 	model3d &model(get_model3d(model_id));
+	bool const is_animated(model.has_animations());
 	bool const have_body_mat(model_file.body_mat_id >= 0);
 	bool const use_custom_color   (!is_shadow_pass && have_body_mat && color.A != 0.0);
 	bool const use_custom_emissive(!is_shadow_pass && have_body_mat && emissive);
 	bool const use_custom_texture (!is_shadow_pass && have_body_mat && untextured);
 	colorRGBA orig_color;
 	int orig_tid(-1);
-	if (use_custom_color   ) {orig_color = model.set_color_for_material  (model_file.body_mat_id, color);} // use custom color for body material
-	if (use_custom_texture ) {orig_tid   = model.set_texture_for_material(model_file.body_mat_id, -1);}
+	int const untex_tid(-1); // Note: this indexes into the model's texture_manager textures vector; it's not a global texture ID
+	if (use_custom_color   ) {orig_color = model.set_color_for_material  (model_file.body_mat_id, color    );} // use custom color for body material
+	if (use_custom_texture ) {orig_tid   = model.set_texture_for_material(model_file.body_mat_id, untex_tid);}
 	if (use_custom_emissive) {model.set_material_emissive_color(model_file.body_mat_id, color);} // use custom color for body material
 	model.bind_all_used_tids();
-	cube_t const &bcube(model.get_bcube());
+	cube_t const bcube(model.get_bcube() * model_file.model_anim_scale);
 	point const orig_camera_pos(camera_pdu.pos), bcube_center(bcube.get_cube_center());
 	camera_pdu.pos += bcube_center - pos - xlate; // required for distance based LOD
 	bool const camera_pdu_valid(camera_pdu.valid);
 	camera_pdu.valid = 0; // disable VFC, since we're doing custom transforms here
 	// Note: in model space, front-back=z, left-right=x, top-bot=y (for model_file.swap_yz=1)
 	float const height(model_file.swap_xz ? bcube.dx() : (model_file.swap_yz ? bcube.dy() : bcube.dz()));
-	// animated models of people don't have valid bcubes because they sometimes start in a T-pose, so use the height as the size scale since it's more likely to be accurate
-	bool const is_animated(model.has_animations());
+	// animated models don't have valid bcubes because they sometimes start in a bind pose, so use the height as the size scale since it's more likely to be accurate
 	float sz_scale(0.0);
 	if (is_animated) {sz_scale = (obj_bcube.dz() / height);} // use zsize only for scale
 	else             {sz_scale = (obj_bcube.get_size().sum() / bcube.get_size().sum());} // use average XYZ size for scale
@@ -178,13 +267,18 @@ void city_model_loader_t::draw_model(shader_t &s, vector3d const &pos, cube_t co
 		anim_state->set_animation_id_and_time(s, has_bone_animations, anim_speed);
 
 		if (has_bone_animations) {
-			float const speed_mult(32.0*anim_speed);
+			int const anim_id(anim_state->get_anim_id_for_setup_bone_transforms());
+			float const speed_mult(SKELETAL_ANIM_TIME_CONST*anim_speed), anim_time(speed_mult*anim_state->anim_time);
 
 			if (anim_state->blend_factor > 0.0) { // enable animation blending
-				model.setup_bone_transforms_blended(s, speed_mult*anim_state->anim_time, speed_mult*anim_state->anim_time2, anim_state->blend_factor);
+				model.setup_bone_transforms_blended(s, anim_time, speed_mult*anim_state->anim_time2,
+					anim_state->blend_factor, anim_id, anim_state->get_anim_id2_for_setup_bone_transforms());
+			}
+			else if (anim_state->cached) { // single cached animation
+				model.setup_bone_transforms_cached(*anim_state->cached, s, anim_time, anim_id);
 			}
 			else { // single animation
-				model.setup_bone_transforms(s, speed_mult*anim_state->anim_time); // Note: anim_id is specified through the animation name property
+				model.setup_bone_transforms(s, anim_time, anim_id);
 			}
 		}
 		else {
@@ -192,14 +286,16 @@ void city_model_loader_t::draw_model(shader_t &s, vector3d const &pos, cube_t co
 			s.add_uniform_float("model_delta_height", (0.1*height + (model_file.swap_xz ? bcube.x1() : (model_file.swap_yz ? bcube.y1() : bcube.z1()))));
 		}
 	}
+	vector3d const local_rotate(do_local_rotate ? model_file.rotate_about : zero_vector);
 	fgPushMatrix();
-	translate_to(pos + vector3d(0.0, 0.0, z_offset*sz_scale)); // z_offset is in model space, scale to world space
-	rotate_model_from_plus_x_to_dir(dir);
+	translate_to(pos + z_offset*sz_scale*plus_z - local_rotate); // z_offset is in model space, scale to world space
+	rotate_model_from_plus_x_to_dir(dir); // typically rotated about the Z axis
+	if (local_rotate != all_zeros) {translate_to(local_rotate);}
 	if (dir.z != 0.0) {fgRotate(TO_DEG*asinf(-dir.z), 0.0, 1.0, 0.0);} // handle cars on a slope
 	if (model_file.xy_rot != 0.0) {fgRotate(model_file.xy_rot, 0.0, 0.0, 1.0);} // apply model rotation about z/up axis (in degrees)
-	if (model_file.swap_xz) {fgRotate(90.0, 0.0, 1.0, 0.0);} // swap X and Z dirs; models have up=X, but we want up=Z
-	if (model_file.swap_yz) {fgRotate(90.0, 1.0, 0.0, 0.0);} // swap Y and Z dirs; models have up=Y, but we want up=Z
-	if (upside_down) {fgRotate(180.0, 1.0, 0.0, 0.0);} // R180 about X to flip over
+	if (model_file.swap_xz) {fgRotate( 90.0, 0.0, 1.0, 0.0);} // swap X and Z dirs; models have up=X, but we want up=Z
+	if (model_file.swap_yz) {fgRotate( 90.0, 1.0, 0.0, 0.0);} // swap Y and Z dirs; models have up=Y, but we want up=Z
+	if (upside_down       ) {fgRotate(180.0, 1.0, 0.0, 0.0);} // R180 about X to flip over
 	uniform_scale(sz_scale); // scale from model space to the world space size of our target cube, using a uniform scale based on the averages of the x,y,z sizes
 	point center(bcube_center);
 	UNROLL_3X(if (model_file.centered & (1<<i_)) {center[i_] = 0.0;}); // use centered bit mask to control which component is centered vs. translated
@@ -207,32 +303,30 @@ void city_model_loader_t::draw_model(shader_t &s, vector3d const &pos, cube_t co
 	bool const disable_cull_face_this_obj(/*!is_shadow_pass &&*/ model_file.two_sided && glIsEnabled(GL_CULL_FACE));
 	if (disable_cull_face_this_obj) {glDisable(GL_CULL_FACE);}
 
-	if (skip_mat_mask > 0) { // draw select materials
-		for (unsigned i = 0; i < model.num_materials(); ++i) {
-			if (skip_mat_mask & (1<<i)) continue; // skip this material
-			model.render_material(s, i, is_shadow_pass, 0, 2, 0, nullptr, 1); // no_set_min_alpha=1
+	if (!force_high_detail && (low_detail || is_shadow_pass)) { // low detail pass, normal maps disabled
+		if (!is_shadow_pass && use_model3d_bump_maps()) {bind_default_flat_normal_map();} // still need to set the default here in case the shader is using it
+		// combine shadow materials into a single VBO and draw with one call when is_shadow_pass==1? this is complex and may not yield a significant improvement
+		for (auto i = model_file.shadow_mat_ids.begin(); i != model_file.shadow_mat_ids.end(); ++i) {
+			if (skip_mat_mask & (1<<*i)) continue; // skip this material
+			model.render_material(s, *i, is_shadow_pass, 0, 2, 0, nullptr, 1);
 		}
 	}
-	else if (!force_high_detail && (low_detail || is_shadow_pass)) { // low detail pass, normal maps disabled
-		if (!is_shadow_pass && use_model3d_bump_maps()) {model3d::bind_default_flat_normal_map();} // still need to set the default here in case the shader is using it
-		// TODO: combine shadow materials into a single VBO and draw with one call when is_shadow_pass==1; this is complex and may not yield a significant improvement
-		for (auto i = model_file.shadow_mat_ids.begin(); i != model_file.shadow_mat_ids.end(); ++i) {model.render_material(s, *i, is_shadow_pass, 0, 2, 0, nullptr, 1);}
-	}
 	else { // draw all materials
-		float lod_mult(model_file.lod_mult); // should model_file.lod_mult always be multiplied by sz_scale?
+		// should model_file.lod_mult always be multiplied by sz_scale? this would make the config file values more consistent, but requires a lot of manual updating
+		float lod_mult(model_file.lod_mult);
 		if (!is_shadow_pass && model_file.lod_mult == 0.0) {lod_mult = 400.0*sz_scale;} // auto select lod_mult
 		float const fixed_lod_dist((is_shadow_pass && !force_high_detail) ? 10.0 : 0.0);
 		model.render_materials(s, is_shadow_pass, 0, 0, 2, 3, 3, model.get_unbound_material(), rotation_t(),
-			nullptr, nullptr, is_shadow_pass, lod_mult, fixed_lod_dist, 0, 1, 1); // enable_alpha_mask=2 (both), is_scaled=1, no_set_min_alpha=1
+			nullptr, nullptr, is_shadow_pass, lod_mult, fixed_lod_dist, 0, 1, 1, skip_mat_mask); // enable_alpha_mask=2 (both), is_scaled=1, no_set_min_alpha=1
 	}
 	if (disable_cull_face_this_obj) {glEnable(GL_CULL_FACE);} // restore previous value
 	fgPopMatrix();
 	camera_pdu.valid = camera_pdu_valid;
 	camera_pdu.pos   = orig_camera_pos;
 	select_texture(WHITE_TEX); // reset back to default/untextured
-	if (use_custom_color   ) {model.set_color_for_material  (model_file.body_mat_id, orig_color);} // restore original color
-	if (use_custom_texture ) {model.set_texture_for_material(model_file.body_mat_id, orig_tid  );} // restore original texture
-	if (use_custom_emissive) {model.set_material_emissive_color(model_file.body_mat_id, BLACK);} // reset
+	if (use_custom_color   ) {model.set_color_for_material     (model_file.body_mat_id, orig_color);} // restore original color
+	if (use_custom_texture ) {model.set_texture_for_material   (model_file.body_mat_id, orig_tid  );} // restore original texture
+	if (use_custom_emissive) {model.set_material_emissive_color(model_file.body_mat_id, BLACK     );} // reset
 }
 
 unsigned get_model_id(unsigned id) { // first 8 bits = model_id, second 8 bits = sub_model_id
@@ -283,6 +377,8 @@ bool city_params_t::add_model(unsigned id, FILE *fp) {
 	assert(id < NUM_OBJ_MODELS);
 	city_model_t model;
 	if (!model.read(fp)) return 0;
+	model.default_anim_name = default_anim_name; // needed for birds
+	model.model_anim_scale  = model_anim_scale ; // needed for birds
 	bool const filename_valid(model.check_filename());
 	if (!filename_valid) {cerr << "Error: model file '" << model.fn << "' does not exist; skipping" << endl;} // nonfatal
 	if (filename_valid || building_models[id].empty()) {building_models[id].push_back(model);} // add if valid or the first model

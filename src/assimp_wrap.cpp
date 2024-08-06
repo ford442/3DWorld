@@ -5,7 +5,9 @@
 
 #include "3DWorld.h"
 #include "model3d.h"
+#include "profiler.h"
 
+extern int display_mode;
 extern string assimp_alpha_exclude_str;
 
 string get_base_filename(string const &filename);
@@ -27,55 +29,63 @@ unsigned model_anim_t::get_bone_id(string const &bone_name) {
 	bone_name_to_index_map[bone_name] = bone_id;
 	return bone_id;
 }
-vector3d model_anim_t::calc_interpolated_position(float anim_time, anim_data_t const &A) const {
-	assert(!A.pos.empty());
-	if (A.pos.size() == 1) {return A.pos[0].v;} // single value, no interpolation
+vector3d  interpolate(vector3d  const &A, vector3d  const &B, float t) {return A + t*(B - A);}
+glm::quat interpolate(glm::quat const &A, glm::quat const &B, float t) {return glm::normalize(glm::slerp(A, B, t));}
 
-	for (unsigned i = 0; i+1 < A.pos.size(); ++i) {
-		anim_vec3_val_t const &cur(A.pos[i]), &next(A.pos[i+1]);
-		if (anim_time >= next.time) continue; // not yet
-		float const t((anim_time - cur.time) / (next.time - cur.time));
-		assert(t >= 0.0f && t <= 1.0f);
-		return cur.v + t*(next.v - cur.v);
-	} // for i
-	assert(0);
-	return zero_vector; // never gets here
+model_anim_t::merged_anim_data_t interpolate(model_anim_t::merged_anim_data_t const &A, model_anim_t::merged_anim_data_t const &B, float t) {
+	model_anim_t::merged_anim_data_t ret;
+	ret.set(interpolate(A.pos, B.pos, t), interpolate(A.scale, B.scale, t), interpolate(A.q, B.q, t));
+	return ret;
 }
-glm::quat model_anim_t::calc_interpolated_rotation(float anim_time, anim_data_t const &A) const {
-	assert(!A.rot.empty());
-	if (A.rot.size() == 1) {return A.rot[0].q;} // single value, no interpolation
+template<typename T> T calc_interpolated_val(float time, vector<model_anim_t::anim_val_t<T>> const &vals) {
+	unsigned const size(vals.size());
+	assert(size > 0);
+	if (size == 1)                 return vals.front().v; // single value, no interpolation
+	if (time <= vals.front().time) return vals.front().v; // animation doesn't start at time 0? return first frame
+	if (time >= vals.back ().time) return vals.back ().v;
+	// assume frames are evenly spaced and attempt to calculate the correct position
+	float const tot_time(vals.back().time - vals.front().time);
+	assert(tot_time > 0.0);
+	unsigned const ix((size - 1)*(time/tot_time));
 
-	for (unsigned i = 0; i+1 < A.rot.size(); ++i) {
-		anim_quat_val_t const &cur(A.rot[i]), &next(A.rot[i+1]);
-		if (anim_time >= next.time) continue; // not yet
-		float const t((anim_time - cur.time) / (next.time - cur.time));
+	if (ix+1 < size) {
+		auto const &cur(vals[ix]), &next(vals[ix+1]);
+			
+		if (time >= cur.time && time <= next.time) {
+			float const t((time - cur.time) / (next.time - cur.time));
+			assert(t >= 0.0f && t <= 1.0f);
+			return interpolate(cur.v, next.v, t);
+		}
+	}
+	for (unsigned i = 0; i+1 < size; ++i) {
+		auto const &cur(vals[i]), &next(vals[i+1]);
+		if (time >= next.time) continue; // not yet
+		assert(cur.time < next.time);
+		float const t((time - cur.time) / (next.time - cur.time));
 		assert(t >= 0.0f && t <= 1.0f);
-		return glm::normalize(glm::slerp(cur.q, next.q, t));
+		return interpolate(cur.v, next.v, t);
 	} // for i
-	assert(0);
-	return glm::quat(); // never gets here
-}
-vector3d model_anim_t::calc_interpolated_scale(float anim_time, anim_data_t const &A) const {
-	assert(!A.scale.empty());
-	if (A.scale.size() == 1) {return A.scale[0].v;} // single value, no interpolation
-
-	for (unsigned i = 0; i+1 < A.scale.size(); ++i) {
-		anim_vec3_val_t const &cur(A.scale[i]), &next(A.scale[i+1]);
-		if (anim_time >= next.time) continue; // not yet
-		float const t((anim_time - cur.time) / (next.time - cur.time));
-		assert(t >= 0.0f && t <= 1.0f);
-		return cur.v + t*(next.v - cur.v);
-	} // for i
-	assert(0);
-	return zero_vector; // never gets here
+	return vals.back().v; // return last frame if we ran off the end (duration was wrong)
 }
 xform_matrix model_anim_t::apply_anim_transform(float anim_time, animation_t const &animation, anim_node_t const &node) const {
+	if (node.no_anim_data) return node.transform; // no animation data; flag is not per-animation, but should still agree across animations
 	auto it(animation.anim_data.find(node.name)); // found about half the time
-	if (it == animation.anim_data.end()) {return node.transform;} // defaults to node transform
+	if (it == animation.anim_data.end()) {node.no_anim_data = 1; return node.transform;} // defaults to node transform
 	anim_data_t const &A(it->second);
-	xform_matrix node_transform(glm::translate(glm::mat4(1.0), vec3_from_vector3d(calc_interpolated_position(anim_time, A))));
-	node_transform *= glm::toMat4(calc_interpolated_rotation(anim_time, A));
-	if (A.uses_scale) {node_transform *= glm::scale(glm::mat4(1.0), vec3_from_vector3d(calc_interpolated_scale(anim_time, A)));} // only scale when needed (rarely)
+	xform_matrix node_transform; // identity
+
+	if (!A.merged.empty()) { // use merged
+		merged_anim_data_t const ret(calc_interpolated_val(anim_time, A.merged));
+		UNROLL_3X(node_transform[3][i_] = ret.pos[i_];);
+		node_transform *= glm::toMat4(ret.q);
+		if (A.uses_scale) {node_transform *= glm::scale(glm::mat4(1.0), vec3_from_vector3d(ret.scale));} // only scale when needed (rarely)
+	}
+	else { // use separate
+		vector3d const translate(calc_interpolated_val(anim_time, A.pos));
+		UNROLL_3X(node_transform[3][i_] = translate[i_];);
+		node_transform *= glm::toMat4(calc_interpolated_val(anim_time, A.rot));
+		if (A.uses_scale) {node_transform *= glm::scale(glm::mat4(1.0), vec3_from_vector3d(calc_interpolated_val(anim_time, A.scale)));} // only scale when needed (rarely)
+	}
 	return node_transform;
 }
 void model_anim_t::transform_node_hierarchy_recur(float anim_time, animation_t const &animation, unsigned node_ix, xform_matrix const &parent_transform) {
@@ -91,11 +101,31 @@ void model_anim_t::transform_node_hierarchy_recur(float anim_time, animation_t c
 	for (unsigned i : node.children) {transform_node_hierarchy_recur(anim_time, animation, i, global_transform);}
 }
 void model_anim_t::get_bone_transforms(unsigned anim_id, float cur_time) {
-	assert(anim_id < animations.size());
+	//highres_timer_t timer("get_bone_transforms");  // 0.011ms
+	assert(!animations.empty());
+	static bool had_anim_id_error(0);
+
+	if (anim_id >= animations.size()) {
+		if (!had_anim_id_error) {
+			cerr << "*** Error: Invalid animation ID " << anim_id << "; Max is " << (animations.size()-1) << "; Using max value." << endl;
+			had_anim_id_error = 1;
+		}
+		anim_id = animations.size() - 1;
+	}
 	animation_t const &animation(animations[anim_id]);
 	float const time_in_ticks(cur_time * animation.ticks_per_sec);
 	float const anim_time(fmod(time_in_ticks, animation.duration));
 	transform_node_hierarchy_recur(anim_time, animation, 0, root_transform); // root node is 0
+}
+bool model_anim_t::check_anim_wrapped(unsigned anim_id, float old_time, float new_time) const {
+	assert(anim_id < animations.size());
+	animation_t const &animation(animations[anim_id]);
+	return (int((new_time * animation.ticks_per_sec)/animation.duration) != int((old_time * animation.ticks_per_sec)/animation.duration));
+}
+float model_anim_t::get_anim_duration(unsigned anim_id) const { // in seconds
+	assert(anim_id < animations.size());
+	animation_t const &animation(animations[anim_id]);
+	return animation.duration/animation.ticks_per_sec;
 }
 
 void model_anim_t::blend_animations_simple(unsigned anim_id1, unsigned anim_id2, float blend_factor, float cur_time1, float cur_time2) {
@@ -142,6 +172,28 @@ void model_anim_t::get_blended_bone_transforms(float anim_time1, float anim_time
 	for (unsigned i : node.children) {get_blended_bone_transforms(anim_time1, anim_time2, animation1, animation2, i, global_transform, blend_factor);}
 }
 
+void model_anim_t::merge_anim_transforms() {
+	for (animation_t &A : animations) {
+		for (auto &kv : A.anim_data) {
+			anim_data_t &ad(kv.second);
+			unsigned const sz(ad.pos.size());
+			if (ad.rot.size() != sz || ad.scale.size() != sz) continue; // sizes differ
+			bool differ(0);
+
+			for (unsigned i = 0; i < sz; ++i) {
+				if (ad.pos[i].time != ad.rot[i].time || ad.pos[i].time != ad.scale[i].time) {differ = 1; break;}
+			}
+			if (differ) continue;
+			ad.merged.resize(sz);
+
+			for (unsigned i = 0; i < sz; ++i) {
+				ad.merged[i].time = ad.pos[i].time;
+				ad.merged[i].v.set(ad.pos[i].v, ad.scale[i].v, ad.rot[i].v);
+			}
+		} // for kv
+	} // for A
+}
+
 void model_anim_t::merge_from(model_anim_t const &anim) {
 	if (animations.empty()) { // first animation added - copy from the incoming class
 		assert(anim_nodes.empty());
@@ -157,7 +209,9 @@ void model_anim_t::merge_from(model_anim_t const &anim) {
 		}
 		// anim.bone_name_to_index_map can have fewer entries than bone_name_to_index_map, but the names must match
 		for (auto const &kv : anim.bone_name_to_index_map) {
-			if (bone_name_to_index_map.find(kv.first) == bone_name_to_index_map.end()) {cout << "Warning: Merging animation with unknown bone name '" << kv.first << "'";}
+			auto it(bone_name_to_index_map.find(kv.first));
+			if (it == bone_name_to_index_map.end()) {cout << "Warning: Merging animation with unknown bone name '" << kv.first << "'";}
+			else if(it->second != kv.second) {} // index is different - what do we do here?
 		}
 		// what about bone_transforms, bone_offset_matrices, and bone_name_to_index_map values? they're different in my test models but still work, so maybe they don't need to agree
 		vector_add_to(anim.animations, animations); // just combine the animations, and we're done, right?
@@ -205,12 +259,11 @@ void print_assimp_matrix(aiMatrix4x4 const &m) {aiMatrix4x4_to_xform_matrix(m).p
 
 // For reference, see: https://learnopengl.com/Model-Loading/Model
 // Also: https://github.com/emeiri/ogldev
-// Also: http://www.xphere.me/2019/05/bones-animation-with-openglassimpglm/
 
 class file_reader_assimp {
 	model3d &model;
 	geom_xform_t cur_xf;
-	string model_dir, anim_name;
+	string model_fn, model_dir, anim_name;
 	bool load_animations=0, had_vertex_error=0, had_comp_tex_error=0;
 	unsigned temp_image_ix=0;
 
@@ -223,6 +276,11 @@ class file_reader_assimp {
 	vector<texture_load_work_item_t> to_load;
 	set<unsigned> unique_tids;
 
+	static void init_texture(texture_t &t) { // called on internal texture formats; what about external textures, do we need expand_grayscale_to_rgb()?
+		t.expand_grayscale_to_rgb();
+		t.fix_word_alignment(); // untested
+		t.init(); // calls calc_color()
+	}
 	void load_embedded_textures() {
 		timer_t timer("Load Embedded Textures", !to_load.empty()); // 1.57s (0.55s) avg across 5 people and 5 zombie models
 
@@ -235,7 +293,9 @@ class file_reader_assimp {
 				cerr << "Error: Failed to load embedded texture with stb_image" << endl;
 				exit(1); // fatal
 			}
-			t.init(); // calls calc_color()
+			//if (model.get_filename() == "../models/dumpster.glb" && !t.normal_map && t.ncolors == 3) {t.write_to_jpg("embedded_image.jpg");} // TESTING
+			//cout << "*** " << TXT(model.get_filename()) << TXT(t.name) << TXT(t.width) << TXT(t.height) << TXT(t.ncolors) << endl; // TESTING
+			init_texture(t);
 		} // for i
 		to_load.clear();
 	}
@@ -245,15 +305,32 @@ class file_reader_assimp {
 		// load only the first texture, as that's all we support
 		aiString fn; // absolute path, not relative to the model file
 		if (mat->GetTexture(type, 0, &fn) != AI_SUCCESS) return -1;
-		char const *const filename(fn.C_Str());
-		aiTexture const *const texture(scene->GetEmbeddedTexture(filename));
-		string full_path(model_dir + filename);
+		char const *const texture_fn(fn.C_Str());
+		aiTexture const *const texture(scene->GetEmbeddedTexture(texture_fn));
+		// embedded texture texture_fn is generally something like "*0", so include the full model filename to make it globally unique
+		string full_path((texture ? model_fn : model_dir) + texture_fn);
 		bool is_temp_image(0);
 
-		if (texture) {
+		// hack: if this is a PSD (Photoshop) file, we don't support reading it, but we can see if the actual file is a JPG (which happens for one model)
+		if (!texture && endswith(full_path, ".psd")) {
+			string mod_path(full_path);
+			unsigned const sz(full_path.size());
+			mod_path[sz-3] = 'j';
+			mod_path[sz-2] = 'p';
+			mod_path[sz-1] = 'g';
+			
+			if (check_texture_file_exists(mod_path)) {full_path = mod_path;} // jpg
+			else {
+				mod_path[sz-3] = 'p';
+				mod_path[sz-2] = 'n';
+				mod_path[sz-1] = 'g';
+				if (check_texture_file_exists(mod_path)) {full_path = mod_path;} // png
+			}
+		}
+		if (texture) { // embedded texture
 			assert(texture->pcData);
 			// try to read from memory
-			// is_alpha_mask=0, verbose=0, invert_alpha=0, wrap=1, mirror=0, force_grayscale=0
+			// is_alpha_mask=0, verbose=0, invert_alpha=0, wrap=1, mirror=0, force_grayscale=0, invert_y=1
 			unsigned const tid(model.tmgr.create_texture(full_path, 0, 0, 0, 1, 0, 0, is_normal_map, 1));
 			texture_t &t(model.tmgr.get_texture(tid));
 			//cout << TXT(width) << TXT(height) << TXT(tid) << TXT(t.is_allocated()) << endl;
@@ -273,7 +350,7 @@ class file_reader_assimp {
 					tdata[4*i+2] = texture->pcData[i].b;
 					tdata[4*i+3] = texture->pcData[i].a;
 				}
-				t.init(); // calls calc_color()
+				init_texture(t);
 				return tid; // done
 			}
 			// else texture stored compressed
@@ -284,22 +361,28 @@ class file_reader_assimp {
 			}
 			model.tmgr.remove_last_texture(); // not using this texture
 			// write as a temporary image file that we can read back in; reuse filename across images
-			full_path = "temp_assimp_embedded_image." + get_file_extension(filename);
+			full_path = "temp_assimp_embedded_image";
+			string const ext(get_file_extension(texture_fn));
+			if (!ext.empty()) {full_path += "." + ext;} // add externsion if present
 			ofstream out(full_path, ios::binary);
 			out.write((const char *)texture->pcData, texture->mWidth);
 			is_temp_image = 1;
 		}
 		else if (!check_texture_file_exists(full_path)) {
-			string const fn(filename);
-			bool found(0);
+			string const &fn(texture_fn);
+			string local_path;
+			bool found(0), try_local(0);
+			if (fn.size() > 3 && (fn[0] >= 'A' && fn[0] <= 'Z') && fn[1] == ':' && (fn[2] == '\\' || fn[2] == '/')) {try_local = 1;} // Windows path?
+			else if (fn.size() > 2 && fn[0] == '/') {try_local = 1;} // linux path?
 
-			if (fn.size() > 3 && (fn[0] >= 'A' && fn[0] <= 'Z') && fn[1] == ':' && (fn[2] == '\\' || fn[2] == '/')) {
-				// looks like a Windows path that's invalid; try stripping off the path and looking in the current directory
-				string const local_path(model_dir + get_base_filename(fn));
+			if (try_local) { // try stripping off the path and looking in the current directory
+				local_path = model_dir + get_base_filename(fn);
 				if (check_texture_file_exists(local_path)) {full_path = local_path; found = 1;}
 			}
 			if (!found) {
-				cerr << "Error: Can't find texture file for assimp model: " << full_path << endl;
+				cerr << "Error: Can't find texture file for assimp model: " << full_path;
+				if (!local_path.empty()) {cerr << " or " << local_path;}
+				cerr << endl;
 				return -1;
 			}
 		}
@@ -355,18 +438,21 @@ class file_reader_assimp {
 		model_anim.animations.reserve(scene->mNumAnimations);
 
 		for (unsigned a = 0; a < scene->mNumAnimations; ++a) {
-			//cout << "adding animation '" << anim_name << "'" << endl; // TESTING
-			model_anim.animations.emplace_back(anim_name);
 			aiAnimation const *const anim(scene->mAnimations[a]);
-			assert(anim);
-			read_missing_bones(anim, model_anim);
+			assert(anim != nullptr);
+			bool const use_anim_name(a == 0 && !anim_name.empty() && anim_name != "use_model_anim_name"); // "use_model_anim_name" is a special name
+			string const name_to_use(use_anim_name ? anim_name : string(anim->mName.C_Str()));
+			model_anim.animations.emplace_back(name_to_use);
+			//cout << "Adding animation '" << anim->mName.C_Str() << "' ID " << a << " as '" << name_to_use << "'" << endl; // TESTING
+			//read_missing_bones(anim, model_anim); // okay to do, but increases the number of bones unnecessarily
 			if (anim->mTicksPerSecond) {model_anim.animations[a].ticks_per_sec = anim->mTicksPerSecond;} // defaults to 25
 			model_anim.animations[a].duration = anim->mDuration;
-		}
+		} // for a
 		extract_animation_data_recur(scene, scene->mRootNode, model_anim);
+		model_anim.merge_anim_transforms();
 	}
 
-	// Note: unclear if this is actually needed; at least it seems to do nothing for the models I've tested this on
+	// Note: unclear if this is actually needed; it seems to do nothing for the models I've tested this on unless bones with no weights are skipped in parse_single_bone()
 	void read_missing_bones(aiAnimation const *const anim, model_anim_t &model_anim) {
 		// https://learnopengl.com/Guest-Articles/2020/Skeletal-Animation
 		// reading channels (bones engaged in an animation and their keyframes)
@@ -380,6 +466,7 @@ class file_reader_assimp {
 		}
 	}
 	void parse_single_bone(int bone_index, aiBone const *const pBone, mesh_bone_data_t &bone_data, model_anim_t &model_anim, unsigned first_vertex_offset) {
+		if (pBone->mNumWeights == 0) return; // bone with no weights - ignore
 		unsigned const bone_id(model_anim.get_bone_id(pBone->mName.C_Str()));
 
 		if (bone_id == model_anim.bone_transforms.size()) { // maybe add a new bone
@@ -407,7 +494,7 @@ class file_reader_assimp {
 		for (unsigned i = 0; i < mesh->mNumVertices; i++) { // process vertices
 			vert_norm_tc &v(verts[i]);
 			assert(mesh->mVertices != nullptr); // vertices are required
-			assert(mesh->mNormals  != nullptr); // we specified normal creation, so these shouldbe non-null
+			assert(mesh->mNormals  != nullptr); // we specified normal creation, so these should be non-null
 			v.v = aiVector3D_to_vector3d(mesh->mVertices[i]); // position
 			v.n = aiVector3D_to_vector3d(mesh->mNormals [i]); // normals
 
@@ -415,7 +502,7 @@ class file_reader_assimp {
 				cur_xf.xform_pos   (v.v);
 				cur_xf.xform_pos_rm(v.n);
 			}
-			if (mesh->mTextureCoords != nullptr && mesh->mTextureCoords[0] != nullptr) { // TCs are optional and default to (0,0); we only use the first of 8
+			if (mesh->mTextureCoords[0] != nullptr) { // TCs are optional and default to (0,0); we only use the first of 8
 				v.t[0] = mesh->mTextureCoords[0][i].x; 
 				v.t[1] = mesh->mTextureCoords[0][i].y;
 			}
@@ -423,6 +510,8 @@ class file_reader_assimp {
 			if (load_animations) {cur_xf.xform_pos(bcube_pt);} // if we didn't transform the point above, transform it now to compute a (hopefully more accurate) bcube
 			if (i == 0) {mesh_bcube.set_from_point(bcube_pt);} else {mesh_bcube.union_with_pt(bcube_pt);}
 		} // for i
+		// alternate AABB approach; requires setting aiProcess_GenBoundingBoxes; Doesn't handle load_animations=1 case; unclear what benefits this has
+		//cube_t aabb(aiVector3D_to_vector3d(mesh->mAABB.mMin), aiVector3D_to_vector3d(mesh->mAABB.mMax));
 		assert(mesh->mFaces != nullptr);
 		assert(mesh->mNumFaces > 0); // if there were verts, there must be faces
 
@@ -500,7 +589,8 @@ public:
 		model(model_), anim_name(anim_name_), load_animations(load_animations_) {}
 
 	bool read(string const &fn, geom_xform_t const &xf, bool recalc_normals, bool verbose) {
-		cur_xf = xf;
+		cur_xf   = xf;
+		model_fn = fn; // needed for embedded texture filename uniquing
 		Assimp::Importer importer;
 		importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_PRESERVE_PIVOTS, false); // required for correct FBX model import
 		// aiProcess_OptimizeMeshes
@@ -509,6 +599,7 @@ public:
 		// aiProcess_FindDegenerates, aiProcess_FindInvalidData - optional
 		// aiProcess_FlipUVs - not needed since this can be done in the texture loading
 		// aiProcess_CalcTangentSpace - ???
+		// aiProcess_GenBoundingBoxes - calculate mesh AABBs
 		unsigned flags(aiProcess_Triangulate | aiProcess_SortByPType | aiProcess_JoinIdenticalVertices |
 			           aiProcess_FixInfacingNormals | aiProcess_GenUVCoords | aiProcess_OptimizeMeshes);
 		// Note: here we treat the recalc_normals flag as using smooth normals; if the model already contains normals, they're always used
@@ -529,8 +620,12 @@ public:
 			}
 			cerr << "Warning: AssImp flagged incomplete scene" << endl; // nonfatal
 		}
+		if (load_animations && scene->mNumAnimations == 0) { // no animations to load
+			load_animations = 0;
+			cerr << "Warning: load_animations=1 was specified, but model contains no animations; Reloading without animations" << endl;
+			return read(fn, xf, recalc_normals, verbose); // must reread the file with aiProcess_PreTransformVertices flag
+		}
 		if (scene->mRootNode == nullptr) {cout << "Warning: No root node for model" << endl;}
-		if (scene->mNumAnimations == 0) {load_animations = 0;} // no animations to load
 		model_dir = fn;
 		while (!model_dir.empty() && model_dir.back() != '/' && model_dir.back() != '\\') {model_dir.pop_back();} // remove filename from end, but leave the slash
 		if (scene->mRootNode) {process_node_recur(scene->mRootNode, scene, model.model_anim_data);}

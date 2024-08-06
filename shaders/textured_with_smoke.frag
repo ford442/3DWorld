@@ -22,9 +22,16 @@ uniform float cube_bb[6], sphere_radius;
 uniform float depth_trans_bias, clip_plane_z, ripple_time, rain_intensity, reflectivity, snow_cov_amt;
 uniform float reflect_plane_ztop, reflect_plane_zbot;
 uniform float winding_normal_sign = 1.0;
-uniform float cube_map_reflect_mipmap_level = 0;
+uniform float cube_map_reflect_mipmap_level = 0.0;
+uniform float puddle_scale = 0.04;
+uniform float water_damage_zmax = 0.0;
+uniform float crack_scale  = 1.0;
+uniform float crack_sharp  = 100.0;
+uniform float crack_weight = 0.0;
+uniform float crack_zmax   = 0.0;
 uniform int cube_map_texture_size = 0;
 uniform vec4 emission = vec4(0,0,0,1);
+uniform bool two_sided_lighting = true;
 
 //in vec3 vpos, normal; // world space, come from indir_lighting.part.frag
 // epos, eye_norm, and tc come from bump_map.frag
@@ -190,15 +197,26 @@ float get_water_snow_coverage() {
 }
 
 float get_puddle_val(in float wetness) {
-
 	float wet_val = 0.0;
 	float freq    = 1.0;
 
 	for (int i = 0; i < 4; ++i) {
-		wet_val += texture(wet_noise_tex, 0.04*freq*vpos).r/freq;
+		wet_val += texture(wet_noise_tex, puddle_scale*freq*vpos).r/freq;
 		freq    *= 2.0;
 	}
 	return sqrt(min(1.0, 8.0*wetness))*min(1.0, pow((wetness + max(wet_val, 0.6) - 0.6), 8.0));
+}
+
+float get_crack_factor() {
+	float val  = 0.0;
+	float freq = 1.0;
+
+	for (int i = 0; i < 4; ++i) {
+		val  += texture(wet_noise_tex, crack_scale*freq*vpos).r/freq;
+		freq *= 2.0;
+	}
+	return min(1.0, crack_sharp*crack_scale*abs(val - 1.0));
+	//return ((abs(val - 1.0) < 0.02) ? 0.0 : 1.0);
 }
 
 // returns {fresnel_term, reflect_weight}
@@ -306,14 +324,36 @@ void main()
 	}
 #endif // ENABLE_PUDDLES
 
+#ifdef ENABLE_WATER_DAMAGE
+	if (wetness > 0.0) { // add water damage similar to puddles
+		wetness       = ((vpos.z < water_damage_zmax) ? get_puddle_val(wetness) : 0.0);
+		reflectivity2 = wetness;
+	}
+#endif // ENABLE_WATER_DAMAGE
+
+#ifdef ADD_CRACKS
+	// not on ceilings since they may be wood; what about floors/carpets?
+	if (crack_weight > 0.0 && vpos.z < crack_zmax && normal.z > -0.5) {
+		float color_scale = mix(1.0, get_crack_factor(), crack_weight);
+		texel.rgb *= color_scale;
+		wetness   *= color_scale;
+	}
+#endif // ADD_CRACKS
+
 #ifdef USE_WINDING_RULE_FOR_NORMAL
-	float normal_sign = winding_normal_sign*((!two_sided_lighting || gl_FrontFacing) ? 1.0 : -1.0); // two-sided lighting
+	float normal_sign  = winding_normal_sign*((!two_sided_lighting || gl_FrontFacing) ? 1.0 : -1.0); // two-sided lighting
 #else
-	float normal_sign = ((!two_sided_lighting || (dot(eye_norm, epos.xyz) < 0.0)) ? 1.0 : -1.0); // two-sided lighting
+	float normal_sign  = ((!two_sided_lighting || (dot(eye_norm, epos.xyz) < 0.0)) ? 1.0 : -1.0); // two-sided lighting
 #endif
 	vec3 normal_s      = normal_sign*normal;
+#ifdef ENABLE_WATER_DAMAGE
+	float wet_surf_val = wetness; // all surfaces are wet
+#else
 	float wet_surf_val = wetness*max(normal.z, 0.0); // only +z surfaces are wet; doesn't apply to spec shininess though
-	vec4 base_color    = mix(1.0, 0.25, wet_surf_val)*gl_Color;
+#endif
+	vec4 base_color    = mix(1.0, 0.25, wet_surf_val)*gl_Color; // unlit material color (albedo)
+	base_color.rgb    *= texel.rgb; // maybe gamma correction is wrong when the texture is added this way? but it's not actually used in any scenes
+	vec3 lit_color     = emission.rgb*texel.rgb + emissive_scale*base_color.rgb;
 
 #ifdef ENABLE_SNOW_COVERAGE
 	if (snow_cov_amt > 0.0 && normal_s.z > 0.4) {
@@ -323,8 +363,7 @@ void main()
 		texel          = mix(texel, vec4(0.9, 0.9, 1.0, 1.0), snow_amt);
 		alpha          = mix(alpha, 1.0, snow_amt);
 	}
-#endif
-	vec3 lit_color = emission.rgb + emissive_scale*gl_Color.rgb;
+#endif // ENABLE_SNOW_COVERAGE
 #ifdef ENABLE_EMISSIVE_MAP
 	lit_color     += texture(emissive_map, tc);
 #endif
@@ -341,7 +380,7 @@ void main()
 		if (enable_light2) {ADD_LIGHT(2);} // lightning
 	}
 	if (enable_dlights) {add_dlights_bm_scaled(lit_color, vpos, epos, normalize(normal_s), base_color.rgb, 1.0, normal_sign, wet_surf_val);} // dynamic lighting
-	vec4 color = vec4((texel.rgb * lit_color), (texel.a * alpha));
+	vec4 color = vec4(lit_color, (texel.a * alpha));
 
 #ifdef ENABLE_GAMMA_CORRECTION
 	color.rgb = pow(color.rgb, vec3(0.45)); // gamma correction

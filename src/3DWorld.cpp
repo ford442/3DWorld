@@ -17,6 +17,7 @@
 #include "draw_utils.h"
 #include "tree_leaf.h"
 #include <set>
+#include <thread> // for std::thread::hardware_concurrency()
 
 #ifdef _WIN32 // wglew.h seems to be Windows only
 #include <GL/wglew.h> // for wglSwapIntervalEXT
@@ -26,8 +27,8 @@
 
 #ifdef _WIN32
 extern "C" { // force use of dedicated GPUs rather than Intel integrated graphics
-	_declspec(dllexport) DWORD NvOptimusEnablement = 1;
-	_declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+	__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+	__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
@@ -79,12 +80,12 @@ bool detail_normal_map(0), init_core_context(0), use_core_context(0), enable_mul
 bool enable_dlight_shadows(1), tree_indir_lighting(0), ctrl_key_pressed(0), only_pine_palm_trees(0), enable_gamma_correct(0), use_z_prepass(0), reflect_dodgeballs(0);
 bool store_cobj_accum_lighting_as_blocked(0), all_model3d_ref_update(0), begin_motion(0), enable_mouse_look(MOUSE_LOOK_DEF), enable_init_shields(1), tt_triplanar_tex(0);
 bool enable_model3d_bump_maps(1), use_obj_file_bump_grayscale(1), invert_bump_maps(0), use_interior_cube_map_refl(0), enable_cube_map_bump_maps(1), no_store_model_textures_in_memory(0);
-bool enable_model3d_custom_mipmaps(1), flatten_tt_mesh_under_models(0), show_map_view_mandelbrot(0), smileys_chase_player(0), disable_fire_delay(0), disable_recoil(0);
+bool enable_model3d_custom_mipmaps(1), flatten_tt_mesh_under_models(0), smileys_chase_player(0), disable_fire_delay(0), disable_recoil(0), mesh_size_locked(0);
 bool enable_dpart_shadows(0), enable_tt_model_reflect(1), enable_tt_model_indir(0), auto_calc_tt_model_zvals(0), use_model_lod_blocks(0), enable_translocator(0), enable_grass_fire(0);
 bool disable_model_textures(0), start_in_inf_terrain(0), allow_shader_invariants(1), config_unlimited_weapons(0), disable_tt_water_reflect(0), allow_model3d_quads(1);
 bool enable_timing_profiler(0), fast_transparent_spheres(0), force_ref_cmap_update(0), use_instanced_pine_trees(0), enable_postproc_recolor(0), draw_building_interiors(0);
-bool toggle_room_light(0), teleport_to_screenshot(0), merge_model_objects(0), display_frame_time(0), reverse_3ds_vert_winding_order(1), disable_dlights(0);
-bool enable_hcopter_shadows(0), pre_load_full_tiled_terrain(0), disable_blood(0), enable_model_animations(1);
+bool toggle_room_light(0), teleport_to_screenshot(0), merge_model_objects(0), reverse_3ds_vert_winding_order(1), disable_dlights(0), voxel_add_remove(0), enable_ground_csm(0);
+bool enable_hcopter_shadows(0), pre_load_full_tiled_terrain(0), disable_blood(0), enable_model_animations(1), rotate_trees(0), invert_model3d_faces(0), play_gameplay_alert(1);
 int xoff(0), yoff(0), xoff2(0), yoff2(0), rand_gen_index(0), mesh_rgen_index(0), camera_change(1), camera_in_air(0), auto_time_adv(0);
 int animate(1), animate2(1), draw_model(0), init_x(STARTING_INIT_X), fire_key(0), do_run(0), init_num_balls(-1), change_wmode_frame(0);
 int game_mode(0), map_mode(0), load_hmv(0), load_coll_objs(1), read_landscape(0), screen_reset(0), mesh_seed(0), rgen_seed(1);
@@ -98,19 +99,19 @@ int do_zoom(0), disable_universe(0), disable_inf_terrain(0), precip_mode(0), bui
 int num_trees(0), num_smileys(1), srand_param(3), left_handed(0), mesh_scale_change(0);
 int pause_frame(0), show_fog(0), spectate(0), b2down(0), free_for_all(0), teams(2), show_scores(0), universe_only(0);
 int reset_timing(0), read_heightmap(0), default_ground_tex(-1), num_dodgeballs(1), INIT_DISABLE_WATER, ground_effects_level(2);
-int enable_fsource(0), run_forward(0), advanced(0), dynamic_mesh_scroll(0);
+int enable_fsource(0), run_forward(0), advanced(0), dynamic_mesh_scroll(0), default_anim_id(-1), stats_display_mode(0);
 int read_snow_file(0), write_snow_file(0), mesh_detail_tex(NOISE_TEX);
 int read_light_files[NUM_LIGHTING_TYPES] = {0}, write_light_files[NUM_LIGHTING_TYPES] = {0};
-unsigned num_snowflakes(0), create_voxel_landscape(0), hmap_filter_width(0), num_dynam_parts(100), snow_coverage_resolution(2);
+unsigned num_snowflakes(0), create_voxel_landscape(0), hmap_filter_width(0), num_dynam_parts(100), snow_coverage_resolution(2), show_map_view_fractal(0);
 unsigned num_birds_per_tile(2), num_fish_per_tile(15), num_bflies_per_tile(4);
-unsigned erosion_iters(0), erosion_iters_tt(0), skybox_tid(0), tiled_terrain_gen_heightmap_sz(0);
+unsigned erosion_iters(0), erosion_iters_tt(0), skybox_tid(0), tiled_terrain_gen_heightmap_sz(0), game_mode_disable_mask(0), num_frame_draw_calls(0);
 float NEAR_CLIP(DEF_NEAR_CLIP), FAR_CLIP(DEF_FAR_CLIP), system_max_orbit(1.0), sky_occlude_scale(0.0), tree_slope_thresh(5.0), mouse_sensitivity(1.0), tt_grass_scale_factor(1.0);
 float water_plane_z(0.0), base_gravity(1.0), crater_depth(1.0), crater_radius(1.0), disabled_mesh_z(FAR_CLIP), vegetation(1.0), atmosphere(1.0), biome_x_offset(0.0);
 float mesh_file_scale(1.0), mesh_file_tz(0.0), speed_mult(1.0), mesh_z_cutoff(-FAR_CLIP), relh_adj_tex(0.0), dodgeball_metalness(1.0), ray_step_size_mult(1.0);
 float water_h_off(0.0), water_h_off_rel(0.0), perspective_fovy(0.0), perspective_nclip(0.0), read_mesh_zmm(0.0), indir_light_exp(1.0), cloud_height_offset(0.0);
 float snow_depth(0.0), snow_random(0.0), cobj_z_bias(DEF_Z_BIAS), init_temperature(DEF_TEMPERATURE), indir_vert_offset(0.25), sm_tree_density(1.0), fog_dist_scale(1.0);
 float CAMERA_RADIUS(DEF_CAMERA_RADIUS), C_STEP_HEIGHT(0.6), waypoint_sz_thresh(1.0), model3d_alpha_thresh(0.9), model3d_texture_anisotropy(1.0), dist_to_fire_sq(0.0);
-float ocean_wave_height(DEF_OCEAN_WAVE_HEIGHT), tree_density_thresh(0.55), model_auto_tc_scale(0.0), model_triplanar_tc_scale(0.0), shadow_map_pcf_offset(0.0);
+float ocean_wave_height(DEF_OCEAN_WAVE_HEIGHT), tree_density_thresh(0.55), model_auto_tc_scale(0.0), model_triplanar_tc_scale(0.0), precip_dist_scale(1.0);
 float custom_glaciate_exp(0.0), tree_type_rand_zone(0.0), jump_height(1.0), force_czmin(0.0), force_czmax(0.0), smap_thresh_scale(1.0), dlight_intensity_scale(1.0);
 float model_mat_lod_thresh(5.0), clouds_per_tile(0.5), def_atmosphere(1.0), def_vegetation(1.0), ocean_depth_opacity_mult(1.0), erode_amount(1.0), ambient_scale(1.0);
 float model_hemi_lighting_scale(0.5), pine_tree_radius_scale(1.0), sunlight_brightness(1.0), moonlight_brightness(1.0), sm_tree_scale(1.0);
@@ -133,9 +134,10 @@ char player_name[MAX_CHARS] = "Player";
 bool vert_opt_flags[3] = {0}; // {enable, full_opt, verbose}
 
 
-extern bool clear_landscape_vbo, use_dense_voxels, tree_4th_branches, model_calc_tan_vect, water_is_lava, use_grass_tess, def_tex_compress, ship_cube_map_reflection, flashlight_on;
+extern bool clear_landscape_vbo, use_dense_voxels, tree_4th_branches, model_calc_tan_vect, water_is_lava, use_grass_tess, def_tex_compress, ship_cube_map_reflection;
+extern bool flashlight_on, player_wait_respawn, camera_in_building;
 extern int camera_flight, DISABLE_WATER, DISABLE_SCENERY, camera_invincible, onscreen_display, mesh_freq_filter, show_waypoints, last_inventory_frame;
-extern int tree_coll_level, GLACIATE, UNLIMITED_WEAPONS, destroy_thresh, MAX_RUN_DIST, mesh_gen_mode, mesh_gen_shape, map_drag_x, map_drag_y;
+extern int tree_coll_level, GLACIATE, UNLIMITED_WEAPONS, destroy_thresh, MAX_RUN_DIST, mesh_gen_mode, mesh_gen_shape, map_drag_x, map_drag_y, player_in_water;
 extern unsigned NPTS, NRAYS, LOCAL_RAYS, GLOBAL_RAYS, DYNAMIC_RAYS, NUM_THREADS, MAX_RAY_BOUNCES, grass_density, max_unique_trees, shadow_map_sz;
 extern unsigned scene_smap_vbo_invalid, spheres_mode, max_cube_map_tex_sz, DL_GRID_BS;
 extern float fticks, team_damage, self_damage, player_damage, smiley_damage, smiley_speed, tree_deadness, tree_dead_prob, lm_dz_adj, nleaves_scale, flower_density, universe_ambient_scale;
@@ -394,10 +396,13 @@ void check_xy_offsets() {
 
 	if (camera_view) return;
 	int const mrd(((world_mode == WMODE_INF_TERRAIN) ? 4 : 1)*MAX_RUN_DIST); // increase distance in TT mode to reduce shadow map updates
-	while (xoff >=  mrd) {xoff -= mrd; surface_pos.x -= mrd*DX_VAL;}
-	while (xoff <= -mrd) {xoff += mrd; surface_pos.x += mrd*DX_VAL;}
-	while (yoff >=  mrd) {yoff -= mrd; surface_pos.y -= mrd*DY_VAL;}
-	while (yoff <= -mrd) {yoff += mrd; surface_pos.y += mrd*DY_VAL;}
+	vector3d delta;
+	while (xoff >=  mrd) {xoff -= mrd; delta.x -= mrd*DX_VAL;}
+	while (xoff <= -mrd) {xoff += mrd; delta.x += mrd*DX_VAL;}
+	while (yoff >=  mrd) {yoff -= mrd; delta.y -= mrd*DY_VAL;}
+	while (yoff <= -mrd) {yoff += mrd; delta.y += mrd*DY_VAL;}
+	surface_pos     += delta;
+	camera_last_pos += delta;
 }
 
 
@@ -436,7 +441,7 @@ void set_camera_pos_dir(point const &pos, vector3d const &dir) {
 
 
 void move_camera_pos_xy(vector3d const &v, float dist) {
-
+	// called when the player moves in both ground and TT modes; checks for XY collisions that block movement
 	// normal ground movement - should speed depend on orientation or not?
 	if (world_mode == WMODE_INF_TERRAIN) {dist *= get_player_building_speed_mult();}
 	static float prev_camera_zval(surface_pos.z); // required for walking on bridges to determine if camera is on or below the bridge
@@ -446,7 +451,7 @@ void move_camera_pos_xy(vector3d const &v, float dist) {
 	surface_pos.y += xy_scale*v.y;
 	if (world_mode == WMODE_INF_TERRAIN) {check_legal_movement_using_model_coll(prev, surface_pos, CAMERA_RADIUS);} // collision with models
 	bool const include_cars = 1;
-	proc_city_sphere_coll(surface_pos, prev, CAMERA_RADIUS, prev_camera_zval, 0, include_cars, nullptr, PLAYER_CAN_ENTER_BUILDINGS); // use prev pos for building collisions
+	proc_city_sphere_coll(surface_pos, prev, CAMERA_RADIUS, prev_camera_zval, include_cars, nullptr, PLAYER_CAN_ENTER_BUILDINGS); // use prev pos for building collisions
 	prev_camera_zval = surface_pos.z;
 }
 
@@ -457,6 +462,7 @@ void move_camera_pos(vector3d const &v, float dist) { // remember that dist is n
 	else {move_camera_pos_xy(v, dist);}
 }
 
+float get_player_move_dist() {return fticks*speed_mult*player_speed*GROUND_SPEED*calc_speed();}
 
 void advance_camera(int dir) { // player movement processing
 
@@ -468,8 +474,9 @@ void advance_camera(int dir) { // player movement processing
 		return;
 	}
 	if (camera_mode != 1 || (map_mode && world_mode != WMODE_INF_TERRAIN)) return;
+	if (world_mode == WMODE_INF_TERRAIN && player_wait_respawn) return; // can't move during respawn
 	vector3d v;
-	float dist(fticks*speed_mult*player_speed*GROUND_SPEED*calc_speed());
+	float dist(get_player_move_dist());
 	
 	if (game_mode && sstates != NULL) {
 		if (sstates[CAMERA_ID].freeze_time > 0) return; // can't move
@@ -570,7 +577,7 @@ void update_sound_loops() {
 	set_sound_loop_state(SOUND_LOOP_FIRE, (!universe && dist_to_fire_sq > 0.0 && dist_to_fire_sq < 2.0), fire_gain);
 	set_sound_loop_state(SOUND_LOOP_RAIN, (!universe && rain_wind_volume > 0.0 && is_rain_enabled()), rain_wind_volume);
 	set_sound_loop_state(SOUND_LOOP_WIND, (!universe && rain_wind_volume > 0.0 && wind.mag() >= 1.0), rain_wind_volume);
-	set_sound_loop_state(SOUND_LOOP_UNDERWATER, (!universe && underwater && frame_counter > change_wmode_frame+1));
+	set_sound_loop_state(SOUND_LOOP_UNDERWATER, (!universe && (underwater || player_in_water == 2) && frame_counter > change_wmode_frame+1));
 	dist_to_fire_sq = 0.0;
 	proc_delayed_and_placed_sounds();
 }
@@ -617,7 +624,11 @@ struct player_height_mgr_t {
 		if (!inited) {cur_height = camera_zh; inited = 1;} // start at full height
 		float adj_val(0.0);
 
-		if (ctrl_key_pressed) { // crouch
+		if (player_wait_respawn) { // player is on the floor if waiting for respawn
+			if (cur_height == 0) return; // already fully down
+			adj_val = -0.5;
+		}
+		else if (ctrl_key_pressed) { // crouch
 			if (cur_height == 0) return; // already fully down
 			adj_val = -1.0;
 		}
@@ -625,7 +636,7 @@ struct player_height_mgr_t {
 			if (cur_height == camera_zh) return; // already fully up
 			adj_val = 1.0;
 		}
-		cur_height += adj_val*camera_zh*10.0*(fticks/TICKS_PER_SECOND); // 100ms for complete transition
+		cur_height += adj_val*camera_zh*5.0*(fticks/TICKS_PER_SECOND); // 200ms for complete transition
 		cur_height  = max(0.25*camera_zh, min(camera_zh, cur_height)); // clamp to valid range, 25% to 100% height
 	}
 };
@@ -633,6 +644,7 @@ struct player_height_mgr_t {
 player_height_mgr_t player_height_mgr;
 
 double get_player_height() {return player_height_mgr.cur_height;} // control key = crouch
+float  get_crouch_amt   () {return (1.0 - get_player_height()/camera_zh)/0.75;}
 void force_player_height(double height) {assert(height >= 0.0); player_height_mgr.cur_height = height;} // for building attic forced crouch
 
 // This function is called whenever the mouse is pressed or released
@@ -803,8 +815,7 @@ void change_tree_mode() {
 }
 
 void switch_weapon_mode() {
-
-	if (sstates == NULL || !game_mode) return;
+	if (sstates == NULL || game_mode != GAME_MODE_FPS) return;
 	++sstates[CAMERA_ID].wmode;
 	sstates[CAMERA_ID].verify_wmode();
 	play_switch_wmode_sound();
@@ -812,8 +823,7 @@ void switch_weapon_mode() {
 }
 
 void toggle_camera_mode() {
-
-	camera_mode   = !camera_mode;
+	camera_mode   = (camera_mode == 0);
 	camera_reset  = 1;
 	camera_change = 1;
 	if (camera_mode == 1) {camera_invincible = 1;} // in air (else on ground)
@@ -823,7 +833,6 @@ void update_precip_rate_verbose(float val) {
 	update_precip_rate(val);
 	cout << ((val > 1.0) ? "increase" : "decrease") << " precip to " << obj_groups[coll_id[PRECIP]].max_objs << endl;
 }
-
 void show_bool_option_change(string const &name, bool new_val) {
 	print_text_onscreen((name + (new_val ? " ON" : " OFF")), WHITE, 1.0, 1.0*TICKS_PER_SECOND);
 }
@@ -831,6 +840,28 @@ void show_speed() {
 	ostringstream oss;
 	oss << "Player Speed " << get_player_speed_mult() << "x";
 	print_text_onscreen(oss.str(), WHITE, 1.0, 1.0*TICKS_PER_SECOND);
+}
+void show_text_prompt() {
+	print_text_onscreen("Text Prompt", WHITE, 1.0, 2.0*TICKS_PER_SECOND);
+}
+
+void print_texture_stats();
+void print_shader_stats();
+void show_tiled_terrain_debug_stats();
+
+void show_frame_stats() {
+	print_texture_stats();
+	print_shader_stats();
+	cout << "Draw calls for frame " << frame_counter << ": " << num_frame_draw_calls << endl;
+	if (world_mode == WMODE_INF_TERRAIN) {show_tiled_terrain_debug_stats();}
+}
+
+void next_game_mode() {
+	if (world_mode == WMODE_UNIVERSE)      return; // only one game mode
+	if ((game_mode_disable_mask & 7) == 7) return; // all game modes disabled, leave at init game mode (error?)
+	int const prev_game_mode(game_mode);
+	do {game_mode = (game_mode + 1) % 3;} while (game_mode_disable_mask & (1 << game_mode)); // select the next enabled game mode
+	if (game_mode != prev_game_mode) {change_game_mode();}
 }
 
 
@@ -840,7 +871,7 @@ void show_speed() {
 // key repeat is only enabled for movement keys wasd
 void keyboard_proc(unsigned char key, int x, int y) {
 
-    switch (key) { // available: O, P,. somtimes Z
+    switch (key) { // available: sometimes O, sometimes Z
 	case 0x1B: // ESC key (27)
 		quit_3dworld();
 		break;
@@ -943,13 +974,14 @@ void keyboard_proc(unsigned char key, int x, int y) {
 	case 'f': // print framerate and stats
 		show_framerate = 1;
 		timing_profiler_stats();
+		show_frame_stats();
 		break;
 	case 'g': // pause/resume playback of eventlist
 		pause_frame = !pause_frame;
 		break;
 	case 'G': // toggle show framerate/universe stats / voxel add/remove (used to be z)
-		display_framerate = !display_framerate;
-		if (display_framerate) {display_frame_time ^= 1;} // toggle between FPS and frame time
+		stats_display_mode = (stats_display_mode + 1) % 4;
+		display_framerate  = (stats_display_mode != 3);
 		break;
 
 	case 'p': // reset camera / change fire primary
@@ -958,6 +990,10 @@ void keyboard_proc(unsigned char key, int x, int y) {
 			break;
 		}
 		reset_camera_pos();
+		break;
+
+	case 'P': // voxel add/remove toggle
+		voxel_add_remove ^= 1;
 		break;
 
 	case 'v': // reset camera and change camera mode from air to surface
@@ -1010,6 +1046,9 @@ void keyboard_proc(unsigned char key, int x, int y) {
 		break;
 	case 'u': // toggle timing profiler
 		toggle_timing_profiler(); // show_bool_option_change()?
+		break;
+	case 'O': // text prompt (for future use)
+		show_text_prompt();
 		break;
 
 	case '=': // increase temp
@@ -1226,7 +1265,7 @@ void keyboard_proc(unsigned char key, int x, int y) {
 	case '4': // toggle occlusion culling / tiled terrain/voxel/mesh detail normal maps
 		display_mode ^= 0x08;   show_bool_option_change("Occlusion Culling", (display_mode & 0x08)); break;
 	case '5': // walk on snow/ship shadows/reflections/debugging
-		display_mode ^= 0x10;   show_bool_option_change("Debug Mode", (display_mode & 0x10)); break;
+		display_mode ^= 0x10;   show_bool_option_change((camera_in_building ? "Indirect Lighting" : "Debug Mode"), (display_mode & 0x10)); break;
 	case '6': // toggle water reflections, bump maps, bloom, and map view lighting/shadows
 		display_mode ^= 0x20;   break;
 	case '7': // toggle snow accumulation, clouds, and universe mode multithreading
@@ -1379,9 +1418,7 @@ void keyboard2(int key, int x, int y) { // handling of special keys
 		break;
 
 	case GLUT_KEY_F2: // switch game mode
-		if (world_mode == WMODE_UNIVERSE) break;
-		++game_mode;
-		change_game_mode();
+		next_game_mode();
 		break;
 
 	case GLUT_KEY_F3:
@@ -1663,14 +1700,17 @@ bool kw_to_val_map_float_check_t::maybe_set_from_fp(string const &str, FILE *fp)
 	auto it(m.find(str));
 	if (it == m.end()) return 0;
 	if (!read_type_t(fp, *it->second.v)) {cfg_err(opt_prefix + str + " keyword", error);}
-	if (!it->second.check_val()) {cerr << "Illegal value: " << *it->second.v << "; "; cfg_err(opt_prefix + str + " keyword", error);}
+	if (!it->second.check_val()) {cerr << "Illegal value: " << *it->second.v << "; "; cfg_err(opt_prefix + " " + str + " keyword", error);}
 	return 1;
 }
 template class kw_to_val_map_t<colorRGBA>; // explicit instantiation of this one because it's used for buildings but not here
 
 
 bool bmp_file_to_binary_array(char const *const fn, unsigned char **&data) {
-	if (strlen(fn) > 0) {if (!bmp_to_chars(fn, data)) return 0;}
+	if (strlen(fn) > 0) {
+		if (!bmp_to_chars(fn, data)) return 0;
+		mesh_size_locked = 1;
+	}
 	return 1;
 }
 
@@ -1757,7 +1797,6 @@ int load_config(string const &config_file) {
 	kwmb.add("disable_tt_water_reflect", disable_tt_water_reflect);
 	kwmb.add("use_model_lod_blocks", use_model_lod_blocks);
 	kwmb.add("flatten_tt_mesh_under_models", flatten_tt_mesh_under_models);
-	kwmb.add("show_map_view_mandelbrot", show_map_view_mandelbrot);
 	kwmb.add("def_texture_compress", def_tex_compress);
 	kwmb.add("smileys_chase_player", smileys_chase_player);
 	kwmb.add("disable_fire_delay", disable_fire_delay);
@@ -1780,6 +1819,11 @@ int load_config(string const &config_file) {
 	kwmb.add("pre_load_full_tiled_terrain", pre_load_full_tiled_terrain);
 	kwmb.add("disable_blood", disable_blood);
 	kwmb.add("enable_model_animations", enable_model_animations);
+	kwmb.add("rotate_trees", rotate_trees);
+	kwmb.add("invert_model3d_faces", invert_model3d_faces);
+	kwmb.add("play_gameplay_alert", play_gameplay_alert);
+	kwmb.add("vsync_enabled", vsync_enabled);
+	kwmb.add("enable_ground_csm", enable_ground_csm);
 
 	kw_to_val_map_t<int> kwmi(error);
 	kwmi.add("verbose", verbose_mode);
@@ -1814,6 +1858,7 @@ int load_config(string const &config_file) {
 	kwmi.add("init_game_mode", game_mode);
 	kwmi.add("init_num_balls", init_num_balls);
 	kwmi.add("use_voxel_rocks", use_voxel_rocks); // 0=never, 1=always, 2=only when no vegetation
+	kwmi.add("default_anim_id", default_anim_id);
 
 	kw_to_val_map_t<unsigned> kwmu(error);
 	kwmu.add("grass_density", grass_density);
@@ -1832,6 +1877,8 @@ int load_config(string const &config_file) {
 	kwmu.add("snow_coverage_resolution", snow_coverage_resolution);
 	kwmu.add("dlight_grid_bitshift", DL_GRID_BS);
 	kwmu.add("tiled_terrain_gen_heightmap_sz", tiled_terrain_gen_heightmap_sz);
+	kwmu.add("game_mode_disable_mask", game_mode_disable_mask);
+	kwmu.add("show_map_view_fractal", show_map_view_fractal);
 
 	kw_to_val_map_t<float> kwmf(error);
 	kwmf.add("gravity", base_gravity);
@@ -1881,7 +1928,6 @@ int load_config(string const &config_file) {
 	kwmf.add("sm_tree_scale", sm_tree_scale);
 	kwmf.add("model_auto_tc_scale", model_auto_tc_scale);
 	kwmf.add("model_triplanar_tc_scale", model_triplanar_tc_scale);
-	kwmf.add("shadow_map_pcf_offset", shadow_map_pcf_offset);
 	kwmf.add("smap_thresh_scale", smap_thresh_scale);
 	kwmf.add("cloud_height_offset", cloud_height_offset);
 	kwmf.add("dodgeball_metalness", dodgeball_metalness);
@@ -2010,6 +2056,11 @@ int load_config(string const &config_file) {
 		}
 		else if (str == "mesh_size") {
 			if (fscanf(fp, "%i%i%i", &MESH_X_SIZE, &MESH_Y_SIZE, &MESH_Z_SIZE) != 3) cfg_err("mesh size command", error);
+
+			if (mesh_size_locked) {
+				cerr << "Error: mesh_size command cannot be called after loading a file that depends on the size" << endl;
+				error = 1;
+			}
 		}
 		else if (str == "scene_size") {
 			if (fscanf(fp, "%f%f%f", &X_SCENE_SIZE, &Y_SCENE_SIZE, &Z_SCENE_SIZE) != 3) cfg_err("scene size command", error);
@@ -2126,7 +2177,9 @@ int load_config(string const &config_file) {
 		}
 		else if (str == "skybox_tex") {
 			if (!read_str(fp, strc)) cfg_err("skybox_tex", error);
-			skybox_tid = get_texture_by_name(string(strc), 0, 0, 0); // clamp
+			string const texture_name = string(strc);
+			if (!check_texture_file_exists(texture_name)) {std::cerr << "Error: Failed to load skybox texture '" << texture_name << "'; Disabling skybox" << endl;}
+			else {skybox_tid = get_texture_by_name(texture_name, 0, 0, 0);} // clamp
 		}
 		else if (str == "ship_def_file") {
 			if (!read_str(fp, ship_def_file)) cfg_err("ship_def_file command", error);
@@ -2160,7 +2213,12 @@ int load_config(string const &config_file) {
 			if (fscanf(fp, "%u%u%u%u%u", &NPTS, &NRAYS, &LOCAL_RAYS, &GLOBAL_RAYS, &DYNAMIC_RAYS) < 3) cfg_err("num_light_rays command", error);
 		}
 		else if (str == "num_threads") {
-			if (!read_nonzero_uint(fp, NUM_THREADS) || NUM_THREADS > 100) cfg_err("num_threads", error);
+			if (!read_uint(fp, NUM_THREADS) || NUM_THREADS > 100) cfg_err("num_threads", error);
+			
+			if (NUM_THREADS == 0) { // auto special case
+				unsigned const num_hw_threads(std::thread::hardware_concurrency()); // includes hyperthreading
+				NUM_THREADS = ((num_hw_threads > 0) ? num_hw_threads : 4); // default to 4 if the call returns 0
+			}
 		}
 		else if (str == "ambient_lighting_scale") {
 			if (fscanf(fp, "%f%f%f", &ambient_lighting_scale.R, &ambient_lighting_scale.G, &ambient_lighting_scale.B) != 3) cfg_err("ambient_lighting_scale command", error);
@@ -2204,12 +2262,12 @@ int load_config(string const &config_file) {
 	teams          = max(teams,          1);
 	tree_mode      = tree_mode % 4;
 	use_core_context = init_core_context;
-	if (shadow_map_sz > 0 && shadow_map_pcf_offset == 0.0) {shadow_map_pcf_offset = 40.0/shadow_map_sz;}
-	if (universe_only)   {world_mode = WMODE_UNIVERSE;}
+	if (universe_only) {world_mode = WMODE_UNIVERSE;}
 	if (tiled_terrain_only || start_in_inf_terrain) {world_mode = WMODE_INF_TERRAIN;}
 	//if (read_heightmap && dynamic_mesh_scroll) cout << "Warning: read_heightmap and dynamic_mesh_scroll are currently incompatible options as the heightmap does not scroll." << endl;
 	DISABLE_WATER = INIT_DISABLE_WATER;
 	XY_MULT_SIZE  = MESH_X_SIZE*MESH_Y_SIZE; // for bmp_to_chars() allocation
+	precip_dist_scale = CAMERA_RADIUS/DEF_CAMERA_RADIUS;
 	if (!bmp_file_to_binary_array(md_fname, mesh_draw    )) {error = 1;}
 	if (!bmp_file_to_binary_array(we_fname, water_enabled)) {error = 1;}
 	if (!bmp_file_to_binary_array(fw_fname, flower_weight)) {error = 1;}

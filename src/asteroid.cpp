@@ -43,30 +43,23 @@ extern vector<cached_obj> all_ships;
 extern vector<us_weapon> us_weapons;
 extern usw_ray_group trail_rays;
 
-shader_t cached_voxel_shaders[9]; // one for each value of num_lights (0-8)
-shader_t cached_proc_shaders [9];
+shader_t cached_voxel_shader, cached_proc_shader;
 
 
 unsigned calc_lod_pow2(unsigned max_ndiv, unsigned ndiv);
-
 
 int get_spherical_texture(int tid) {
 	//return ((tid == MOON_TEX) ? ROCK_SPHERE_TEX : tid);
 	return tid; // ROCK_SPHERE_TEX no longer matches MOON_TEX
 }
 
-
 void clear_cached_shaders() {
-
-	for (unsigned i = 0; i < 9; ++i) {
-		cached_voxel_shaders[i].end_shader();
-		cached_proc_shaders [i].end_shader();
-	}
+	cached_voxel_shader.end_shader();
+	cached_proc_shader .end_shader();
 }
 
 
 class uobj_asteroid_sphere : public uobj_asteroid {
-
 public:
 	uobj_asteroid_sphere(point const &pos_, float radius_, int tid, unsigned lt) : uobj_asteroid(pos_, radius_, tid, lt) {}
 	virtual void draw_obj(uobj_draw_data &ddata) const {ddata.draw_asteroid(tex_id);}
@@ -74,7 +67,6 @@ public:
 
 
 class uobj_asteroid_rock3d : public uobj_asteroid {
-
 	rock_shape3d model3d;
 
 public:
@@ -107,14 +99,13 @@ public:
 	}
 	virtual void draw_obj(uobj_draw_data &ddata) const {
 		unsigned const num_lights(ddata.first_pass ? min(8U, num_exp_lights+2U) : 2); // only enable exp_lights on first pass
-		shader_t &s(cached_proc_shaders[num_lights]);
+		shader_t &s(cached_proc_shader);
 		
 		if (s.is_setup()) { // already setup
 			s.enable();
 		}
 		else {
 			bind_3d_texture(get_noise_tex_3d(64, 1)); // grayscale noise
-			s.set_int_prefix("num_lights", num_lights, 1); // FS
 			s.set_prefix("#define NO_SPECULAR",   1); // FS (optional/optimization)
 			s.set_prefix("#define NUM_OCTAVES 8", 0); // VS
 			s.set_vert_shader("perlin_clouds_3d.part*+procedural_rock");
@@ -125,6 +116,7 @@ public:
 			s.add_uniform_float("noise_scale",  0.1);
 			s.add_uniform_float("height_scale", AST_PROC_HEIGHT);
 		}
+		s.add_uniform_int("num_lights", num_lights);
 		s.set_cur_color(colorRGBA(0.5, 0.45, 0.4, 1.0)); // Note: ignores color_a
 		end_texture();
 		draw_sphere_vbo(all_zeros, 1.0, 3*ddata.ndiv/2, 0); // ndiv may be too large to use a vbo
@@ -135,7 +127,6 @@ public:
 
 
 class uobj_asteroid_destroyable : public uobj_asteroid {
-
 public:
 	uobj_asteroid_destroyable(point const &pos_, float radius_, int tid, unsigned lt) : uobj_asteroid(pos_, radius_, tid, lt) {}
 	virtual bool apply_damage(float damage, point &hit_pos) = 0;
@@ -309,14 +300,13 @@ void enable_bump_map_pre(shader_t &shader) {
 	shader.set_prefix("in vec3 vpos, normal;",   1); // FS
 }
 void enable_bump_map_post(shader_t &shader, unsigned tu_id, float tscale) {
-	select_multitex(get_texture_by_name("normal_maps/moon_NRM.jpg", 1, 0), tu_id, 1);
+	select_texture(get_texture_by_name("normal_maps/moon_NRM.jpg", 1, 0), tu_id);
 	shader.add_uniform_int("bump_map", tu_id);
 	shader.add_uniform_float("bump_tex_scale", tscale);
 }
 
 
 class uobj_asteroid_voxel : public uobj_asteroid_destroyable {
-
 	mutable voxel_model_space model; // const problems with draw()
 	static noise_texture_manager_t global_asteroid_ntg;
 
@@ -351,7 +341,7 @@ public:
 		if (ddata.ndiv <= 4) {ddata.draw_asteroid(model.get_params().tids[0]); return;}
 		unsigned const num_lights(ddata.first_pass ? min(8U, num_exp_lights+2U) : 2); // only enable exp_lights on first pass
 		unsigned const lod_level(min(16U/ddata.ndiv, NUM_VOX_AST_LODS-1));
-		shader_t &s(cached_voxel_shaders[num_lights]);
+		shader_t &s(cached_voxel_shader);
 		
 		if (s.is_setup()) { // already setup
 			s.enable();
@@ -359,7 +349,6 @@ public:
 		else {
 			bool const use_bmap = 1;
 			if (use_bmap) {enable_bump_map_pre(s);}
-			s.set_int_prefix("num_lights", num_lights, 1); // FS
 			s.set_prefix("#define NO_SPECULAR", 1); // FS (optional/optimization)
 			if (allow_shader_invariants) {s.set_prefix("invariant gl_Position;", 0);} // VS
 			s.set_vert_shader("asteroid");
@@ -378,6 +367,7 @@ public:
 		}
 		if ( ddata.first_pass) {model.setup_tex_gen_for_rendering(s);}
 		if (!ddata.first_pass) {s.add_uniform_float("depth_bias", -1.0E-6);} // depth bias hack (other asteroid types?)
+		s.add_uniform_int("num_lights", num_lights);
 		s.add_uniform_color("color", ddata.color_a);
 		if (!is_light_enabled(0)) {clear_colors_and_disable_light(0, &s);} // if there's no sun, make sure this shader knows it
 		glEnable(GL_CULL_FACE);
@@ -864,21 +854,6 @@ void uasteroid_belt::draw_detail(point_d const &pos_, point const &camera, bool 
 		if (is_ice) {shader.clear_specular();} // reset specular
 		shader.end_shader();
 	}
-	if (0 && !no_asteroid_dust) { // draw fine dust as fog
-		shader.begin_color_only_shader(colorRGBA(0.5, 0.5, 0.5, 0.5));
-		select_texture(WHITE_TEX); // untextured
-		glEnable(GL_CULL_FACE);
-		glCullFace(GL_FRONT);
-		fgPushMatrix();
-		global_translate(afpos);
-		rotate_into_plus_z(orbital_plane_normal);
-		scale_by(orbit_scale);
-		draw_torus(all_zeros, inner_radius, outer_radius, N_SPHERE_DIV, N_SPHERE_DIV);
-		fgPopMatrix();
-		glDisable(GL_CULL_FACE);
-		glCullFace(GL_BACK);
-		shader.end_shader();
-	}
 	if (world_mode == WMODE_UNIVERSE && !no_asteroid_dust && !cloud_insts.empty() && (display_mode & 0x0100) != 0) { // draw volumetric fog/dust clouds
 		float const def_cloud_radius((is_planet_ab() ? 0.018 : 0.009)*radius);
 		
@@ -1362,12 +1337,14 @@ void uasteroid_belt::remove_asteroid(unsigned ix) {
 void uasteroid_cont::detach_asteroid(unsigned ix) {
 
 	assert(ix < size());
-	// create a new asteroid from the instance and copy all the parameters
+	// create a new asteroid (AS_MODEL_HMAP) from the instance and copy all the parameters
 	uasteroid const &inst(operator[](ix));
 	uobj_asteroid *asteroid(uobj_asteroid::create(inst.pos, inst.radius, AST_FIELD_MODEL, inst.get_fragment_tid(inst.pos), inst.get_rseed(), 0)); // lt=0
-	asteroid->set_vel(inst.get_velocity());
-	asteroid->set_scale(inst.get_scale());
-	// FIXME: rotation
+	asteroid->set_vel  (inst.get_velocity());
+	asteroid->set_scale(inst.get_scale   ());
+	// TODO: what about rotations? set from inst.rot_axis/inst.rot_ang? but dir and upv aren't used for drawing uobj_asteroid_hmap
+	//asteroid->set_dir();
+	//asteroid->set_upv();
 	add_uobj(asteroid);
 	remove_asteroid(ix);
 }

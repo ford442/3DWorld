@@ -11,7 +11,7 @@
 float    const SMOKE_ZVEL      = 3.0;
 unsigned const NUM_STARS       = 5000;
 unsigned const MAX_BUBBLES     = 2500;
-unsigned const MAX_PART_CLOUDS = 250;
+unsigned const MAX_PART_CLOUDS = 300;
 unsigned const MAX_FIRES       = 75;
 unsigned const MAX_DECALS      = 5000;
 
@@ -73,7 +73,6 @@ void gen_and_draw_stars(float alpha, bool half_sphere, bool no_update) {
 
 
 void gen_star(star &star1, int half_sphere) {
-
 	float const radius(0.7f*(FAR_CLIP+X_SCENE_SIZE)), theta(rand_uniform(0.0, TWO_PI));
 	float phi(gen_rand_phi<rand_uniform>());
 	if (!half_sphere && (rand()&1) == 0) phi = PI - phi;
@@ -84,44 +83,34 @@ void gen_star(star &star1, int half_sphere) {
 
 
 void rand_xy_point(float zval, point &pt, unsigned flags) {
-
 	for (unsigned i = 0; i < 2; ++i) {
 		pt[i] = ((flags & FALL_EVERYWHERE) ? 1.5 : 1.0)*SCENE_SIZE[i]*signed_rand_float();
 	}
 	pt.z = zval;
 }
-
-
 void gen_object_pos(point &position, unsigned flags) {
-
 	rand_xy_point((CLOUD_CEILING + ztop)*(1.0 + rand_uniform(-0.1, 0.1)), position, flags);
 }
 
 
 void basic_physics_obj::init(point const &p) {
-
 	status = 1;
 	time   = 0;
 	pos    = p;
 }
-
-
 void basic_physics_obj::init_gen_rand(point const &p, float rxy, float rz) {
-
 	init(p);
 	pos += point(rand_uniform(-rxy, rxy), rand_uniform(-rxy, rxy), rand_uniform(-rz, rz));
 }
 
 
 void dwobject::print_and_terminate() const { // only called when there is an error
-
 	cout << "pos = " << pos.str() << ", vel = " << velocity.str() << ", type = " << int(type) << ", status = " << int(status) << endl;
 	assert(0);
 }
 
 
 void bubble::gen(point const &p, float r, colorRGBA const &c) {
-
 	init_gen_rand(p, 0.005, 0.01);
 	radius   = ((r == 0.0) ? rand_uniform(0.001, 0.004) : r);
 	velocity = rand_uniform(0.15, 0.2);
@@ -131,7 +120,7 @@ void bubble::gen(point const &p, float r, colorRGBA const &c) {
 
 
 void particle_cloud::gen(point const &p, colorRGBA const &bc, vector3d const &iv, float r, float den, float dark, float dam,
-	int src, int dt, bool as, bool use_parts, bool nl, float spread)
+	int src, int dt, bool as, bool use_parts, bool nl, float spread, float tsfact)
 {
 	init_gen_rand(p, 0.005*spread, 0.025*spread);
 	acc_smoke  = as;
@@ -144,6 +133,7 @@ void particle_cloud::gen(point const &p, colorRGBA const &bc, vector3d const &iv
 	darkness   = dark;
 	density    = den;
 	damage     = dam;
+	timestep_factor = tsfact;
 	no_lighting= nl;
 	red_only   = 0;
 
@@ -207,13 +197,10 @@ void decal_obj::gen(point const &p, float r, float ang, vector3d const &o, int l
 
 
 void gen_bubble(point const &pos, float r, colorRGBA const &c) {
-
 	if (animate2 && begin_motion) {bubbles[bubbles.choose_element()].gen(pos, r, c);}
 }
 
-
 void gen_line_of_bubbles(point const &p1, point const &p2, float r, colorRGBA const &c) {
-
 	//RESET_TIME;
 	if (!animate2) return;
 	point cur(p1);
@@ -237,26 +224,21 @@ void gen_line_of_bubbles(point const &p1, point const &p2, float r, colorRGBA co
 
 
 bool gen_arb_smoke(point const &pos, colorRGBA const &bc, vector3d const &iv, float r, float den, float dark, float dam,
-	int src, int dt, bool as, float spread, bool no_lighting)
+	int src, int dt, bool as, float spread, bool no_lighting, float tsfact)
 {
 	if (!animate2 || is_underwater(pos) || is_under_mesh(pos)) return 0;
 	// Note: we scale by 0.62 since we're using BLUR_CENT_TEX rather than BLUR_TEX to draw smoke (to reduce fill rate)
 	unsigned ix(0);
 	if (!part_clouds.choose_element_not_newer_than(1.0*TICKS_PER_SECOND, ix)) return 0; // no available smoke slots, and none older than 1s
-	part_clouds[ix].gen(pos, bc, iv, 0.62*r, den, dark, dam, src, dt, as, 1, no_lighting, spread);
+	part_clouds[ix].gen(pos, bc, iv, 0.62*r, den, dark, dam, src, dt, as, 1, no_lighting, spread, tsfact);
 	return 1;
 }
-
-
 bool gen_smoke(point const &pos, float zvel_scale, float radius_scale, colorRGBA const &color, bool no_lighting) {
-
 	return gen_arb_smoke(pos, color, vector3d(0.0, 0.0, SMOKE_ZVEL*zvel_scale),
 		radius_scale*rand_uniform(0.01, 0.025), rand_uniform(0.7, 0.9), rand_uniform(0.75, 0.95), 0.0, NO_SOURCE, SMOKE, 1, 1.0, no_lighting);
 }
 
-
 bool gen_fire(point const &pos, float size, int source, bool allow_close, bool is_static, float light_bwidth, float intensity) {
-
 	assert(size > 0.0);
 	if (!is_over_mesh(pos) || is_underwater(pos)) return 0; // off the mesh or under water/ice
 
@@ -271,7 +253,6 @@ bool gen_fire(point const &pos, float size, int source, bool allow_close, bool i
 	fires[fires.choose_element()].gen(pos, size, intensity, source, is_static, light_bwidth);
 	return 1;
 }
-
 
 void gen_decal(point const &pos, float radius, vector3d const &orient, int tid, int cid, colorRGBA const &color,
 	bool is_glass, bool rand_angle, int lifetime, float min_dist_scale, tex_range_t const &tr)
@@ -297,9 +278,7 @@ void gen_decal(point const &pos, float radius, vector3d const &orient, int tid, 
 	has_decals = 1;
 }
 
-
 void gen_particles(point const &pos, unsigned num, float lt_scale, bool fade) { // lt_scale: 0.0 = full lt, 1.0 = no lt
-
 	obj_group &objg(obj_groups[coll_id[PARTICLE]]);
 
 	for (unsigned o = 0; o < num; ++o) {
@@ -429,7 +408,7 @@ template<typename base> vector3d rand_gen_template_t<base>::signed_rand_vector_x
 }
 
 template<typename base> vector3d rand_gen_template_t<base>::signed_rand_vector_norm(float scale) {
-	// FIXME: this is more correct (more uniform), but changes universe mode generated content
+	// Note: this is more correct (more uniform), but changes universe mode generated content
 	//return scale*signed_rand_vector_spherical().get_norm();
 	assert(scale > 0.0);
 
@@ -466,6 +445,8 @@ template<typename base> vector3d rand_gen_template_t<base>::signed_rand_vector_s
 	float const u(signed_rand_float()), theta(TWO_PI*signed_rand_float()), xy_term(sqrt(1.0f-u*u));
 	return scale*vector3d(xy_term*cos(theta), xy_term*sin(theta), u);
 }
+
+template<typename base> vector3d rand_gen_template_t<base>::signed_rand_vector_spherical_xy_norm() {return signed_rand_vector_spherical_xy().get_norm();}
 
 template<typename base> point rand_gen_template_t<base>::gen_rand_cube_point(cube_t const &c) {
 	point pt;

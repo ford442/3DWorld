@@ -471,6 +471,30 @@
     <ClCompile Include="src\building_animal_draw.cpp">
       <Filter>Source Files\City</Filter>
     </ClCompile>
+    <ClCompile Include="src\city_obj_placer.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
+    <ClCompile Include="src\building_room_obj_place.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
+    <ClCompile Include="src\building_ext_basement.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
+    <ClCompile Include="src\building_water.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
+    <ClCompile Include="src\city_birds.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
+    <ClCompile Include="src\building_clocks.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
+    <ClCompile Include="src\building_fish.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
+    <ClCompile Include="src\city_skyway.cpp">
+      <Filter>Source Files\City</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\3DWorld.h">
@@ -687,6 +711,9 @@
       <Filter>Source Files\City</Filter>
     </ClInclude>
     <ClInclude Include="src\building_animals.h">
+      <Filter>Source Files\City</Filter>
+    </ClInclude>
+    <ClInclude Include="src\nav_grid.h">
       <Filter>Source Files\City</Filter>
     </ClInclude>
   </ItemGroup>
@@ -1463,6 +1490,57 @@
     </None>
     <None Include="shaders\model_animation.part.vert">
       <Filter>Shaders\vert</Filter>
+    </None>
+    <None Include="shaders\msdf_text.frag">
+      <Filter>Shaders\frag</Filter>
+    </None>
+    <None Include="shaders\world_space_offset_rot.part.vert">
+      <Filter>Shaders\vert</Filter>
+    </None>
+    <None Include="shaders\building_water.frag">
+      <Filter>Shaders\frag</Filter>
+    </None>
+    <None Include="shaders\building_water.vert">
+      <Filter>Shaders\vert</Filter>
+    </None>
+    <None Include="shaders\postproc_water_fog.frag">
+      <Filter>Shaders\frag\Fullscreen</Filter>
+    </None>
+    <None Include="shaders\convert_to_grayscale.frag">
+      <Filter>Shaders\frag\Fullscreen</Filter>
+    </None>
+    <None Include="shaders\lava_lamp.frag">
+      <Filter>Shaders\frag</Filter>
+    </None>
+    <None Include="shaders\shadow_map.vert">
+      <Filter>Shaders\vert</Filter>
+    </None>
+    <None Include="shaders\empty_shader.frag">
+      <Filter>Shaders\frag</Filter>
+    </None>
+    <None Include="shaders\alpha_mask_shadow.frag">
+      <Filter>Shaders\frag</Filter>
+    </None>
+    <None Include="shaders\csm_layers.geom">
+      <Filter>Shaders\geom</Filter>
+    </None>
+    <None Include="shaders\shadow_map_csm.vert">
+      <Filter>Shaders\vert</Filter>
+    </None>
+    <None Include="shaders\passthrough.geom">
+      <Filter>Shaders\geom</Filter>
+    </None>
+    <None Include="shaders\shadow_map_csm_tc.vert">
+      <Filter>Shaders\vert</Filter>
+    </None>
+    <None Include="shaders\csm_layers_tc.geom">
+      <Filter>Shaders\geom</Filter>
+    </None>
+    <None Include="shaders\shadow_map_csm_xlate_scale.vert">
+      <Filter>Shaders\vert</Filter>
+    </None>
+    <None Include="shaders\caustics_overlay.frag">
+      <Filter>Shaders\frag</Filter>
     </None>
   </ItemGroup>
   <ItemGroup>

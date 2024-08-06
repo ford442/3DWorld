@@ -895,6 +895,7 @@ void sd_sphere_vbo_d::draw_ndiv_pow2_vbo(unsigned draw_ndiv) {
 	unsigned const lod(draw_setup(draw_ndiv));
 	if (faceted) {glDrawArrays(GL_TRIANGLES, 0, 6*ndiv*ndiv);} // ndiv is ignored
 	else {glDrawRangeElements(GL_TRIANGLE_STRIP, 0, (ndiv+1)*(ndiv+1), get_count(lod), get_index_type_enum(), get_index_ptr(lod));}
+	++num_frame_draw_calls;
 	post_render();
 }
 
@@ -1133,31 +1134,25 @@ void line_tquad_draw_t::draw(float noise_scale) const { // supports quads and tr
 
 void pos_dir_up::draw_frustum() const {
 
-	float const nf_val[2] = {near_, far_};
-	point pts[2][4]; // {near, far} x {ll, lr, ur, ul}
+	point pts[8]; // {near, far} x {ll, lr, ur, ul}
 	vector<vert_wrap_t> verts;
+	get_frustum_corners(pts);
 
 	for (unsigned d = 0; d < 2; ++d) {
-		point const center(pos + dir*nf_val[d]); // plane center
-		float const dy(nf_val[d]*tterm), dx(A*dy); // d*sin(theta)
-		pts[d][0] = center - cp*dx - upv_*dy;
-		pts[d][1] = center + cp*dx - upv_*dy;
-		pts[d][2] = center + cp*dx + upv_*dy;
-		pts[d][3] = center - cp*dx + upv_*dy;
-		for (unsigned i = 0; i < 4; ++i) {verts.push_back(pts[d][i]);} // near and far clipping planes
+		for (unsigned i = 0; i < 4; ++i) {verts.push_back(pts[4*d+i]);} // near and far clipping planes
 	}
 	for (unsigned i = 0; i < 4; ++i) { // sides
-		verts.push_back(pts[0][(i+0)&3]);
-		verts.push_back(pts[0][(i+1)&3]);
-		verts.push_back(pts[1][(i+1)&3]);
-		verts.push_back(pts[1][(i+0)&3]);
+		verts.push_back(pts[0+((i+0)&3)]);
+		verts.push_back(pts[0+((i+1)&3)]);
+		verts.push_back(pts[4+((i+1)&3)]);
+		verts.push_back(pts[4+((i+0)&3)]);
 	}
 	draw_quad_verts_as_tris(verts);
 }
 
 
-void draw_simple_cube(cube_t const &c, bool texture, unsigned dim_mask) {
-	draw_cube(c.get_cube_center(), c.dx(), c.dy(), c.dz(), texture, 1.0, 0, nullptr, dim_mask);
+void draw_simple_cube(cube_t const &c, bool texture, unsigned dim_mask, vector3d const *const view_dir) {
+	draw_cube(c.get_cube_center(), c.dx(), c.dy(), c.dz(), texture, 1.0, 0, view_dir, dim_mask);
 }
 
 // need to do something with tex coords for scale
@@ -1272,6 +1267,7 @@ void draw_sphere_vbo_pre_bound(int ndiv, bool textured, bool half, unsigned num_
 	assert(off1 < off2);
 	check_mvm_update();
 	glDrawArraysInstanced(GL_TRIANGLE_STRIP, off1, (off2 - off1), num_instances); // uses triangle strips separated by degenerate triangles
+	++num_frame_draw_calls;
 }
 
 
@@ -1281,14 +1277,11 @@ void begin_sphere_draw(bool textured) {
 	assert(!sphere_vbo_bound); sphere_vbo_bound = 1;
 	bind_draw_sphere_vbo(textured, 1);
 }
-
 void end_sphere_draw() {
 	assert(sphere_vbo_bound); sphere_vbo_bound = 0;
 	bind_vbo(0);
 }
-
 void draw_sphere_vbo_raw(int ndiv, bool textured, bool half, unsigned num_instances) {
-
 	if (!sphere_vbo_bound) {bind_draw_sphere_vbo(textured, 1);}
 	draw_sphere_vbo_pre_bound(ndiv, textured, half, num_instances);
 	if (!sphere_vbo_bound) {bind_vbo(0);}

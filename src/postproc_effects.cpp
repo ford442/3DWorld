@@ -23,20 +23,17 @@ bool player_is_drowning();
 float get_player_drunkenness();
 
 
-void bind_depth_buffer() {
-
+void bind_depth_buffer(unsigned tu_id=0) {
 	if (frame_counter != depth_buffer_frame) {depth_buffer_to_texture(depth_tid);} // depth texture is not valid for this frame, create it
 	depth_buffer_frame = frame_counter;
 	assert(depth_tid > 0);
-	bind_2d_texture(depth_tid);
+	bind_texture_tu(depth_tid, tu_id);
 }
-
-void bind_frame_buffer_RGB() {
-	
+void bind_frame_buffer_RGB(unsigned tu_id=0) {
 	if (frame_counter != color_buffer_frame) {frame_buffer_RGB_to_texture(frame_buffer_RGB_tid);} // FB RGB texture is not valid for this frame, create it
 	color_buffer_frame = frame_counter;
 	assert(frame_buffer_RGB_tid > 0);
-	bind_2d_texture(frame_buffer_RGB_tid);
+	bind_texture_tu(frame_buffer_RGB_tid, tu_id);
 }
 
 void draw_ortho_screen_space_triangle() {
@@ -62,7 +59,6 @@ void draw_ortho_screen_space_triangle() {
 void set_xy_step(shader_t &s) {s.add_uniform_vector2d("xy_step", vector2d(1.0/window_width, 1.0/window_height));}
 
 void setup_depth_tex(shader_t &s, int tu_id) {
-
 	set_xy_step(s);
 	s.add_uniform_int("depth_tex", tu_id);
 	s.add_uniform_float("znear", NEAR_CLIP);
@@ -70,7 +66,6 @@ void setup_depth_tex(shader_t &s, int tu_id) {
 }
 
 void fill_screen_white_and_end_shader(shader_t &s) {
-
 	s.set_cur_color(WHITE);
 	draw_ortho_screen_space_triangle();
 	s.end_shader();
@@ -150,7 +145,7 @@ void add_ssao() {
 	fill_screen_white_and_end_shader(s);
 }
 
-void add_color_only_effect(string const &frag_shader, float intensity=1.0, float time_scale=1.0, float pos_scale=0.0) {
+void add_color_only_effect(string const &frag_shader, float intensity=1.0, float time_scale=1.0, float pos_scale=0.0, colorRGBA const &color_mod=WHITE) {
 
 	static float time(0.0);
 	if (animate2) {time += time_scale*fticks;}
@@ -163,26 +158,41 @@ void add_color_only_effect(string const &frag_shader, float intensity=1.0, float
 	if (pos_scale != 0.0) {s.add_uniform_float("pos_scale", pos_scale);} // not all shaders have this uniform
 	s.add_uniform_int("frame_buffer_tex", 0);
 	s.add_uniform_float("time", time); // may not be used
-	select_multitex(NOISE_TEX, 1);
+	s.add_uniform_color("color_mod", color_mod); // may not be used
+	select_texture(NOISE_TEX, 1);
 	s.add_uniform_int("noise_tex", 1); // Note: used for heat waves effect, could be used for others
 	set_xy_step(s); // may not be used
 	fill_screen_white_and_end_shader(s);
 	color_buffer_frame = 0; // reset to invalidate buffer
 }
 
-void add_vignette() {
+void add_vignette(colorRGBA const &color) {
 
+	if (color.A == 0.0) return;
 	bind_frame_buffer_RGB();
 	shader_t s;
 	s.set_vert_shader("no_lighting_tex_coord");
 	s.set_frag_shader("vignette");
 	s.begin_shader();
 	s.add_uniform_int("frame_buffer_tex", 0);
-	s.add_uniform_color("edge_color", vignette_color);
+	s.add_uniform_color("edge_color", color);
 	fill_screen_white_and_end_shader(s);
 	color_buffer_frame = 0; // reset to invalidate buffer
 }
 
+void postproc_convert_to_grayscale(unsigned xsize, unsigned ysize) {
+
+	bind_frame_buffer_RGB();
+	shader_t s;
+	s.set_vert_shader("no_lighting_tex_coord");
+	s.set_frag_shader("convert_to_grayscale");
+	s.begin_shader();
+	// since the screen resolution may be different, we have to scale the texture coordinates
+	s.add_uniform_float("xscale", float(xsize)/float(window_width ));
+	s.add_uniform_float("yscale", float(ysize)/float(window_height));
+	fill_screen_white_and_end_shader(s);
+	color_buffer_frame = 0; // reset to invalidate buffer
+}
 
 void add_sphere_refract_effect(sphere_t const &sphere, float intensity) {
 
@@ -207,9 +217,7 @@ void add_sphere_refract_effect(sphere_t const &sphere, float intensity) {
 
 void add_depth_of_field(float focus_depth, float dof_val) {
 
-	set_active_texture(1);
-	bind_depth_buffer();
-	set_active_texture(0);
+	bind_depth_buffer(1); // tu_id=1
 	shader_t s;
 
 	for (unsigned dim = 0; dim < 2; ++dim) {
@@ -226,7 +234,7 @@ void add_depth_of_field(float focus_depth, float dof_val) {
 	}
 }
 
-void add_2d_blur() {
+void add_2d_blur() { // faster than add_color_only_effect("screen_space_blur")
 
 	shader_t s;
 
@@ -274,6 +282,27 @@ void add_2d_bloom() {
 	color_buffer_frame = 0; // reset to invalidate buffer and force recreation of texture for second pass
 }
 
+void add_postproc_underwater_fog(float atten_scale, float max_uw_dist, float mud_amt) {
+
+	bind_depth_buffer(1); // tu_id=1
+	shader_t s;
+	bind_frame_buffer_RGB();
+	s.set_vert_shader("no_lighting_tex_coord");
+	s.set_frag_shader("depth_utils.part+postproc_water_fog");
+	s.begin_shader();
+	s.add_uniform_float("max_uw_dist", max_uw_dist);
+	setup_depth_tex(s, 1);
+	setup_shader_underwater_atten(s, atten_scale, mud_amt);
+	fill_screen_white_and_end_shader(s);
+	color_buffer_frame = 0; // reset to invalidate buffer
+}
+
+void apply_player_underwater_effect(colorRGBA const &color_mod=WHITE, float intensity=1.0) {
+	add_2d_blur();
+	if (player_is_drowning())                 {add_color_only_effect("drunken_wave", 1.00*intensity, 1.0, 0.0, color_mod);}
+	else if (world_mode == WMODE_INF_TERRAIN) {add_color_only_effect("drunken_wave", 0.12*intensity, 1.6, 1.6, color_mod);} // reduced but faster effect
+}
+
 void run_postproc_effects() {
 
 	bool const enable_ssao = 0;
@@ -298,10 +327,7 @@ void run_postproc_effects() {
 		add_color_only_effect("drunken_wave", 1.0f*(min(drunkenness, 1.25f) - 0.5f));
 	}
 	else if (camera_underwater) {
-		//add_color_only_effect("screen_space_blur");
-		add_2d_blur();
-		if (player_is_drowning())                 {add_color_only_effect("drunken_wave", 1.0);}
-		else if (world_mode == WMODE_INF_TERRAIN) {add_color_only_effect("drunken_wave", 0.12, 1.6, 1.6);} // reduced but faster effect
+		apply_player_underwater_effect();
 	}
 	else {
 		float const dist_to_fire(sqrt(dist_to_fire_sq)), fire_max_dist(4.0*CAMERA_RADIUS);
@@ -327,7 +353,7 @@ void run_postproc_effects() {
 		else if (have_buildings() && is_night()) {add_2d_bloom();} // allow bloom for building windows at night in TT mode
 	}
 	if (enable_postproc_recolor) {add_color_only_effect("recolor", 0.0);} // add recolor at the very end
-	if (vignette_color.A > 0.0 ) {add_vignette();}
+	if (vignette_color.A > 0.0 ) {add_vignette(vignette_color);}
 
 	if (0 && !prev_mat_valid) { // capture matrices from this frame for use with next frame (if needed in the future)
 		prev_mvm = fgGetMVM();

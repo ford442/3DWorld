@@ -33,9 +33,9 @@ bool model_calc_tan_vect(1); // slower and more memory but sometimes better qual
 extern bool group_back_face_cull, enable_model3d_tex_comp, disable_shader_effects, texture_alpha_in_red_comp, use_model3d_tex_mipmaps, enable_model3d_bump_maps;
 extern bool two_sided_lighting, have_indir_smoke_tex, use_core_context, model3d_wn_normal, invert_model_nmap_bscale, use_z_prepass, all_model3d_ref_update;
 extern bool use_interior_cube_map_refl, enable_model3d_custom_mipmaps, enable_tt_model_indir, no_subdiv_model, auto_calc_tt_model_zvals, use_model_lod_blocks;
-extern bool flatten_tt_mesh_under_models, no_store_model_textures_in_memory, disable_model_textures, allow_model3d_quads, merge_model_objects;
+extern bool flatten_tt_mesh_under_models, no_store_model_textures_in_memory, disable_model_textures, allow_model3d_quads, merge_model_objects, invert_model3d_faces;
 extern unsigned shadow_map_sz, reflection_tid;
-extern int display_mode, animate2;
+extern int display_mode, animate2, default_anim_id;
 extern float model3d_alpha_thresh, model3d_texture_anisotropy, model_triplanar_tc_scale, model_mat_lod_thresh, cobj_z_bias, model_hemi_lighting_scale, light_int_scale[];
 extern double tfticks;
 extern pos_dir_up orig_camera_pdu;
@@ -51,14 +51,13 @@ bool enable_spec_map() {return (ENABLE_SPEC_MAPS && !disable_shader_effects);}
 bool no_sparse_smap_update();
 bool enable_reflection_dynamic_updates();
 string texture_str(int tid);
-bool endswith(string const &value, string const &ending);
 bool use_model3d_bump_maps() {return enable_bump_map();} // global function export
 
 
 // ************ texture_manager ************
 
-unsigned texture_manager::create_texture(string const &fn, bool is_alpha_mask, bool verbose,
-	bool invert_alpha, bool wrap, bool mirror, bool force_grayscale, bool is_nm, bool invert_y, bool no_cache, bool load_now)
+unsigned texture_manager::create_texture(string const &fn, bool is_alpha_mask, bool verbose, bool invert_alpha,
+	bool wrap, bool mirror, bool force_grayscale, bool is_nm, bool invert_y, bool no_cache, bool load_now)
 {
 	assert(!(wrap && mirror)); // can't both be set
 
@@ -74,11 +73,12 @@ unsigned texture_manager::create_texture(string const &fn, bool is_alpha_mask, b
 	if (!no_cache) {tex_map[fn] = tid;}
 	if (verbose) cout << "creating texture " << fn << endl;
 	bool const compress(!is_alpha_mask && enable_model3d_tex_comp);
-	bool const use_mipmaps(use_model3d_tex_mipmaps && !is_alpha_mask);
+	// Note: custom mipmap code is also present in ensure_texture_loaded(), but that may not be called early enough if load_now=0
+	int const use_mipmaps((use_model3d_tex_mipmaps && !is_alpha_mask) ? (enable_model3d_custom_mipmaps ? 4 : 1) : 0);
 	unsigned ncolors((is_alpha_mask || force_grayscale) ? 1 : 3);
 	// type=read_from_file format=auto width height wrap_mir ncolors use_mipmaps name [do_compress]
 	// always RGB wrapped+mipmap (normal map flag set later)
-	textures.push_back(texture_t(0, IMG_FMT_AUTO, 0, 0, (mirror ? 2 : (wrap ? 1 : 0)), ncolors, use_mipmaps, fn, invert_y, compress, model3d_texture_anisotropy, 1.0, is_nm));
+	textures.emplace_back(0, IMG_FMT_AUTO, 0, 0, (mirror ? 2 : (wrap ? 1 : 0)), ncolors, use_mipmaps, fn, invert_y, compress, model3d_texture_anisotropy, 1.0, is_nm);
 	textures.back().invert_alpha = invert_alpha;
 	if (load_now) {ensure_texture_loaded(tid, is_nm);} // must load temp images now
 	return tid; // can't fail
@@ -383,10 +383,8 @@ template<typename T> void indexed_vntc_vect_t<T>::finalize_lod_blocks(unsigned n
 
 
 template<unsigned N> struct vert_to_tri_t {
+	unsigned t[N] = {0}, n=0; // if this vertex is used in more than N triangles we give up and never remove it
 
-	unsigned t[N] = {0}, n; // if this vertex is used in more than N triangles we give up and never remove it
-
-	vert_to_tri_t() : n(0) {}
 	void add(unsigned ix) {if (n < N) {t[n] = ix;} ++n;} // only add if it fits, but always increment n
 	void remove(unsigned tix) {assert(tix < min(n, N)); t[tix] = t[n-1]; --n;} // move last element to position tix
 	unsigned get_first_index_ix(unsigned tix) const {assert(tix < min(n, N)); return 3*t[tix];} // multiply by 3 to convert from triangle to index
@@ -394,7 +392,6 @@ template<unsigned N> struct vert_to_tri_t {
 };
 
 struct merge_entry_t {
-
 	unsigned vix;
 	float val;
 
@@ -443,7 +440,6 @@ template<typename T> void indexed_vntc_vect_t<T>::simplify(vector<unsigned> &out
 		assert(indices[i] < num_verts);
 		vert_to_tri[indices[i]].add(i);
 	}
-
 	// determine which verts/edges can be removed
 	std::priority_queue<merge_entry_t> merge_queue; // of vertices
 
@@ -478,7 +474,6 @@ template<typename T> void indexed_vntc_vect_t<T>::simplify(vector<unsigned> &out
 		float const val(normal_sum.mag()/normal_sum.count);
 		merge_queue.push(merge_entry_t(i, val));
 	}
-
 	// mapping from orig vertex to collapsed (new) vertex
 	unsigned const cand_verts(merge_queue.size());
 	vertex_remap_t remap(num_verts);
@@ -538,14 +533,20 @@ template<typename T> void indexed_vntc_vect_t<T>::simplify_meshoptimizer(vector<
 }
 
 template<typename T> void indexed_vntc_vect_t<T>::simplify_indices(float reduce_target) {
-
 	vector<unsigned> simplified_indices;
 	simplify_meshoptimizer(simplified_indices, reduce_target);
 	indices.swap(simplified_indices);
 }
 
+template<typename T> void indexed_vntc_vect_t<T>::reverse_winding_order(unsigned npts) {
+	if (indices.empty()) return; // unsupported (error?)
+	unsigned const nverts(num_verts());
+	assert((nverts%npts) == 0);
+	for (unsigned i = 0; i < nverts; i += npts) {reverse(indices.begin()+i, indices.begin()+i+npts);}
+	for (auto &v : *this) {v.invert_normal();}
+}
+
 template<typename T> void indexed_vntc_vect_t<T>::clear() {
-	
 	vntc_vect_t<T>::clear();
 	indices.clear();
 	clear_blocks();
@@ -638,7 +639,7 @@ unsigned model3d::get_anim_id(shader_t &shader, string const &prop_name, int ani
 	string const anim_name(shader.get_property(prop_name));
 
 	if (anim_name.empty()) { // no named animation, use the first one; could also use "default" for the name as that matches the default name
-		model_error_logger.log_error("Error: No animation name or ID specified for model '" + filename + "'; Using the first animation");
+		model_error_logger.log_error("Warning: No animation name or ID specified for model '" + filename + "'; Using the first animation");
 		return 0; // use first animation
 	}
 	anim_id = model_anim_data.get_animation_id_by_name(anim_name);
@@ -649,12 +650,29 @@ unsigned model3d::get_anim_id(shader_t &shader, string const &prop_name, int ani
 	}
 	return anim_id;
 }
+void model3d::setup_bone_transforms_cached(bone_transform_data_t &cached, shader_t &shader, float anim_time, int anim_id) {
+	if (!has_animations()) return;
+
+	if (cached.anim_id == anim_id && cached.anim_time == anim_time) {
+		assert(cached.transforms.size() == model_anim_data.bone_transforms.size());
+		add_bone_transforms_to_shader(shader, cached.transforms);
+	}
+	else {
+		setup_bone_transforms(shader, anim_time, anim_id);
+		unsigned const orig_sz(model_anim_data.bone_transforms.size());
+		cached.transforms.swap(model_anim_data.bone_transforms);
+		cached.anim_id   = anim_id;
+		cached.anim_time = anim_time;
+		model_anim_data.bone_transforms.resize(orig_sz); // must be the correct size
+	}
+}
 void model3d::setup_bone_transforms(shader_t &shader, float anim_time, int anim_id) {
 	if (!has_animations()) return;
 	//highres_timer_t timer("Setup Bone Transforms"); // 0.021ms
 	model_anim_data.get_bone_transforms(get_anim_id(shader, "animation_name", anim_id), anim_time);
 	add_bone_transforms_to_shader(shader);
 }
+// do we need a cached version of this one as well?
 void model3d::setup_bone_transforms_blended(shader_t &shader, float anim_time1, float anim_time2, float blend_factor, int anim_id1, int anim_id2) {
 	if (!has_animations()) return;
 	//highres_timer_t timer("Setup Bone Transforms Blend");
@@ -670,16 +688,25 @@ void model3d::setup_bone_transforms_blended(shader_t &shader, float anim_time1, 
 	}
 	add_bone_transforms_to_shader(shader);
 }
-void model3d::add_bone_transforms_to_shader(shader_t &shader) const {
+bool model3d::check_anim_wrapped(unsigned anim_id, float old_time, float new_time) const {
+	assert(has_animations());
+	return model_anim_data.check_anim_wrapped(anim_id, old_time, new_time);
+}
+float model3d::get_anim_duration(unsigned anim_id) const { // in seconds
+	assert(has_animations());
+	return model_anim_data.get_anim_duration(anim_id);
+}
+void model3d::add_bone_transforms_to_shader(shader_t &shader, vector<xform_matrix> const &bone_transforms) const {
 	unsigned const MAX_MODEL_BONES = 200; // must agree with shader code
-	unsigned const num_bones(model_anim_data.bone_transforms.size());
+	unsigned num_bones(bone_transforms.size());
 	assert(num_bones > 0);
 
 	if (num_bones > MAX_MODEL_BONES) {
 		cerr << "Error: Too many bones for model: " << num_bones << "; Max is " << MAX_MODEL_BONES << endl;
 		assert(0); // or return? or ignore some bones?
+		num_bones = MAX_MODEL_BONES;
 	}
-	if (!shader.add_uniform_matrix_4x4("bones", model_anim_data.bone_transforms[0].get_ptr(), 0, num_bones)) { // transpose=0
+	if (!shader.add_uniform_matrix_4x4("bones", bone_transforms[0].get_ptr(), 0, num_bones)) { // transpose=0
 		//assert(0); // too strong, as this can trigger when debugging and when using a shader that was setup before the model was loaded
 	}
 }
@@ -778,12 +805,14 @@ template<typename T> void indexed_vntc_vect_t<T>::render(shader_t &shader, bool 
 	
 	if (is_shadow_pass || blocks.empty() || no_vfc || camera_pdu.sphere_completely_visible_test(bsphere.pos, bsphere.radius)) { // draw the entire range
 		glDrawRangeElements(prim_type, 0, (unsigned)size(), (unsigned)(ixn*end_ix/ixd), GL_UNSIGNED_INT, 0);
+		++num_frame_draw_calls;
 	}
 	else { // draw each block independently
 		// could use glDrawElementsIndirect(), but the draw calls don't seem to add any significant overhead for the current set of models
 		for (auto i = blocks.begin(); i != blocks.end(); ++i) {
 			if (camera_pdu.cube_visible(i->bcube)) {
 				glDrawRangeElements(prim_type, 0, (unsigned)size(), (ixn*i->num/ixd), GL_UNSIGNED_INT, (void *)((ixn*i->start_ix/ixd)*sizeof(unsigned)));
+				++num_frame_draw_calls;
 			}
 		}
 	}
@@ -798,7 +827,7 @@ template<typename T> void indexed_vntc_vect_t<T>::reserve_for_num_verts(unsigned
 }
 
 template<typename T> void indexed_vntc_vect_t<T>::add_poly(polygon_t const &poly, vertex_map_t<T> &vmap) {
-	for (unsigned i = 0; i < poly.size(); ++i) {add_vertex(poly[i], vmap);} // FIXME: ignores poly color
+	for (unsigned i = 0; i < poly.size(); ++i) {add_vertex(poly[i], vmap);}
 }
 
 template<typename T> void indexed_vntc_vect_t<T>::add_triangle(triangle const &t, vertex_map_t<T> &vmap) {
@@ -856,9 +885,9 @@ template<typename T> float indexed_vntc_vect_t<T>::calc_area(unsigned npts) {
 
 
 struct shared_vertex_t {
-	unsigned ai, bi;
-	bool shared;
-	shared_vertex_t() : ai(0), bi(0), shared(0) {}
+	unsigned ai=0, bi=0;
+	bool shared=0;
+	shared_vertex_t() {}
 	shared_vertex_t(unsigned ai_, unsigned bi_) : ai(ai_), bi(bi_), shared(1) {}
 };
 
@@ -876,8 +905,9 @@ template<typename T> void indexed_vntc_vect_t<T>::get_polygons(get_polygon_args_
 	}
 	unsigned const nv(num_verts());
 	if (nv == 0) return;
+	assert(npts ==3 || npts == 4);
 	assert((nv % npts) == 0);
-	polygon_t poly(args.color), quad_poly(args.color);
+	polygon_t poly, quad_poly;
 	poly.resize(npts);
 	quad_poly.resize(4);
 
@@ -973,16 +1003,13 @@ template<typename T> void indexed_vntc_vect_t<T>::write_to_obj_file(ostream &out
 // ************ polygon_t ************
 
 void polygon_t::from_triangle(triangle const &t) {
-
 	resize(3);
 	float const tc[2] = {0.0, 0.0}; // all zero?
 	vector3d const normal(t.get_normal());
 	UNROLL_3X(operator[](i_) = vert_norm_tc(t.pts[i_], normal, tc);)
 }
 
-
 bool polygon_t::is_convex() const {
-
 	unsigned const npts((unsigned)size());
 	assert(npts >= 3);
 	if (npts == 3) return 1;
@@ -996,9 +1023,7 @@ bool polygon_t::is_convex() const {
 	return !(counts[0] && counts[1]);
 }
 
-
 bool polygon_t::is_coplanar(float thresh) const {
-
 	assert(size() >= 3);
 	if (size() == 3 || thresh == 0.0) return 1;
 	vector3d n2;
@@ -1006,18 +1031,14 @@ bool polygon_t::is_coplanar(float thresh) const {
 	return (dot_product(get_planar_normal(), n2) > thresh);
 }
 
-
 vector3d polygon_t::get_planar_normal() const {
-
 	assert(size() >= 3);
 	vector3d norm;
 	get_normal((*this)[0].v, (*this)[1].v, (*this)[2].v, norm, 1);
 	return norm;
 }
 
-
 void polygon_t::from_points(vector<point> const &pts) {
-
 	resize(pts.size());
 	for (unsigned i = 0; i < size(); ++i) {(*this)[i].v = pts[i];}
 }
@@ -1095,6 +1116,10 @@ template<typename T> void vntc_vect_block_t<T>::invert_tcy() {
 
 template<typename T> void vntc_vect_block_t<T>::simplify_indices(float reduce_target) {
 	for (auto i = begin(); i != end(); ++i) {i->simplify_indices(reduce_target);}
+}
+
+template<typename T> void vntc_vect_block_t<T>::reverse_winding_order(unsigned npts) {
+	for (auto i = begin(); i != end(); ++i) {i->reverse_winding_order(npts);}
 }
 
 template<typename T> void vntc_vect_block_t<T>::merge_into_single_vector() {
@@ -1185,16 +1210,16 @@ template<typename T> void geometry_t<T>::add_poly(polygon_t const &poly, vertex_
 
 template<typename T> void geometry_t<T>::get_polygons(get_polygon_args_t &args) const {
 	triangles.get_polygons(args, 3); // should be empty in quads_only mode (will be checked)
-	quads.get_polygons    (args, 4);
+	quads    .get_polygons(args, 4);
 }
 
 template<typename T> cube_t geometry_t<T>::get_bcube() const {
 
-	cube_t bcube(all_zeros_cube); // will return this if empty
+	cube_t bcube; // will return this if empty
 
 	if (!triangles.empty()) {
 		bcube = triangles.get_bcube();
-		if (!quads.empty()) bcube.union_with_cube(quads.get_bcube());
+		if (!quads.empty()) {bcube.union_with_cube(quads.get_bcube());}
 	}
 	else if (!quads.empty()) {
 		bcube = quads.get_bcube();
@@ -1206,15 +1231,15 @@ template<typename T> void geometry_t<T>::clear() {
 
 	free_vbos();
 	triangles.clear();
-	quads.clear();
+	quads    .clear();
 }
 
 template<typename T> void geometry_t<T>::get_stats(model3d_stats_t &stats) const {
 	
 	stats.tris  += triangles.num_verts()/3;
-	stats.quads += quads.num_verts()/4;
+	stats.quads += quads    .num_verts()/4;
 	triangles.get_stats(stats);
-	quads.get_stats(stats);
+	quads    .get_stats(stats);
 }
 
 template<typename T> void geometry_t<T>::calc_area(float &area, unsigned &ntris) {
@@ -1224,6 +1249,11 @@ template<typename T> void geometry_t<T>::calc_area(float &area, unsigned &ntris)
 
 template<typename T> void geometry_t<T>::simplify_indices(float reduce_target) {
 	triangles.simplify_indices(reduce_target); // mesh simplification only applies to triangles, not quads
+}
+
+template<typename T> void geometry_t<T>::reverse_winding_order() {
+	triangles.reverse_winding_order(3);
+	quads    .reverse_winding_order(4);
 }
 
 
@@ -1242,19 +1272,23 @@ void material_t::compute_area_per_tri() {
 	if (avg_area_per_tri > 0) return; // already computed
 	unsigned tris(0);
 	tot_tri_area = 0;
-	geom.calc_area(tot_tri_area, tris);
+	geom    .calc_area(tot_tri_area, tris);
 	geom_tan.calc_area(tot_tri_area, tris);
 	if (tris > 0) {avg_area_per_tri = alpha*tot_tri_area/tris;}
 	//cout << "name: " << name << " " << TXT(tris) << TXT(tot_tri_area) << TXT(alpha) << "value: " << (1.0E6*avg_area_per_tri) << endl;
 }
 
 void material_t::simplify_indices(float reduce_target) {
-	geom.simplify_indices(reduce_target);
+	geom    .simplify_indices(reduce_target);
 	geom_tan.simplify_indices(reduce_target);
 }
 
-void material_t::ensure_textures_loaded(texture_manager &tmgr) {
+void material_t::reverse_winding_order() {
+	geom    .reverse_winding_order();
+	geom_tan.reverse_winding_order();
+}
 
+void material_t::ensure_textures_loaded(texture_manager &tmgr) {
 	tmgr.ensure_tid_loaded(get_render_texture(), 0); // only one tid for now
 	// if bump_tid is set, but bump maps are disabled, then clear bump_tid because either a) we won't use it, or b) it won't be loaded later when we try to use it
 	if (use_bump_map()) {tmgr.ensure_tid_loaded(bump_tid, 1);} else {bump_tid = -1;}
@@ -1309,11 +1343,8 @@ void material_t::check_for_tc_invert_y(texture_manager &tmgr) {
 }
 
 
-void bind_texture_tu_or_white_tex(texture_manager const &tmgr, int tid, unsigned tu_id) {
-
-	set_active_texture(tu_id);
-	if (tid >= 0) {tmgr.bind_texture(tid);} else {select_texture(WHITE_TEX);}
-	set_active_texture(0);
+void texture_manager::bind_texture_tu_or_white_tex(int tid, unsigned tu_id) const {
+	bind_texture_tu_def_white_tex(((tid >= 0) ? get_texture(tid).get_tid() : 0), tu_id);
 }
 
 // enable_alpha_mask: 0=non-alpha mask only, 1=alpha mask only, 2=both
@@ -1335,17 +1366,17 @@ void material_t::render(shader_t &shader, texture_manager const &tmgr, int defau
 	int const tex_id(get_render_texture());
 
 	if (is_z_prepass) { // no textures
-		if (alpha < 1.0 || (tex_id >= 0 && alpha_tid >= 0)) return; // partially transparent or has alpha mask
+		if (alpha < 1.0 || has_alpha_mask()) return; // partially transparent or has alpha mask
 		geom.render(shader, 0, xlate);
 		geom_tan.render(shader, 0, xlate);
 	}
 	else if (is_shadow_pass) {
-		bool const has_alpha_mask(tex_id >= 0 && alpha_tid >= 0);
-		if (enable_alpha_mask != 2 && has_alpha_mask != bool(enable_alpha_mask)) return; // incorrect pass
-		if (has_alpha_mask) {tmgr.bind_texture(tex_id);} // enable alpha mask texture
+		bool const has_amask(has_alpha_mask());
+		if (enable_alpha_mask != 2 && has_amask != bool(enable_alpha_mask)) return; // incorrect pass
+		if (has_amask) {tmgr.bind_texture(tex_id);} // enable alpha mask texture
 		geom.render(shader, 1, xlate);
 		geom_tan.render(shader, 1, xlate);
-		if (has_alpha_mask) {select_texture(WHITE_TEX);} // back to a default white texture
+		if (has_amask) {select_texture(WHITE_TEX);} // back to a default white texture
 	}
 	else {
 		bool bmap_disabled(0);
@@ -1360,18 +1391,16 @@ void material_t::render(shader_t &shader, texture_manager const &tmgr, int defau
 			select_texture((default_tid >= 0) ? default_tid : WHITE_TEX); // no texture specified - use white texture
 		}
 		if (use_bump_map()) {
-			set_active_texture(5);
-			tmgr.bind_texture(bump_tid);
-			set_active_texture(0);
+			bind_texture_tu(tmgr.get_texture(bump_tid).get_tid(), 5);
 		}
 		else if (is_bmap_pass) {
-			if (enable_bump_map()) {model3d::bind_default_flat_normal_map();} // use default normal map in this case instead of leaving it unbound, or bound to the previous material
+			if (enable_bump_map()) {bind_default_flat_normal_map();} // use default normal map in this case instead of leaving it unbound, or bound to the previous material
 			shader.add_uniform_float("bump_map_mag", 0.0); // disable bump map, including TBN matrix transform of eye_pos and light_dir; needed when there are no TCs or tangent vectors
 			bmap_disabled = 1;
 		}
 		if (enable_spec_map()) { // all white/specular if no specular map texture
-			bind_texture_tu_or_white_tex(tmgr, s_tid,  8); // specular map
-			bind_texture_tu_or_white_tex(tmgr, ns_tid, 9); // gloss map (Note: unclear how to interpret map_ns in object files)
+			tmgr.bind_texture_tu_or_white_tex(s_tid,  8); // specular map
+			tmgr.bind_texture_tu_or_white_tex(ns_tid, 9); // gloss map (Note: unclear how to interpret map_ns in object files)
 		}
 		if (metalness >= 0.0) {shader.add_uniform_float("metalness", metalness);} // set metalness if specified/valid; may or may not be used
 		bool const set_ref_ix(!disable_shader_effects /*&& alpha < 1.0*/ && ni != 1.0);
@@ -1515,21 +1544,6 @@ void coll_tquads_from_triangles(vector<triangle> const &triangles, vector<coll_t
 	for (unsigned i = 0; i < triangles.size(); ++i) ppts.push_back(coll_tquad(triangles[i], color));
 }
 
-unsigned model3d::add_triangles(vector<triangle> const &triangles, colorRGBA const &color, int mat_id, unsigned obj_id) {
-
-	// average_normals=1 should turn most of these face normals into vertex normals
-	vntc_map_t  vmap    [2] = {vntc_map_t (1), vntc_map_t (1)};
-	vntct_map_t vmap_tan[2] = {vntct_map_t(1), vntct_map_t(1)};
-	unsigned tot_added(0);
-	polygon_t poly(color);
-
-	for (vector<triangle>::const_iterator i = triangles.begin(); i != triangles.end(); ++i) {
-		poly.from_triangle(*i);
-		tot_added += add_polygon(poly, vmap, vmap_tan, mat_id, obj_id);
-	}
-	return tot_added;
-}
-
 unsigned model3d::add_polygon(polygon_t const &poly, vntc_map_t vmap[2], vntct_map_t vmap_tan[2], int mat_id, unsigned obj_id) {
 	
 	for (unsigned d = 0; d < 2; ++d) {
@@ -1590,13 +1604,10 @@ void model3d::get_polygons(vector<coll_tquad> &polygons, bool quads_only, bool a
 		unsigned const num_copies((!apply_transforms || transforms.empty()) ? 1 : transforms.size());
 		polygons.reserve(num_copies*(quads_only ? stats.quads : (stats.tris + 1.5*stats.quads)));
 	}
-	colorRGBA def_color(WHITE);
-	if (unbound_mat.tid >= 0) {def_color.modulate_with(texture_color(unbound_mat.tid));}
-	get_polygon_args_t args(polygons, def_color, quads_only, lod_level);
+	get_polygon_args_t args(polygons, quads_only, lod_level);
 	unbound_geom.get_polygons(args);
 
 	for (deque<material_t>::const_iterator m = materials.begin(); m != materials.end(); ++m) {
-		args.color = m->get_avg_color(tmgr, unbound_mat.tid);
 		m->geom.get_polygons    (args);
 		m->geom_tan.get_polygons(args);
 	}
@@ -1630,9 +1641,9 @@ void calc_bounds(cube_t const &c, int bounds[2][2], float spacing) {
 
 
 struct float_plus_dir {
-	float f;
-	bool d;
-	float_plus_dir() : f(0.0f), d(0) {}
+	float f=0.0;
+	bool d=0;
+	float_plus_dir() {}
 	float_plus_dir(float f_, bool d_) : f(f_), d(d_) {}
 	bool operator<(float_plus_dir const &fd) const {return ((f == fd.f) ? (d < fd.d) : (f < fd.f));}
 };
@@ -1650,11 +1661,11 @@ template<typename T> unsigned add_polygons_to_voxel_grid(vector<coll_tquad> &pol
 	cont.get_stats(stats);
 	polygons.clear();
 	polygons.reserve(stats.quads);
-	get_polygon_args_t args(polygons, WHITE, 1); // quads_only=1
+	get_polygon_args_t args(polygons, 1); // quads_only=1
 	cont.get_polygons(args);
 	xform_polygons(polygons, xf, 0);
 	
-	for (vector<coll_tquad>::const_iterator i = polygons.begin(); i != polygons.end(); ++i) {
+	for (vector<coll_tquad>::const_iterator i = polygons.begin(); i != polygons.end(); ++i) { // Note: colors are unused
 		assert(i->npts == 4);
 		if (fabs(i->normal.z) < 0.99) continue; // only keep top/bottom cube sides
 		cube_t const bcube(i->get_bcube());
@@ -1928,6 +1939,7 @@ void model3d::bind_all_used_tids() {
 		}
 		needs_alpha_test |= m->get_needs_alpha_test();
 		needs_trans_pass |= m->is_partial_transparent();
+		has_alpha_mask   |= m->has_alpha_mask();
 	} // for m
 	calc_tangent_vectors();
 }
@@ -1945,25 +1957,37 @@ void model3d::simplify_indices(float reduce_target) {
 	unbound_geom.simplify_indices(reduce_target);
 }
 
+void model3d::reverse_winding_order(uint64_t mats_mask) { // Note: only handles up to 64 materials
+	if (mats_mask == 0) return; // nothing to do
 
-void set_def_spec_map() {
-	if (enable_spec_map()) {select_multitex(WHITE_TEX, 8);} // all white/specular (no specular map texture)
+	for (unsigned m = 0; m < materials.size(); ++m) {
+		if (mats_mask & (uint64_t(1) << m)) {materials[m].reverse_winding_order();}
+	}
+	if (mats_mask & (uint64_t(1) << materials.size())) {unbound_geom.reverse_winding_order();} // use the last material slot
 }
 
-void model3d::render_materials(shader_t &shader, bool is_shadow_pass, int reflection_pass, bool is_z_prepass, int enable_alpha_mask,
-	unsigned bmap_pass_mask, int trans_op_mask, base_mat_t const &unbound_mat, rotation_t const &rot, point const *const xlate,
-	xform_matrix const *const mvm, bool force_lod, float model_lod_mult, float fixed_lod_dist, bool skip_cull_face, bool is_scaled, bool no_set_min_alpha)
+
+void set_def_spec_map() {
+	if (enable_spec_map()) {select_texture(WHITE_TEX, 8);} // all white/specular (no specular map texture)
+}
+bool cull_front_faces(int reflection_pass) {
+	// the reflection pass uses a mirror, which changes the winding direction, so we cull the front faces instead
+	return ((reflection_pass == 1) ^ invert_model3d_faces);
+}
+
+void model3d::render_materials(shader_t &shader, bool is_shadow_pass, int reflection_pass, bool is_z_prepass, int enable_alpha_mask, unsigned bmap_pass_mask,
+	int trans_op_mask, base_mat_t const &unbound_mat, rotation_t const &rot, point const *const xlate, xform_matrix const *const mvm, bool force_lod,
+	float model_lod_mult, float fixed_lod_dist, bool skip_cull_face, bool is_scaled, bool no_set_min_alpha, unsigned skip_mat_mask)
 {
 	bool const is_normal_pass(!is_shadow_pass && !is_z_prepass), is_bmap_pass((bmap_pass_mask & 2) != 0);
 	if (is_normal_pass) {smap_data[rot].set_for_all_lights(shader, mvm);} // choose correct shadow map based on rotation
 
 	if (group_back_face_cull && reflection_pass != 2 && !skip_cull_face) { // okay enable culling if is_shadow_pass on some scenes
-		if (reflection_pass == 1) {glCullFace(GL_FRONT);} // the reflection pass uses a mirror, which changes the winding direction, so we cull the front faces instead
+		if (cull_front_faces(reflection_pass)) {glCullFace(GL_FRONT);}
 		glEnable(GL_CULL_FACE);
 	}
-
-	// render geom that was not bound to a material
-	if ((bmap_pass_mask & 1) && unbound_mat.color.alpha > 0.0 && (trans_op_mask & 1) && !unbound_geom.empty()) { // enabled, not in bump map only pass; assume opaque
+	// render geom that was not bound to a material; skip if skip_mat_mask was set since this material is non-indexable
+	if ((bmap_pass_mask & 1) && unbound_mat.color.alpha > 0.0 && (trans_op_mask & 1) && !unbound_geom.empty() && skip_mat_mask == 0) { // not in bump map only pass; assume opaque
 		if (is_normal_pass) { // cur_ub_tid texture shouldn't have an alpha mask, so we don't need to use it in the shadow pass
 			assert(unbound_mat.tid >= 0);
 			select_texture(unbound_mat.tid);
@@ -1976,8 +2000,7 @@ void model3d::render_materials(shader_t &shader, bool is_shadow_pass, int reflec
 	}
 	bool check_lod(force_lod);
 	point center(all_zeros);
-	float max_area_per_tri(0.0);
-	float const lod_thresh(1.0E6*model_mat_lod_thresh*model_lod_mult);
+	float const lod_thresh(1.0E6*model_mat_lod_thresh*model_lod_mult*lod_scale);
 
 	if ((world_mode == WMODE_INF_TERRAIN || use_model_lod_blocks) && !is_shadow_pass) { // setup LOD/distance culling
 		point pts[2] = {bcube.get_llc(), bcube.get_urc()};
@@ -1989,32 +2012,30 @@ void model3d::render_materials(shader_t &shader, bool is_shadow_pass, int reflec
 		check_lod |= (is_scaled || !bcube_rot.contains_pt(camera_pdu.pos));
 		if (check_lod) {center = bcube_rot.get_cube_center();}
 	}
-	if (check_lod) {
-		for (auto m = materials.begin(); m != materials.end(); ++m) {max_eq(max_area_per_tri, m->avg_area_per_tri);}
-	}
 	// render all materials (opaque then transparent)
 	for (unsigned pass = 0; pass < (is_z_prepass ? 1U : 2U); ++pass) { // opaque, transparent
 		if (!(trans_op_mask & (1<<pass))) continue; // wrong opaque vs. transparent pass
 
 		for (unsigned i = 0; i < materials.size(); ++i) {
+			if (skip_mat_mask & (1<<i)) continue; // skip this material
 			material_t const &mat(materials[i]);
 
 			if (mat.is_partial_transparent() == (pass != 0) && (bmap_pass_mask & (1 << unsigned(mat.use_bump_map())))) {
-				if (check_lod && mat.avg_area_per_tri > 0.0 && mat.avg_area_per_tri < max_area_per_tri) { // don't cull the material with the largest triangle area
+				if (check_lod && mat.avg_area_per_tri > 0.0 && !mat.no_lod_cull) {
 					if ((fixed_lod_dist ? fixed_lod_dist : p2p_dist(camera_pdu.pos, center)) > lod_thresh*mat.avg_area_per_tri) continue; // LOD/dist culling
 				}
 				to_draw.push_back(make_pair(mat.draw_order_score, i));
 			}
-		}
+		} // for i
 		sort(to_draw.begin(), to_draw.end());
 
 		for (unsigned i = 0; i < to_draw.size(); ++i) {
 			materials[to_draw[i].second].render(shader, tmgr, unbound_mat.tid, is_shadow_pass, is_z_prepass, enable_alpha_mask, is_bmap_pass, xlate, no_set_min_alpha);
 		}
 		to_draw.clear();
-	}
+	} // for pass
 	if (group_back_face_cull && reflection_pass != 2 && !skip_cull_face) { // okay enable culling if is_shadow_pass on some scenes
-		if (reflection_pass == 1) {glCullFace(GL_BACK);} // restore the default
+		if (cull_front_faces(reflection_pass)) {glCullFace(GL_BACK);} // restore the default
 		glDisable(GL_CULL_FACE);
 	}
 }
@@ -2169,6 +2190,17 @@ bool is_cube_visible_to_camera(cube_t const &cube, bool is_shadow_pass, bool ani
 }
 
 
+void model3d::fit_to_scene() {
+	if (!transforms.empty()) {cerr << "Error: Can't fit model3d to scene when transforms have been added" << endl; return;}
+	cube_t scene(get_scene_bounds());
+	max_eq(scene.z2(), (scene.z1() + Z_SCENE_SIZE)); // make sure delta Z is at least Z_SCENE_SIZE
+	vector3d const model_sz(bcube.get_size()), scene_sz(scene.get_size());
+	model3d_xform_t xf;
+	xf.scale = min(scene_sz.x/model_sz.x, min(scene_sz.y/model_sz.y, scene_sz.z/model_sz.z)); // make sure it fits in all dims
+	xf.tv    = scene.get_cube_center() - xf.scale*bcube.get_cube_center();
+	transforms.push_back(xf);
+}
+
 void model3d::set_target_translate_scale(point const &target_pos, float target_radius, geom_xform_t &xf) const {
 	xf.scale = target_radius / (0.5*bcube.max_len());
 	xf.tv    = target_pos - xf.scale*bcube.get_cube_center(); // scale is applied before translate
@@ -2200,7 +2232,7 @@ void model3d::render(shader_t &shader, bool is_shadow_pass, int reflection_pass,
 	if (enable_tt_model_indir && world_mode == WMODE_INF_TERRAIN && !is_shadow_pass) {
 		if (model_indir_tid == 0) {create_indir_texture();}
 		if (model_indir_tid != 0) {
-			set_3d_texture_as_current(model_indir_tid, 1); // indir texture uses TU_ID=1
+			bind_texture_tu(model_indir_tid, 1); // indir texture uses TU_ID=1
 			shader.add_uniform_color("const_indir_color", colorRGB(0,0,0)); // set black indir color - assumes all models will get here, so not reset
 		}
 		set_local_model_scene_bounds(shader);
@@ -2232,7 +2264,7 @@ void model3d::render(shader_t &shader, bool is_shadow_pass, int reflection_pass,
 	if (has_animations()) {
 		static float cur_tfticks(0.0);
 		if (animate2) {cur_tfticks = tfticks;}
-		setup_bone_transforms(shader, cur_tfticks/TICKS_PER_SECOND, -1); // anim_id=-1
+		setup_bone_transforms(shader, cur_tfticks/TICKS_PER_SECOND, default_anim_id);
 	}
 	xform_matrix const mvm(fgGetMVM());
 	model3d_xform_t const xlate_xf(xlate);
@@ -2241,13 +2273,14 @@ void model3d::render(shader_t &shader, bool is_shadow_pass, int reflection_pass,
 	// we need the vbo to be created here even in the shadow pass,
 	// and the textures are needed for determining whether or not we need to build the tanget_vectors for bump mapping
 	bind_all_used_tids();
+	if (is_shadow_pass) {select_texture(WHITE_TEX);} // make sure a valid texture is enabled for the shadow pass
 
 	if (transforms.empty()) { // no transforms case
 		render_materials_def(shader, is_shadow_pass, reflection_pass, is_z_prepass, enable_alpha_mask, bmap_pass_mask, trans_op_mask, &xlate, &mvm);
 	}
 	else if (world_mode == WMODE_INF_TERRAIN) {
 		//timer_t timer("Draw Models");
-		float const view_dist(get_inf_terrain_fog_dist() + bcube.get_max_extent()), view_dist_sq(view_dist*view_dist); // or get_draw_tile_dist()?
+		float const view_dist(get_inf_terrain_fog_dist() + bcube.get_max_dim_sz()), view_dist_sq(view_dist*view_dist); // or get_draw_tile_dist()?
 		to_draw_xf.clear();
 		
 		for (unsigned i = 0; i < transforms.size(); ++i) {
@@ -2388,25 +2421,13 @@ cube_t model3d::get_single_transformed_bcube(vector3d const &xlate) const {
 }
 
 
-void setup_smap_shader(shader_t &s, bool sam_pass) {
-
-	if (sam_pass == 1) {
-		s.begin_simple_textured_shader(MIN_SHADOW_ALPHA);
-		select_texture(WHITE_TEX);
-	}
-	else {
-		s.begin_color_only_shader(); // really don't even need colors
-	}
-}
-
-
 void model3d::model_smap_data_t::render_scene_shadow_pass(point const &lpos) {
 
 	model->bind_all_used_tids();
 
-	for (unsigned sam_pass = 0; sam_pass < 2U; ++sam_pass) {
+	for (unsigned sam_pass = 0; sam_pass < (model->get_has_alpha_mask() ? 2U : 1U); ++sam_pass) { // {normal, alpha mask}
 		shader_t s;
-		setup_smap_shader(s, (sam_pass != 0));
+		s.begin_shadow_map_shader(sam_pass == 1);
 		model->render_materials_def(s, 1, 0, 0, (sam_pass == 1), 3, 3, &zero_vector); // no transforms; both opaque and partially transparent
 		s.end_shader();
 	}
@@ -2493,6 +2514,10 @@ void model3d::get_all_mat_lib_fns(set<string> &mat_lib_fns) const {
 void model3d::compute_area_per_tri() {
 #pragma omp parallel for schedule(dynamic)
 	for (int i = 0; i < (int)materials.size(); ++i) {materials[i].compute_area_per_tri();}
+
+	float max_area_per_tri(0.0);
+	for (material_t const &m : materials) {max_eq(max_area_per_tri, m.avg_area_per_tri);}
+	for (material_t &m : materials) {m.no_lod_cull = (m.avg_area_per_tri == max_area_per_tri);} // material with max area per tri is never culled
 }
 
 void model3d::get_stats(model3d_stats_t &stats) const {
@@ -2555,7 +2580,7 @@ bool model3d::read_from_disk(string const &fn) { // as model3d file; Note: trans
 		cerr << "Error opening model3d file for read: " << fn << endl;
 		return 0;
 	}
-	clear(); // ???
+	clear(); // may not be needed
 	unsigned const magic_number_comp(read_uint(in));
 
 	if (magic_number_comp != MAGIC_NUMBER) {
@@ -2576,7 +2601,6 @@ bool model3d::read_from_disk(string const &fn) { // as model3d file; Note: trans
 		mat_map[m->name] = (m - materials.begin());
 	}
 	//simplify_indices(0.1); // TESTING
-	//if (fn == "model_data/fish/fishOBJ.model3d") {write_as_obj_file(fn + ".obj");} // TESTING
 	return in.good();
 }
 
@@ -2685,12 +2709,14 @@ void model3ds::render(bool is_shadow_pass, int reflection_pass, int trans_op_mas
 	bool const allow_animations(!disable_shader_effects && (!is_shadow_pass || ENABLE_ANIMATION_SHADOWS));
 	// Note: in ground mode, lighting is global, so transforms are included in vpos with use_mvm=1; in TT mode, lighting is relative to each model instance
 	bool const use_mvm(!tt_mode && has_any_transforms()), v(!tt_mode), use_smap(1 || v);
-	bool needs_alpha_test(0), needs_bump_maps(0), any_planar_reflective(0), any_cube_map_reflective(0), any_non_reflective(0), use_spec_map(0), use_gloss_map(0), needs_trans_pass(0);
+	bool needs_alpha_test(0), needs_bump_maps(0), any_planar_reflective(0), any_cube_map_reflective(0), any_non_reflective(0);
+	bool use_spec_map(0), use_gloss_map(0), needs_trans_pass(0), has_alpha_mask(0);
 	unsigned num_models_with_animations(0);
 
 	for (iterator m = begin(); m != end(); ++m) {
 		needs_alpha_test |= m->get_needs_alpha_test();
 		needs_trans_pass |= m->get_needs_trans_pass();
+		has_alpha_mask   |= m->get_has_alpha_mask();
 		use_spec_map     |= (enable_spec_map() && m->uses_spec_map());
 		use_gloss_map    |= (enable_spec_map() && m->uses_gloss_map());
 		if (allow_animations) {num_models_with_animations += m->has_animations();}
@@ -2702,7 +2728,7 @@ void model3ds::render(bool is_shadow_pass, int reflection_pass, int trans_op_mas
 	}
 	if (any_planar_reflective + any_cube_map_reflective > 1) {
 		cerr << "Error: Cannot mix planar reflections and cube map reflections for model3ds" << endl;
-		exit(1); // FIXME: better/earlier error? make this work?
+		exit(1); // unsupported by shaders, but there are currently no cases that get here/need this
 	}
 	if (!needs_trans_pass && !(trans_op_mask & 1)) return; // transparent only pass, but no transparent materials
 	bool const any_animated(num_models_with_animations > 0), all_animated(num_models_with_animations == size());
@@ -2729,7 +2755,7 @@ void model3ds::render(bool is_shadow_pass, int reflection_pass, int trans_op_mas
 
 	// the bump map pass is first and the regular pass is second; this way, transparent objects such as glass that don't have bump maps are drawn last
 	for (int bmap_pass = (needs_bump_maps ? 1 : 0); bmap_pass >= 0; --bmap_pass) {
-		for (unsigned sam_pass = 0; sam_pass < (is_shadow_pass ? 2U : 1U); ++sam_pass) {
+		for (unsigned sam_pass = 0; sam_pass < ((is_shadow_pass && has_alpha_mask) ? 2U : 1U); ++sam_pass) {
 			for (unsigned ref_pass = (any_non_reflective ? 0U : 1U); ref_pass < (reflect_mode ? 2U : 1U); ++ref_pass) {
 				for (unsigned anim_pass = 0; anim_pass < 2; ++anim_pass) {
 					if ( anim_pass && !any_animated) continue;
@@ -2743,7 +2769,7 @@ void model3ds::render(bool is_shadow_pass, int reflection_pass, int trans_op_mas
 							// need to use smoke shader for animations, but disable all shading options
 							setup_smoke_shaders(s, min_alpha, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, use_mvm);
 						}
-						else {setup_smap_shader(s, (sam_pass != 0));}
+						else {s.begin_shadow_map_shader(sam_pass == 1);}
 					}
 					else if (shader_effects) {
 						int const use_bmap((bmap_pass == 0) ? 0 : (model_calc_tan_vect ? 2 : 1));
@@ -2754,7 +2780,7 @@ void model3ds::render(bool is_shadow_pass, int reflection_pass, int trans_op_mas
 						if (use_custom_smaps) {s.add_uniform_float("z_bias", cobj_z_bias);} // unnecessary?
 						if (use_bmap && invert_model_nmap_bscale) {s.add_uniform_float("bump_b_scale", 1.0); reset_bscale = 1;}
 						if (ref_pass && any_planar_reflective) {bind_texture_tu(reflection_tid, 14);}
-						if (model3d_wn_normal) {s.add_uniform_float("winding_normal_sign", ((reflection_pass == 1) ? -1.0 : 1.0));}
+						if (model3d_wn_normal) {s.add_uniform_float("winding_normal_sign", (cull_front_faces(reflection_pass) ? -1.0 : 1.0));}
 						s.add_uniform_float("hemi_lighting_scale", model_hemi_lighting_scale);
 					}
 					else {
@@ -2966,7 +2992,7 @@ void get_cur_model_as_cubes(vector<cube_t> &cubes, model3d_xform_t const &xf) { 
 }
 
 bool add_transform_for_cur_model(model3d_xform_t const &xf) {
-	if (all_models.empty()) {cerr << "Error: No model to add transform to" << endl; return 0;}
+	if (all_models.empty()) {cerr << "Error: No model to add transform to" << endl; return 0;} // nonfatal
 	get_cur_model("transform").add_transform(xf);
 	return 1;
 }
@@ -2975,6 +3001,9 @@ void set_sky_lighting_file_for_cur_model(string const &fn, float weight, unsigne
 }
 void set_occlusion_cube_for_cur_model(cube_t const &cube) {
 	get_cur_model("model_occlusion_cube").set_occlusion_cube(cube);
+}
+void fit_cur_model_to_scene() {
+	get_cur_model("fit_to_scene").fit_to_scene();
 }
 bool have_cur_model() {return (!all_models.empty());}
 

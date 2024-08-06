@@ -11,20 +11,26 @@ unsigned get_skip_mask_for_xy(bool dim);
 colorRGBA apply_light_color(room_object_t const &o, colorRGBA const &c);
 void add_boxes_to_space(room_object_t const &c, vect_room_object_t &objects, cube_t const &bounds, vect_cube_t &cubes, rand_gen_t &rgen,
 	unsigned num_boxes, float xy_scale, float hmin, float hmax, bool allow_crates, unsigned flags); // from building_room_obj_expand
-void try_add_lamp(cube_t const &place_area, float floor_spacing, unsigned room_id, unsigned flags, float light_amt,
+bool try_add_lamp(cube_t const &place_area, float floor_spacing, unsigned room_id, unsigned flags, float light_amt,
 	vect_cube_t &cubes, vect_room_object_t &objects, rand_gen_t &rgen);
 bool gen_furnace_cand(cube_t const &place_area, float floor_spacing, bool near_wall, rand_gen_t &rgen, cube_t &furnace, bool &dim, bool &dir);
-bool add_obj_to_closet(room_object_t const &c, cube_t const &interior, vect_room_object_t &objects, vect_cube_t &cubes,
-	rand_gen_t &rgen, vector3d const &sz, unsigned obj_type, unsigned flags, room_obj_shape shape=SHAPE_CUBE);
+bool add_obj_to_closet(room_object_t const &c, cube_t const &interior, vect_room_object_t &objects, vect_cube_t &cubes, rand_gen_t &rgen,
+	vector3d const &sz, unsigned obj_type, unsigned flags, room_obj_shape shape=SHAPE_CUBE, colorRGBA const &color=WHITE, bool against_back=0);
 void narrow_furnace_intake(cube_t &duct, room_object_t const &c);
 
 
+unsigned building_t::get_attic_part_ix() const { // Note: can be called before adding the attic, so can't check has_attic()
+	assert(!parts.empty());
+	return ((real_num_parts >= 2 && parts[1].z2() > parts[0].z2()) ? 1 : 0); // if there are at least two parts, use the taller one
+}
+
+// Note: may incorrectly return 0 for points exactly between roof tquads, such as those on the centerline of the roof
 bool building_t::point_under_attic_roof(point const &pos, vector3d *const cnorm) const {
 	if (!get_attic_part().contains_pt_xy(pos)) return 0;
 
 	for (auto const &tq : roof_tquads) {
 		if (!is_attic_roof(tq, 1)) continue; // type_roof_only=1
-		if (!point_in_polygon_2d(pos.x, pos.y, tq.pts, tq.npts, 0, 1)) continue; // check 2D XY point containment
+		if (!point_in_polygon_2d(pos.x, pos.y, tq.pts, tq.npts)) continue; // check 2D XY point containment
 		vector3d const normal(tq.get_norm());
 		if (normal.z == 0.0) continue; // skip vertical sides
 		if (cnorm) {*cnorm = -normal;} // we're looking at the underside of the roof, so reverse the normal; set whether or not we're inside the attic
@@ -44,13 +50,53 @@ bool building_t::cube_in_attic(cube_t const &c) const {
 		    point_under_attic_roof(point(c.x2(), c.y2(), z2)) || point_under_attic_roof(point(c.x2(), c.y1(), z2)));
 }
 
-void building_t::get_attic_roof_tquads(vector<tquad_with_ix_t> &tquads) const {
+void building_t::get_attic_roof_tquads(vect_tquad_with_ix_t &tquads) const {
 	tquads.clear();
 	if (!has_attic()) return;
 
 	for (auto const &tq : roof_tquads) {
 		if (is_attic_roof(tq, 1)) {tquads.push_back(tq);} // type_roof_only=1
 	}
+}
+
+void building_t::get_attic_windows(vect_tquad_with_ix_t &tquads, float offset_scale) const {
+	if (!is_house || !has_attic() || !has_attic_window) return;
+	float const floor_spacing(get_window_vspace()), shift_dist(offset_scale*get_door_shift_dist()), wall_thickness(get_wall_thickness());
+	cube_t const &part(get_attic_part()); // attic is always in the tallest/first part
+	cube_t avoid;
+
+	if (has_chimney) {
+		avoid = get_chimney();
+		avoid.expand_by_xy(wall_thickness);
+	}
+	for (auto i = roof_tquads.begin(); i != roof_tquads.end(); ++i) {
+		if (i->type != tquad_with_ix_t::TYPE_WALL || i->npts != 3) continue; // not a wall triangle
+		cube_t const bc(i->get_bcube());
+		float const height(bc.dz());
+		if (height < 0.5*floor_spacing)             continue; // too small (maybe porch roof)
+		if (has_chimney && avoid.intersects_xy(bc)) continue; // blocked by chimney
+		bool const dim(bc.dy() < bc.dx()); // should be zero size in X or Y
+		float const wall_pos(i->pts[0][dim]); // all points should have the same pos
+		bool const dir(part.get_center_dim(dim) < wall_pos);
+		if (part.d[dim][dir] != bcube.d[dim][dir]) continue; // only exterior facing walls (avoid window clipping through adjacent part)
+		cube_t part_test(bc);
+		part_test.expand_in_dim( dim,  wall_thickness); // expand to pick up nearby walls
+		part_test.expand_in_dim(!dim,- wall_thickness); // shrink to exclude adjacencies
+		if (!part_test.intersects(part))           continue; // not on the main part with the attic
+		// create square inscribed in triangle
+		float const center(bc.get_center_dim(!dim)), base(bc.get_sz_dim(!dim));
+		float const window_width(min(0.75f*floor_spacing, height*base/(height + base))); // window width == window height
+		tquad_with_ix_t window(4, tquad_with_ix_t::TYPE_HDOOR); // mark as a door so that it's textured from [0.0, 1.0]
+		float const window_pos(wall_pos + (dir ? 1.0 : -1.0)*shift_dist); // shift away from the wall
+		for (unsigned n = 0; n < 4; ++n) {window.pts[n][dim] = window_pos;} // set window position
+		float const bot_edge(bc.z1() + min(0.4f*window_width, 0.1f*bc.dz())); // raise off the floor a bit
+		window.pts[0].z = window.pts[1].z = bot_edge; // bottom edge
+		window.pts[2].z = window.pts[3].z = bot_edge + window_width; // top edge
+		window.pts[0][!dim] = window.pts[3][!dim] = center - 0.5*window_width;
+		window.pts[1][!dim] = window.pts[2][!dim] = center + 0.5*window_width;
+		if (dim ^ dir ^ 1) {std::reverse(window.pts, window.pts+4);} // reverse the winding order
+		tquads.push_back(window);
+	} // for i
 }
 
 bool building_t::has_L_shaped_roof_area() const {
@@ -136,9 +182,9 @@ cube_t building_t::get_attic_access_door_avoid() const {
 void building_t::assign_attic_type(rand_gen_t rgen) {
 	if (rgen.rand_bool()) {interior->attic_type = ATTIC_TYPE_RAFTERS; return;} // rafters is the most common case
 	// wood and plaster don't look good with hipped roofs because they have vertical beams
-	bool const allow_no_rafters(roof_type != ROOF_TYPE_HIPPED && (rgen.rand()&3) == 0); // make these cases rare
-	if (allow_no_rafters) {interior->attic_type = rgen.rand()%NUM_ATTIC_TYPES;} // ATTIC_TYPE_RAFTERS, ATTIC_TYPE_WOOD, ATTIC_TYPE_PLASTER, ATTIC_TYPE_FIBERGLASS
-	else                  {interior->attic_type = rgen.rand()%2;} // ATTIC_TYPE_RAFTERS, ATTIC_TYPE_WOOD
+	bool const allow_no_rafters(roof_type != ROOF_TYPE_HIPPED && !rgen.rand_bool()); // make these cases rare
+	if (allow_no_rafters) {interior->attic_type = rgen.rand()%NUM_ATTIC_TYPES;} // ATTIC_TYPE_RAFTERS, ATTIC_TYPE_FIBERGLASS, ATTIC_TYPE_WOOD, ATTIC_TYPE_PLASTER
+	else                  {interior->attic_type = rgen.rand()%2;} // ATTIC_TYPE_RAFTERS, ATTIC_TYPE_FIBERGLASS
 }
 
 void find_roofline_beam_span(cube_t &beam, float roof_z2, point const pts[4], bool dim) {
@@ -163,6 +209,19 @@ void create_attic_posts(building_t const &b, cube_t const &beam, bool dim, cube_
 	} // for d
 }
 
+unsigned count_num_poly_intersects(float x, float y, float radius, point const *const points, int npts) {
+	float const dx[5] = {0.0, 1.0, -1.0, 0.0, 0.0}, dy[5] = {0.0, 0.0, 0.0, 1.0, -1.0};
+	unsigned count(0);
+	for (unsigned n = 0; n < 5; ++n) {count += point_in_polygon_2d((x + radius*dx[n]), (y + radius*dy[n]), points, npts);} // check 2D XY point contain
+	return count;
+}
+
+unsigned building_t::get_attic_room_id() const {
+	assert(has_attic());
+	int const room_id(get_room_containing_pt(cube_bot_center(interior->attic_access) - get_floor_thickness()*plus_z)); // should we cache this during floorplanning?
+	assert(room_id >= 0); // must be found
+	return room_id;
+}
 void building_t::add_attic_objects(rand_gen_t rgen) {
 	assign_attic_type(rgen); // must be done after roof is added, not in add_attic_access_door()
 	vect_room_object_t &objs(interior->room_geom->objs);
@@ -171,8 +230,7 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 	cube_with_ix_t adoor(interior->attic_access);
 	assert(adoor.is_strictly_normalized());
 	adoor.expand_in_dim(2, -0.2*adoor.dz()); // shrink in z
-	int const room_id(get_room_containing_pt(point(adoor.xc(), adoor.yc(), adoor.z1()-get_floor_thickness()))); // should we cache this during floorplanning?
-	assert(room_id >= 0); // must be found
+	unsigned const room_id(get_attic_room_id());
 	room_t const &room(get_room(room_id));
 	bool const ddim(adoor.ix >> 1), ddir(adoor.ix & 1);
 	unsigned const acc_flags(room.is_hallway ? RO_FLAG_IN_HALLWAY : 0), attic_door_ix(objs.size());
@@ -184,7 +242,7 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 	avoid_cubes.push_back(avoid);
 
 	// add light(s)
-	cube_t const part(get_part_for_room(room)); // Note: assumes attic is a single part
+	cube_t const &part(get_part_for_room(room)); // Note: assumes attic is a single part
 	bool const long_dim(part.dx() < part.dy());
 	float const floor_spacing(get_window_vspace()), beam_depth(get_attic_beam_depth()), z_floor(interior->attic_access.z2());
 	float const sep_dist(part.get_sz_dim(long_dim) - part.get_sz_dim(!long_dim)), attic_height(interior_z2 - z_floor), light_radius(0.03*attic_height);
@@ -212,8 +270,7 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 	}
 	for (unsigned n = 0; n < num_lights; ++n) {
 		light.set_from_sphere(light_pos[n], light_radius);
-		// start off lit for now; maybe should start off and auto turn on when the player enters the attic?
-		unsigned const light_flags(RO_FLAG_LIT | RO_FLAG_EMISSIVE | RO_FLAG_NOCOLL | obj_flags);
+		unsigned const light_flags(RO_FLAG_EMISSIVE | RO_FLAG_NOCOLL | obj_flags); // start off and auto turn on when the player enters the attic
 		objs.emplace_back(light, TYPE_LIGHT, room_id, 0, 0, light_flags, light_amt, SHAPE_SPHERE, get_light_color_temp(0.45)); // yellow-shite
 	}
 	if (has_chimney == 1) { // interior chimney; not drawn when player is in the attic because it's part of the exterior geometry
@@ -233,6 +290,10 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 			}
 		}
 	}
+	// add vertical vent pipes as avoid cubes
+	for (auto i = objs.begin(); i != objs.begin()+objs_start; ++i) {
+		if (i->type == TYPE_PIPE && !i->is_exterior() && i->z2() > z_floor && i->intersects_xy(part)) {avoid_cubes.push_back(*i);}
+	}
 	// add posts as colliders; somewhat of a duplicate of the code in building_room_geom_t::add_attic_rafters()
 	for (tquad_with_ix_t const &tq : roof_tquads) {
 		if (tq.npts == 3 || !is_attic_roof(tq, 1)) continue; // not a roof tquad; type_roof_only=1
@@ -249,13 +310,24 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 		if (beam.get_sz_dim(!dim) <= beam_depth) continue; // if it's long enough
 		cube_t posts[2];
 		create_attic_posts(*this, beam, dim, posts);
+		point const access_center(adoor.get_cube_center());
+		bool const ls_post(p2p_dist_xy_sq(posts[1].get_cube_center(), access_center) < p2p_dist_xy_sq(posts[0].get_cube_center(), access_center));
 
 		for (unsigned d = 0; d < 2; ++d) {
-			if (posts[d].is_all_zeros()) continue;
-			objs.emplace_back(posts[d], TYPE_COLLIDER, room_id, dim, 0, (RO_FLAG_INVIS | obj_flags), 1.0);
-			avoid_cubes.push_back(posts[d]);
+			cube_t const &post(posts[d]);
+			if (post.is_all_zeros()) continue;
+			objs.emplace_back(post, TYPE_COLLIDER, room_id, dim, 0, (RO_FLAG_INVIS | obj_flags), 1.0);
+			avoid_cubes.push_back(post);
 			avoid_cubes.back().expand_by_xy(beam_width); // add extra spacing
-		}
+
+			if (bool(d) == ls_post) { // add light switch on the side facing the attic access door for the closer post
+				point const post_center(post.get_cube_center());
+				vector3d const post_dir(post_center - access_center);
+				bool const ls_dim(fabs(post_dir.x) < fabs(post_dir.y)), ls_dir(post_dir[ls_dim] > 0.0);
+				cube_t c(get_light_switch_bounds(post.z1(), post.d[ls_dim][!ls_dir], post.get_center_dim(!ls_dim), ls_dim, ls_dir));
+				objs.emplace_back(c, TYPE_SWITCH, room_id, ls_dim, ls_dir, (RO_FLAG_NOCOLL | obj_flags), 1.0); // fully lit
+			}
+		} // for d
 	} // for i
 	cube_t place_area(part);
 	place_area.z1() = place_area.z2() = z_floor; // bottom of attic floor
@@ -277,8 +349,9 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 			cube_t furnace;
 			bool dim(0), dir(0);
 			if (!gen_furnace_cand(furnace_place_area, floor_spacing, 0, rgen, furnace, dim, dir)) break; // near_wall=0
+			float const width(furnace.get_sz_dim(!dim)), depth(furnace.get_sz_dim(dim));
 			cube_t test_cube(furnace);
-			test_cube.d[dim][dir] += (dir ? 1.0 : -1.0)*0.5*furnace.get_sz_dim(dim); // add clearance in front
+			test_cube.d[dim][dir] += (dir ? 1.0 : -1.0)*0.5*depth; // add clearance in front
 			if (has_bcube_int(test_cube, avoid_cubes) || !cube_in_attic(furnace)) continue;
 			unsigned const flags((is_house ? RO_FLAG_IS_HOUSE : 0) | obj_flags);
 			room_object_t const furnace_obj(furnace, TYPE_FURNACE, room_id, dim, dir, flags, light_amt);
@@ -288,7 +361,7 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 
 			if (furnace_room >= 0) { // place an intake vent in the ceiling of this room under the furnace
 				cube_t vent(furnace);
-				vent.expand_by_xy(-0.05*furnace.get_sz_dim(!dim)); // shrink slightly
+				vent.expand_by_xy(-0.05*width); // shrink slightly
 				vent.z2() = furnace.z1() - get_fc_thickness(); // ceiling of the room below
 				vent.z1() = vent.z2() - 0.1*get_wall_thickness();
 				bool place_ok(1);
@@ -304,6 +377,11 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 					else {objs.emplace_back(vent, TYPE_VENT, furnace_room, dim, 0, (RO_FLAG_NOCOLL | RO_FLAG_HANGING), 1.0);} // dir=0/horizontal; fully lit
 				}
 			}
+			// add an exhaust vent up through the roof; it may clip through the rafters, but this is difficult to check for and avoid
+			float const vent_radius(0.1*width), dir_offset(0.26);
+			point vent_bot_center(cube_top_center(furnace));
+			vent_bot_center[dim] = (dir_offset*furnace.d[dim][!dir] + (1.0 - dir_offset)*furnace.d[dim][dir]);
+			add_attic_roof_vent(vent_bot_center, vent_radius, room_id, light_amt);
 			has_furnace = 1;
 			break; // success/done
 		} // for n
@@ -313,7 +391,11 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 
 	// add lamp(s)
 	unsigned const num_lamps(rgen.rand() % (has_furnace ? 5 : 3)); // 0-4/2
-	for (unsigned n = 0; n < num_lamps; ++n) {try_add_lamp(place_area, floor_spacing, room_id, obj_flags, light_amt, avoid_cubes, objs, rgen);}
+	
+	for (unsigned n = 0; n < num_lamps; ++n) {
+		if (!try_add_lamp(place_area, floor_spacing, room_id, obj_flags, light_amt, avoid_cubes, objs, rgen)) continue;
+		if (!cube_in_attic(objs.back())) {objs.pop_back();} // too tall, skip
+	}
 	// add chair(s)
 	unsigned const num_chairs(rgen.rand() % (has_furnace ? 4 : 3)); // 0-3/2
 	
@@ -326,11 +408,11 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 			if (i->type == TYPE_CHAIR) {chair_color = i->color; break;} // use the color of the first chair added to this building
 		}
 		for (unsigned n = 0; n < num_chairs; ++n) {
-			if (add_obj_to_closet(objs[attic_door_ix], place_area, objs, avoid_cubes, rgen, sz, TYPE_CHAIR, obj_flags)) {
-				objs.back().dim   = rgen.rand_bool(); // random orient
-				objs.back().dir   = rgen.rand_bool();
-				objs.back().color = chair_color;
-			}
+			if (!add_obj_to_closet(objs[attic_door_ix], place_area, objs, avoid_cubes, rgen, sz, TYPE_CHAIR, obj_flags)) continue;
+			if (!cube_in_attic(objs.back())) {objs.pop_back(); continue;} // too tall, skip
+			objs.back().dim   = rgen.rand_bool(); // random orient
+			objs.back().dir   = rgen.rand_bool();
+			objs.back().color = chair_color;
 		}
 	}
 	// add nightstand(s)
@@ -342,12 +424,11 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 		sz[ dim] = 0.5*depth;
 		sz[!dim] = 0.5*width;
 		sz.z     = height;
-		
-		if (add_obj_to_closet(objs[attic_door_ix], place_area, objs, avoid_cubes, rgen, sz, TYPE_NIGHTSTAND, obj_flags)) {
-			objs.back().dim = dim;
-			objs.back().dir = (objs.back().get_center_dim(dim) < place_area.get_center_dim(dim)); // face the center of the attic so that drawers can be opened
-		}
-	}
+		if (!add_obj_to_closet(objs[attic_door_ix], place_area, objs, avoid_cubes, rgen, sz, TYPE_NIGHTSTAND, obj_flags)) continue;
+		if (!cube_in_attic(objs.back())) {objs.pop_back(); continue;} // too tall, skip
+		objs.back().dim = dim;
+		objs.back().dir = (objs.back().get_center_dim(dim) < place_area.get_center_dim(dim)); // face the center of the attic so that drawers can be opened
+	} // for n
 	// add paintcan(s)
 	unsigned const num_paintcans(rgen.rand() % (has_furnace ? 6 : 4)); // 0-5/3
 	
@@ -377,7 +458,7 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 		for (unsigned d = 0; d < 2; ++d) {rug_center[d] = rgen.rand_uniform(place_area.d[d][0]+rug_hsz[d], place_area.d[d][1]-rug_hsz[d]);}
 		cube_t rug(rug_center);
 		rug.expand_by_xy(rug_hsz);
-		rug.z2() += 0.001*floor_spacing; // set thickness/height
+		rug.z2() += get_rug_thickness(); // set thickness/height
 		bool bad_place(0);
 
 		for (auto i = avoid_cubes.begin(); i != avoid_cubes.begin()+rug_avoid_cubes_end; ++i) { // skip objects that can be placed on rugs
@@ -388,6 +469,36 @@ void building_t::add_attic_objects(rand_gen_t rgen) {
 		objs.back().obj_id = uint16_t(objs.size()); // determines rug texture
 		break; // done
 	} // for n
+}
+
+bool building_t::add_attic_roof_vent(point const &bot_center, float radius, unsigned room_id, float light_amt) {
+	cube_t pipe(bot_center, bot_center);
+	pipe.expand_by_xy(radius);
+	float pipe_z2(bot_center.z); // starting value zero height; should set based on roof height below
+
+	for (auto const &tq : roof_tquads) {
+		bool const is_solar_panel(tq.type == tquad_with_ix_t::TYPE_SOLAR);
+		if (!is_solar_panel && !is_attic_roof(tq, 1)) continue; // type_roof_only=1
+		unsigned const int_count(count_num_poly_intersects(bot_center.x, bot_center.y, radius, tq.pts, tq.npts));
+		if (int_count == 0) continue; // no intersections, skip
+		if (int_count < 5 || is_solar_panel) return 0; // don't allow vent to clip through solar panel or partially clip through a roof
+		vector3d const normal(tq.get_norm());
+		if (normal.z == 0.0) continue; // skip vertical sides
+		float const denom(dot_product(normal, plus_z));
+		if (fabs(denom) < TOLERANCE) break; // should never fail?
+		pipe_z2  = bot_center.z + dot_product_ptv(normal, tq.pts[0], bot_center)/denom;
+	} // for tq
+	if (pipe_z2 <= bot_center.z) return 0; // no roof tquad found; can this happen?
+	float const floor_spacing(get_window_vspace());
+	pipe_z2 += 0.05*floor_spacing + radius; // move up a bit to get it above the roof
+	set_cube_zvals(pipe, bot_center.z, pipe_z2);
+	cube_t end_cap(pipe);
+	set_cube_zvals(end_cap, pipe_z2, (pipe_z2 + 0.04*floor_spacing + radius));
+	end_cap.expand_by_xy(0.8*radius);
+	unsigned const end_cap_flags(RO_FLAG_LIT | RO_FLAG_EXTERIOR | RO_FLAG_ADJ_LO | RO_FLAG_ADJ_HI | RO_FLAG_HANGING | RO_FLAG_NOCOLL); // draw top and bottom flat ends
+	interior->room_geom->objs.emplace_back(pipe,    TYPE_PIPE, room_id, 0, 1, RO_FLAG_LIT,   light_amt, SHAPE_CYLIN, LT_GRAY); // dir=1 for vertical; casts shadows
+	interior->room_geom->objs.emplace_back(end_cap, TYPE_PIPE, room_id, 0, 1, end_cap_flags, 1.0,       SHAPE_CYLIN, GRAY);
+	return 1;
 }
 
 cube_t get_attic_access_door_cube(room_object_t const &c, bool inc_ladder) {
@@ -412,6 +523,7 @@ cube_t get_ladder_bcube_from_open_attic_door(room_object_t const &c, cube_t cons
 void building_room_geom_t::add_attic_door(room_object_t const &c, float tscale) {
 	rgeom_mat_t &wood_mat(get_wood_material(tscale, 1, 0, 1)); // shadows + small
 	colorRGBA const color(apply_light_color(c, c.color));
+	float cord_z2(c.z1()), cord_len_pos(0.0);
 
 	if (c.is_open()) {
 		unsigned const qv_start1(wood_mat.quad_verts.size());
@@ -450,10 +562,22 @@ void building_room_geom_t::add_attic_door(room_object_t const &c, float tscale) 
 			ladder_mat.add_cube_to_verts(step, ladder_color, step.get_llc(), get_skip_mask_for_xy(!c.dim), 1); // skip sides, swap_tex_st=1
 		}
 		rotate_verts(ladder_mat.quad_verts, rot_axis, rot_angle, rot_pt, qv_start2);
+		cord_len_pos = -0.35; // closer to the back
+		cord_z2     -= 0.36*ladder.dz(); // shift down
 	}
 	else { // draw only the top and bottom faces of the door
 		wood_mat.add_cube_to_verts(c, color, c.get_llc(), ~EF_Z12); // shadows + small, top and bottom only
+		cord_len_pos = 0.35; // closer to the front
 	}
+	// draw the cord and handle
+	float const thickness(c.dz()), cord_len(3.0*thickness), cord_radius(0.07*thickness), ball_radius(0.3*thickness);
+	cube_t cord;
+	set_cube_zvals(cord, cord_z2-cord_len, cord_z2);
+	set_wall_width(cord,  c.get_center_dim(!c.dim), cord_radius, !c.dim);
+	set_wall_width(cord, (c.get_center_dim( c.dim) + (c.dir ? -1.0 : 1.0)*cord_len_pos*c.get_sz_dim(c.dim)), cord_radius, c.dim);
+	rgeom_mat_t &cord_mat(get_untextured_material(0, 0, 1)); // unshadowed, small
+	cord_mat.add_vcylin_to_verts(cord, WHITE, 0, 0); // draw sides only
+	cord_mat.add_sphere_to_verts(point(cord.xc(), cord.yc(), cord.z1()), ball_radius, WHITE, 1); // low_detail=1
 }
 
 bool building_t::is_attic_roof(tquad_with_ix_t const &tq, bool type_roof_only) const {
@@ -473,7 +597,22 @@ struct edge_t {
 	}
 };
 
-void add_attic_roof_geom(rgeom_mat_t &mat, colorRGBA const &color, float thickness, float tscale, building_t const &b) {
+// from https://gamedev.stackexchange.com/questions/23743/whats-the-most-efficient-way-to-find-barycentric-coordinates
+vector3d barycentric_interpolate(vector2d const &p0, vector2d const &p1, vector2d const &p2, vector2d const &P) {
+	vector3d ret;
+	float const inverse_det(1.0/((p1.y-p2.y) * (p0.x-p2.x) + (p2.x-p1.x) * (p0.y-p2.y)));
+	ret.x = ((p1.y-p2.y) * (P.x-p2.x) + (p2.x-p1.x) * (P.y-p2.y)) * inverse_det;
+	ret.y = ((p2.y-p0.y) * (P.x-p2.x) + (p0.x-p2.x) * (P.y-p2.y)) * inverse_det;
+	ret.z = 1.0 - ret.x - ret.y;
+	return ret;
+}
+void interpolate_tcs(vert_norm_comp_tc_color const &p0, vert_norm_comp_tc_color const &p1, vert_norm_comp_tc_color const &p2,
+	vert_norm_comp_tc_color &P, unsigned d0, unsigned d1)
+{
+	vector3d const weights(barycentric_interpolate(vector2d(p0.v[d0], p0.v[d1]), vector2d(p1.v[d0], p1.v[d1]), vector2d(p2.v[d0], p2.v[d1]), vector2d(P.v[d0], P.v[d1])));
+	for (unsigned d = 0; d < 2; ++d) {P.t[d] = weights[0]*p0.t[d] + weights[1]*p1.t[d] + weights[2]*p2.t[d];}
+}
+void add_attic_roof_geom(rgeom_mat_t &mat, colorRGBA const &color, float thickness, float tscale, bool swap_st, vect_cube_t const &window_holes, building_t const &b) {
 	thickness *= b.get_attic_beam_depth();
 
 	for (tquad_with_ix_t const &i : b.roof_tquads) {
@@ -504,39 +643,89 @@ void add_attic_roof_geom(rgeom_mat_t &mat, colorRGBA const &color, float thickne
 				if      (vert.v.z < prev.z) {shift_dir = prev - vert.v;}
 				else if (vert.v.z < next.z) {shift_dir = next - vert.v;}
 				if (shift_dir.z > 0.0) {vert.v += shift_dir*(thickness/shift_dir.z);}
-				bool const swap_tc_xy(fabs(normal.x) < fabs(normal.y));
+				bool const swap_tc_xy((fabs(normal.x) < fabs(normal.y)) ^ swap_st);
 				vert.t[!swap_tc_xy] = vert.v.x*tsx;
 				vert.t[ swap_tc_xy] = vert.v.y*tsy;
 			}
 			else { // side wall
 				bool const dim(tq.pts[0].x == tq.pts[1].x); // use nonzero width dim
-				vert.t[0] = vert.v[dim]*tsx;
-				vert.t[1] = vert.v.z*tsy;
+				vert.t[ swap_st] = vert.v[dim]*tsx;
+				vert.t[!swap_st] = vert.v.z*tsy;
 			}
 			mat.itri_verts.push_back(vert);
 		} // for i
+		if (!is_roof && !window_holes.empty()) { // cut holes for windows; verts are ordered {top, left, right} viewed from inside
+			cube_t const bc(tq.get_bcube());
+			bool const dim(bc.dy() < bc.dx()), invert((normal[dim] < 0.0) ^ dim); // should be zero size in X or Y
+			float const wall_pos(bc.d[dim][0]);
+			cube_t holes_test(bc);
+			holes_test.expand_in_dim(dim, thickness);
+			bool added_window(0);
+
+			for (cube_t const &w : window_holes) {
+				if (!w.intersects(holes_test)) continue;
+				point pts[4];
+				pts[0].z = pts[1].z = w.z1(); // bottom edge
+				pts[2].z = pts[3].z = w.z2(); // top edge
+				pts[0][!dim] = pts[3][!dim] = w.d[!dim][ invert];
+				pts[1][!dim] = pts[2][!dim] = w.d[!dim][!invert];
+
+				for (unsigned n = 0; n < 4; ++n) { // add 4 quad verts
+					pts[n][dim] = wall_pos; // set wall position
+					vert.v = pts[n];
+					interpolate_tcs(mat.itri_verts[verts_start+0], mat.itri_verts[verts_start+1], mat.itri_verts[verts_start+2], vert, !dim, 2);
+					mat.itri_verts.push_back(vert);
+				}
+				unsigned const ixs[7][3] = {{0,6,5}, {0,5,2}, {5,4,2}, {4,3,2}, {3,1,2}, {6,1,3}, {0,1,6}}; // indices for 7 triangles
+				for (unsigned t = 0; t < 7; ++t) {UNROLL_3X(mat.indices.push_back(verts_start + ixs[t][i_]);)}
+				added_window = 1;
+				break; // there should only be one
+			} // for w
+			if (added_window) continue; // indices already added, don't need to add below
+		}
 		for (unsigned i = 0; i < ((tq.npts == 4) ? 6U : 3U); ++i) { // 3 indices for triangles, 6 indices (2 triangles) for quads
 			mat.indices.push_back(verts_start + quad_to_tris_ixs[i]);
 		}
 	} // for i
 }
 
-void building_room_geom_t::add_attic_rafters(building_t const &b, float tscale) {
+void building_room_geom_t::add_attic_interior_and_rafters(building_t const &b, float tscale, bool detail_pass) {
 	if (!b.has_attic()) return;
+	if (!detail_pass && !b.has_attic_window) return; // nothing to do
+	// determine attic window hole locations
+	vect_tquad_with_ix_t window_tquads;
+	b.get_attic_windows(window_tquads, 0.0); // offset_scale=0.0
+	unsigned const small(window_tquads.empty() ? 2 : 1); // small if there are attic windows, otherwise detail
+	if (!detail_pass && small == 2) return; // nothing to do
 	unsigned const attic_type(b.interior->attic_type);
+	float const window_expand(b.get_wall_thickness());
+	float const window_h_border(1.05*b.get_window_h_border()), window_v_border(1.05*b.get_window_v_border()); // (0, 1) range, slightly expanded
+	vect_cube_t window_holes;
 
-	if (attic_type == ATTIC_TYPE_WOOD) {
-		add_attic_roof_geom(get_material(tid_nm_pair_t(get_plywood_tid()), 0, 0, 2), WHITE, 1.0, 16.0, b); // no shadows, detail
-		return; // done - rafters not visible
+	for (tquad_with_ix_t const &w : window_tquads) {
+		cube_t bc(w.get_bcube());
+		bool const dim(bc.dy() < bc.dx()); // should be zero size in X or Y
+		bc.expand_in_dim(!dim, -window_h_border*bc.get_sz_dim(!dim));
+		bc.expand_in_dim(2,    -window_v_border*bc.dz());
+		bc.expand_by(window_expand);
+		window_holes.push_back(bc);
 	}
-	else if (attic_type == ATTIC_TYPE_PLASTER) { // or gypsum?
-		add_attic_roof_geom(get_material(b.get_material().wall_tex, 0, 0, 2), WHITE, 1.0, 16.0, b); // no shadows, detail
-		return; // done - rafters not visible
+	if (detail_pass == (small == 2)) { // draw the attic interior
+		if (attic_type == ATTIC_TYPE_WOOD) {
+			add_attic_roof_geom(get_material(tid_nm_pair_t(get_plywood_tid()), 0, 0, small), WHITE, 1.0, 16.0, 0, window_holes, b); // no shadows
+		}
+		else if (attic_type == ATTIC_TYPE_PLASTER) { // or gypsum?
+			add_attic_roof_geom(get_material(b.get_material().wall_tex, 0, 0, small), WHITE, 1.0, 16.0, 0, window_holes, b); // no shadows
+		}
+		else if (attic_type == ATTIC_TYPE_FIBERGLASS) {
+			add_attic_roof_geom(get_material(tid_nm_pair_t(get_insulation_tid()), 0, 0, small), colorRGBA(1.0, 0.7, 0.6), 0.5, 16.0, 0, window_holes, b); // no shadows
+		}
+		else if (attic_type == ATTIC_TYPE_RAFTERS) {
+			add_attic_roof_geom(get_material(b.get_attic_texture(), 0, 0, small), WHITE, 0.1, 8.0, 1, window_holes, b); // no shadows, swap_st=1
+		}
+		else {assert(0);} // unsupported type
 	}
-	else if (attic_type == ATTIC_TYPE_FIBERGLASS) {
-		add_attic_roof_geom(get_material(tid_nm_pair_t(get_insulation_tid()), 0, 0, 2), colorRGBA(1.0, 0.7, 0.6), 0.5, 16.0, b); // no shadows, detail
-	}
-	else {assert(attic_type == ATTIC_TYPE_RAFTERS);}
+	if (!detail_pass || attic_type == ATTIC_TYPE_WOOD || attic_type == ATTIC_TYPE_PLASTER) return; // no rafters to draw
 
 	// build the roof trusses
 	get_wood_material(tscale, 0, 0, 2); // ensure unshadowed material
@@ -599,6 +788,7 @@ void building_room_geom_t::add_attic_rafters(building_t const &b, float tscale) 
 			assert(found);
 			if (beam.dz() < 4.0f*beam_depth) continue; // too short, skip
 			assert(beam.is_strictly_normalized());
+			cube_t beam_seg(beam);
 			// skip top, bottom and face against the roof (top may be partially visible when rotated)
 			unsigned skip_faces(~get_face_mask(dim, dir) | EF_Z12);
 			
@@ -606,7 +796,18 @@ void building_room_geom_t::add_attic_rafters(building_t const &b, float tscale) 
 				if (n == 0          ) {skip_faces |= ~get_face_mask(!dim, 0);}
 				if (n == num_beams-1) {skip_faces |= ~get_face_mask(!dim, 1);}
 			}
-			wood_mat.add_cube_to_verts(beam, WHITE, beam.get_llc(), skip_faces);
+			if (!is_roof) { // triangular wall section; cut out for window holes
+				for (cube_t const &w : window_holes) {
+					if (!beam_seg.intersects(w)) continue;
+					cube_t beam_bot(beam_seg);
+					beam_bot.z2() = w.z1();
+					beam_seg.z1() = w.z2(); // this becomes the bottom segment
+					wood_mat.add_cube_to_verts(beam_bot, WHITE, beam.get_llc(), (skip_faces & ~EF_Z2));
+					skip_faces &= ~EF_Z1;
+					break; // there should only be one
+				}
+			}
+			wood_mat.add_cube_to_verts(beam_seg, WHITE, beam.get_llc(), skip_faces);
 		} // for n
 		if (!is_roof) continue; // below is for sloped roof tquads only
 		// rotate to match slope of roof
@@ -689,7 +890,7 @@ void building_room_geom_t::add_attic_rafters(building_t const &b, float tscale) 
 
 // 0=not in attic, 1=in attic with clearance, 2=in attic without clearance
 int building_t::vent_in_attic_test(cube_t const &vent, bool dim) const {
-	point test_pt(vent.xc(), vent.yc(), (vent.z2() + 1.1*get_fc_thickness()));
+	point test_pt(cube_top_center(vent) + 1.1*get_fc_thickness()*plus_z);
 	if (!point_in_attic(test_pt)) return 0; // not in attic
 	test_pt.z += vent.get_sz_dim(dim) + get_attic_beam_depth(); // check duct height + beam clearance
 	return (point_in_attic(test_pt) ? 1 : 2);
@@ -984,7 +1185,10 @@ void building_room_geom_t::add_skylight_details(cube_t const &skylight, bool has
 			bars[!dmax].push_back(conn);
 		} // for i
 	}
-	rgeom_mat_t &bar_mat(get_untextured_material(1)); // inc_shadows=1
+	// Note: if drawn as exterior, lighting may look better, but it won't cast shadows on the interior;
+	// can draw only the top as exterior, but that's the face oriented toward the light that casts the shadow
+	bool const draw_as_exterior = 0;
+	rgeom_mat_t &bar_mat(get_untextured_material(!draw_as_exterior, 0, 0, 0, draw_as_exterior)); // inc_shadows=1
 
 	for (unsigned d = 0; d < 2; ++d) {
 		for (cube_t const &bar : bars[d]) {bar_mat.add_cube_to_verts_untextured(bar, WHITE, get_skip_mask_for_xy(!d));} // skip ends

@@ -137,9 +137,8 @@ void rect::print() const {
 
 
 void cube_t::set_from_points(point const *const pts, unsigned npts) {
-
 	assert(npts > 0);
-	UNROLL_3X(d[i_][0] = d[i_][1] = pts[0][i_];)
+	set_from_point(pts[0]);
 	for (unsigned i = 1; i < npts; ++i) {union_with_pt(pts[i]);} // get bounding xy rectangle
 }
 
@@ -159,15 +158,12 @@ std::string cube_t::str() const {
 }
 
 std::string cube_t::raw_str() const {
-	
 	std::ostringstream oss;
 	for (unsigned i = 0; i < 6; ++i) {oss << d[i>>1][i&1]; if (i < 5) {oss << " ";}}
 	return oss.str();
 }
 
-
-bool cube_t::is_near_zero_area() const {
-		
+bool cube_t::is_near_zero_area() const {	
 	UNROLL_3X(if (fabs(d[i_][0] - d[i_][1]) < TOLER) return 1;)
 	return 0;
 }
@@ -204,7 +200,7 @@ bool cube_t::cube_intersection(const cube_t &cube, cube_t &res) const { // flags
 	for (unsigned i = 0; i < 3; ++i) {
 		res.d[i][0] = max(d[i][0], cube.d[i][0]);
 		res.d[i][1] = min(d[i][1], cube.d[i][1]);
-		if (res.d[0] >= res.d[1]) return 0; // no intersection
+		if (res.d[0][i] >= res.d[1][i]) return 0; // no intersection
 	}
 	return 1;
 }
@@ -223,13 +219,15 @@ float cube_t::get_overlap_volume(const cube_t &cube) const {
 }
 
 
-vector3d cube_t::closest_side_dir(point const &pos) const { // for fragment velocity
+vector3d cube_t::closest_side_dir(point const &pos, unsigned skip_dims) const {
 
 	int dir(-1);
 	float mdist(0.0);
 	vector3d dv(zero_vector);
 
 	for (unsigned i = 0; i < 3; ++i) {
+		if (skip_dims & (1<<i)) continue;
+
 		for (unsigned j = 0; j < 2; ++j) {
 			float const dist(fabs(d[i][j] - pos[i]));
 
@@ -309,8 +307,9 @@ void cube_t::get_points(point pts[8]) const {
 bool cube_t::line_intersects(point const &p1, point const &p2) const {return check_line_clip(p1, p2, d);}
 
 
-void expand_cubes_by_xy(vect_cube_t &cubes, float val) {
-	for (auto i = cubes.begin(); i != cubes.end(); ++i) {i->expand_by_xy(val);}
+void expand_cubes_by_xy(vect_cube_t &cubes, float val, unsigned start) {
+	assert(start <= cubes.size());
+	for (auto i = cubes.begin() + start; i != cubes.end(); ++i) {i->expand_by_xy(val);}
 }
 bool any_cube_contains_pt_xy(vect_cube_t const &cubes, vector3d const &pos) {
 	for (auto i = cubes.begin(); i != cubes.end(); ++i) {
@@ -325,6 +324,8 @@ bool line_int_cubes_xy(point const &p1, point const &p2, vect_cube_t const &cube
 	return 0;
 }
 bool remove_cube_if_contains_pt_xy(vect_cube_t &cubes, vector3d const &pos, unsigned start) {
+	assert(start <= cubes.size());
+
 	for (auto i = cubes.begin() + start; i != cubes.end(); ++i) {
 		if (i->contains_pt_xy(pos)) {swap(*i, cubes.back()); cubes.pop_back(); return 1;}
 	}
@@ -438,7 +439,6 @@ bool csg_cube::subtract_from_internal(const csg_cube &cube, vector<csg_cube> &ou
 
 
 csg_cube::csg_cube(const coll_obj &cobj, bool use_bounding_cube) : eflags(cobj.cp.surfs) { // coll_obj constructor
-
 	assert(use_bounding_cube || cobj.type == COLL_CUBE);
 	copy_from(cobj);
 	normalize();
@@ -446,7 +446,6 @@ csg_cube::csg_cube(const coll_obj &cobj, bool use_bounding_cube) : eflags(cobj.c
 
 
 inline void csg_cube::write_to_cobj(coll_obj &cobj) const {
-
 	assert(cobj.type == COLL_CUBE);
 	cobj.copy_from(*this);
 	cobj.cp.surfs = eflags;
@@ -454,7 +453,6 @@ inline void csg_cube::write_to_cobj(coll_obj &cobj) const {
 
 
 bool csg_cube::cube_intersection(const csg_cube &cube, csg_cube &res) const { // flags are not set
-
 	res.eflags = 0; // fix later
 	return cube_t::cube_intersection(cube, res);
 }
@@ -560,7 +558,6 @@ bool csg_cube::subtract_from_cylinder(coll_obj_group &new_cobjs, coll_obj &cobj)
 
 
 // returns 1 if some work is done
-// see http://www.cs.fit.edu/~wds/classes/graphics/Clip/clip/clip.html
 bool csg_cube::subtract_from_polygon(coll_obj_group &new_cobjs, coll_obj const &cobj) const { // subtract ourself from cobjs[index]
 
 	// start by assuming *this intersects cobj.d (should have been tested already)

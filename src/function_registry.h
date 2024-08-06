@@ -174,7 +174,8 @@ void draw_projectile_effects(int reflection_pass=0);
 void draw_splash(float x, float y, float z, float size, colorRGBA color=WATER_C);
 void draw_framerate(float val);
 void draw_compass_and_alt();
-void draw_health_bar(float health, float shields, float pu_time=0.0, colorRGBA const &pu_color=BLACK, float extra_bar=0.0, colorRGBA const &extra_bar_color=BLACK, float poisoned=0);
+void draw_health_bar(float health, float shields, float pu_time=0.0, colorRGBA const &pu_color=BLACK, float poisoned=0,
+	vector<status_bar_t> const &extra_bars=vector<status_bar_t>());
 void exec_universe_text(std::string const &text);
 void set_silver_material(shader_t &shader, float alpha=1.0, float brightness=1.0);
 void set_gold_material  (shader_t &shader, float alpha=1.0, float brightness=1.0);
@@ -233,7 +234,7 @@ void disable_flares();
 void draw_tquad(float xsize, float ysize, float z, int prim_type=GL_TRIANGLE_FAN);
 void draw_one_tquad(float x1, float y1, float x2, float y2, float z, int prim_type=GL_TRIANGLE_FAN);
 int get_line_as_quad_pts(point const &p1, point const &p2, float w1, float w2, point pts[4]);
-void draw_simple_cube(cube_t const &c, bool texture=0, unsigned dim_mask=0xFF);
+void draw_simple_cube(cube_t const &c, bool texture=0, unsigned dim_mask=0xFF, vector3d const *const view_dir=nullptr);
 void draw_cube(point const &pos, float sx, float sy, float sz, bool texture, float texture_scale=1.0,
 	bool proportional_texture=0, vector3d const *const view_dir=NULL, unsigned dim_mask=0xFF, bool swap_y_st=0);
 void gen_quad_tex_coords(float *tdata, unsigned num, unsigned stride);
@@ -284,7 +285,7 @@ void clear_tiled_terrain(bool no_regen_buildings=0);
 void reset_tiled_terrain_state();
 void clear_tiled_terrain_shaders();
 float get_tiled_terrain_water_level();
-bool try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only=0);
+bool try_bind_tile_smap_at_point(point const &pos, shader_t &s, bool check_only=0, unsigned *lod_level=nullptr);
 void invalidate_tile_smap_at_pt(point const &pos, float radius, bool repeat_next_frame=0);
 uint64_t get_tile_id_containing_point(point const &pos);
 uint64_t get_tile_id_containing_point_no_xyoff(point const &pos);
@@ -304,7 +305,7 @@ void setup_tile_shader_shadow_map(shader_t &s);
 
 // function prototypes - precipitation
 void draw_local_precipitation(bool no_update=0);
-void draw_underwater_particles(float terrain_zmin);
+void draw_underwater_particles(float terrain_zmin, colorRGBA const &base_color=WHITE);
 
 // function prototypes - map_view
 void draw_overhead_map();
@@ -316,7 +317,7 @@ void gen_object_pos(point &position, unsigned flags);
 void gen_bubble(point const &pos, float r=0.0, colorRGBA const &c=WATER_C);
 void gen_line_of_bubbles(point const &p1, point const &p2, float r=0.0, colorRGBA const &c=WATER_C);
 bool gen_arb_smoke(point const &pos, colorRGBA const &bc, vector3d const &iv, float r, float den, float dark, float dam,
-	int src, int dt, bool as, float spread=1.0, bool no_lighting=0);
+	int src, int dt, bool as, float spread=1.0, bool no_lighting=0, float tsfact=1.0);
 bool gen_smoke(point const &pos, float zvel_scale=1.0, float radius_scale=1.0, colorRGBA const &color=WHITE, bool no_lighting=0);
 bool gen_fire(point const &pos, float size, int source, bool allow_close=0, bool is_static=0, float light_bwidth=1.0, float intensity=1.0);
 void gen_decal(point const &pos, float radius, vector3d const &orient, int tid, int cid=-1, colorRGBA const &color=BLACK,
@@ -367,8 +368,7 @@ void get_city_road_bcubes(vect_cube_t &bcubes, bool connector_only);
 void next_city_frame(bool use_threads_2_3);
 void draw_cities(int shadow_only, int reflection_pass, int trans_op_mask, vector3d const &xlate);
 unsigned check_city_sphere_coll(point const &pos, float radius, bool exclude_bridges_and_tunnels, bool ret_first_coll=1, unsigned check_mask=3);
-void get_city_sphere_coll_cubes(point const &pos, float radius, bool include_intersections, bool xy_only, vect_cube_t &out, vect_cube_t *out_bt=nullptr);
-bool proc_city_sphere_coll(point &pos, point const &p_last, float radius, float prev_frame_zval, bool xy_only, bool inc_cars=0, vector3d *cnorm=nullptr, bool check_interior=0);
+bool proc_city_sphere_coll(point &pos, point const &p_last, float radius, float prev_frame_zval, bool inc_cars=0, vector3d *cnorm=nullptr, bool check_interior=0);
 bool line_intersect_city(point const &p1, point const &p2, float &t, bool ret_any_pt=0);
 bool line_intersect_city(point const &p1, point const &p2, point &p_int);
 bool check_valid_scenery_pos(point const &pos, float radius, bool is_tall=0);
@@ -537,13 +537,14 @@ bool sphere_cube_intersect_xy(point const &pos, float radius, cube_t const &cube
 bool ellipse_cube_intersect(point const &pos, vector3d const &radius, cube_t const &cube);
 bool sphere_cube_intersect(point const &pos, float radius, cube_t const &cube, point const &p_last,
 						   point &p_int, vector3d &norm, unsigned &cdir, bool check_int=1, bool skip_z=0);
-bool sphere_cube_int_update_pos(point &pos, float radius, cube_t const &cube, point const &p_last, bool check_int=1, bool skip_z=0, vector3d *cnorm=nullptr);
+bool sphere_cube_int_update_pos(point &pos, float radius, cube_t const &cube, point const &p_last, bool skip_z=0, vector3d *cnorm=nullptr);
 bool coll_sphere_cylin_int(point const &sc, float sr, coll_obj const &c);
 bool sphere_def_coll_vert_cylin(point const &sc, float sr, point const &cp1, point const &cp2, float cr);
 bool approx_poly_cylin_int(point const *const pts, unsigned npts, cylinder_3dw const &cylin);
 bool do_line_clip(point &v1, point &v2, float const d[3][2]);
 bool get_line_clip(point const &v1, point const &v2, float const d[3][2], float &tmin, float &tmax);
 bool get_line_clip_xy(point const &v1, point const &v2, float const d[3][2], float &tmin, float &tmax);
+void clip_polygon_xy(vector<point> const &pts, cube_t const &c, vector<point> &pts_out);
 float line_line_dist(point const &p1a, point const &p1b, point const &p2a, point const &p2b);
 float get_cylinder_params(point const &cp1, point const &cp2, point const &pos, vector3d &v1, vector3d &v2);
 int  line_intersect_trunc_cone(point const &p1, point const &p2, point const &cp1, point const &cp2,
@@ -611,9 +612,10 @@ void load_textures();
 unsigned get_loaded_textures_cpu_mem();
 unsigned get_loaded_textures_gpu_mem();
 int texture_lookup(std::string const &name);
-int get_texture_by_name(std::string const &name, bool is_normal_map=0, bool invert_y=0, int wrap_mir=1, float aniso=0.0, bool allow_compress=1, int use_mipmaps=1, unsigned ncolors=3);
+int get_texture_by_name(std::string const &name, bool is_normal_map=0, bool invert_y=0, int wrap_mir=1, float aniso=0.0,
+	bool allow_compress=1, int use_mipmaps=1, unsigned ncolors=3, bool is_alpha_mask=0);
 unsigned load_cube_map_texture(std::string const &name);
-bool select_texture(int id);
+bool select_texture(int id, unsigned tu_id=0);
 void update_player_bbb_texture(float extra_blood, bool recreate);
 float get_tex_ar(int id);
 void bind_1d_texture(unsigned tid, bool is_array=0);
@@ -1012,15 +1014,11 @@ void gen_buildings();
 void draw_buildings(int shadow_only, int reflection_pass, vector3d const &xlate);
 void draw_building_lights(vector3d const &xlate);
 void set_buildings_pos_range(cube_t const &pos_range);
-bool check_buildings_point_coll(point const &pos, bool apply_tt_xlate, bool xy_only, bool check_interior=0);
-bool check_buildings_sphere_coll(point const &pos, float radius, bool apply_tt_xlate, bool xy_only, bool check_interior=0, bool exclude_city=0);
-bool proc_buildings_sphere_coll(point &pos, point const &p_last, float radius, bool xy_only, vector3d *cnorm=nullptr, bool check_interior=0, bool exclude_city=0);
 unsigned check_buildings_line_coll(point const &p1, point const &p2, float &t, unsigned &hit_bix, bool ret_any_pt=0);
 bool check_line_coll_building(point const &p1, point const &p2, unsigned building_id);
 cube_t get_building_bcube(unsigned building_id);
 cube_t get_sec_building_bcube(unsigned building_id);
 int get_building_bcube_contains_pos(point const &pos);
-bool check_buildings_ped_coll(point const &pos, float radius, unsigned plot_id, unsigned &building_id);
 bool select_building_in_plot(unsigned plot_id, unsigned rand_val, unsigned &building_id);
 void get_building_bcubes(cube_t const &xy_range, vect_cube_t &bcubes);
 void get_building_bcubes(cube_t const &xy_range, vect_cube_with_ix_t &bcubes);
@@ -1036,13 +1034,14 @@ void free_building_indir_texture();
 void end_building_rt_job();
 
 // function prototypes - csg
-void expand_cubes_by_xy(vect_cube_t &cubes, float val);
+void expand_cubes_by_xy(vect_cube_t &cubes, float val, unsigned start=0);
 bool any_cube_contains_pt_xy(vect_cube_t const &cubes, vector3d const &pos);
 bool line_int_cubes_xy(point const &p1, point const &p2, vect_cube_t const &cubes);
 bool remove_cube_if_contains_pt_xy(vect_cube_t &cubes, vector3d const &pos, unsigned start=0);
 
 void sleep_for_ms(unsigned milliseconds);
 void checked_fclose(FILE *fp);
+bool endswith(std::string const &value, std::string const &ending);
 
 #include "inlines.h"
 

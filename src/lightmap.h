@@ -161,21 +161,21 @@ class local_smap_manager_t;
 class light_source { // size = 116
 
 protected:
-	bool dynamic, enabled, user_placed, is_cube_face, is_cube_light, no_shadows;
-	unsigned smap_index, user_smap_id, smap_mgr_id, cube_eflags, num_dlight_rays; // smap_index = index of shadow map texture/data
-	float radius, radius_inv, r_inner, bwidth, near_clip;
+	bool dynamic=0, enabled=0, user_placed=0, is_cube_face=0, is_cube_light=0, no_shadows=0;
+	unsigned smap_index=0, user_smap_id=0, smap_mgr_id=0, cube_eflags=0, num_dlight_rays=0; // smap_index = index of shadow map texture/data
+	float radius=0.0, radius_inv=0.0, r_inner=0.0, bwidth=0.0, near_clip=0.0, far_clip=0.0;
 	point pos, pos2; // point/sphere light: use pos; line/cylinder light: use pos and pos2
 	vector3d dir;
-	colorRGBA color;
+	colorRGBA color=BLACK;
 	cube_t custom_bcube;
 
-	float calc_cylin_end_radius() const;
+	float calc_cylin_end_radius(float falloff=0.0) const;
 	local_smap_manager_t &get_smap_mgr() const;
 
 public:
-	light_source() : dynamic(0), enabled(0), user_placed(0), is_cube_face(0), is_cube_light(0), no_shadows(0), smap_index(0), user_smap_id(0), smap_mgr_id(0), cube_eflags(0),
-		num_dlight_rays(0), radius(0.0f), radius_inv(0.0f), r_inner(0.0f), bwidth(0.0f), near_clip(0.0f), pos(all_zeros), pos2(all_zeros), dir(zero_vector), color(BLACK) {}
-	light_source(float sz, point const &p, point const &p2, colorRGBA const &c, bool id=0, vector3d const &d=zero_vector, float bw=1.0, float ri=0.0, bool icf=0, float nc=0.0);
+	light_source() {}
+	light_source(float sz, point const &p, point const &p2, colorRGBA const &c, bool id=0,
+		vector3d const &d=zero_vector, float bw=1.0, float ri=0.0, bool icf=0, float nc=0.0, float fc=0.0);
 	void mark_is_cube_light(unsigned eflags) {is_cube_light = 1; cube_eflags = eflags;}
 	void set_dynamic_state(point const &pos_, vector3d const &dir_, colorRGBA const &color_, bool enabled_) {pos = pos2 = pos_; dir = dir_; color = color_; enabled = enabled_;}
 	void set_num_dlight_rays(unsigned num) {num_dlight_rays = num;} // zero = use default
@@ -193,8 +193,9 @@ public:
 	float get_dir_intensity(vector3d const &obj_dir) const;
 	void get_bounds(cube_t &bcube, int bnds[3][2], float sqrt_thresh, bool clip_to_scene_bcube=0, vector3d const &bounds_offset=zero_vector) const;
 	void set_custom_bcube(cube_t const c) {custom_bcube = c;}
-	cube_t calc_bcube(bool add_pad=0, float sqrt_thresh=0.0, bool clip_to_scene_bcube=0) const;
-	cylinder_3dw calc_bounding_cylin(float sqrt_thresh=0.0, bool clip_to_scene_bcube=0) const;
+	bool has_custom_bcube() const {return !custom_bcube.is_all_zeros();}
+	cube_t calc_bcube(bool add_pad=0, float sqrt_thresh=0.0, bool clip_to_scene_bcube=0, float falloff=0.0) const;
+	cylinder_3dw calc_bounding_cylin( float sqrt_thresh=0.0, bool clip_to_scene_bcube=0, float falloff=0.0) const;
 	pos_dir_up calc_pdu(bool dynamic_cobj, bool is_cube_face, float falloff) const;
 	unsigned get_cube_eflags() const {return cube_eflags;}
 	unsigned get_num_rays()    const {return num_dlight_rays;}
@@ -219,6 +220,8 @@ public:
 	void setup_and_bind_smap_texture(shader_t &s, bool &arr_tex_set) const;
 	void write_to_cobj_file(std::ostream &out, bool is_diffuse) const;
 	void draw_light_cone(shader_t &shader, float alpha) const;
+	bool alloc_shadow_map(bool &matched_smap_id, unsigned sm_size=0);
+	void update_shadow_map(bool matched_smap_id, float falloff, bool dynamic_cobj=0, bool outdoor_shadows=0, bool force_update=0);
 	bool setup_shadow_map(float falloff, bool dynamic_cobj=0, bool outdoor_shadows=0, bool force_update=0, unsigned sm_size=0);
 	void release_smap();
 	void invalidate_cached_smap_id(unsigned smap_id) const;

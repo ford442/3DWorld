@@ -41,12 +41,12 @@ vector4d clip_plane;
 vector<camera_filter> cfilters;
 pt_line_drawer bubble_pld;
 
-extern bool have_sun, using_lightmap, has_dl_sources, has_spotlights, has_line_lights, smoke_exists, two_sided_lighting, tree_indir_lighting, display_frame_time;
+extern bool have_sun, using_lightmap, has_dl_sources, has_spotlights, has_line_lights, smoke_exists, two_sided_lighting, tree_indir_lighting;
 extern bool group_back_face_cull, have_indir_smoke_tex, combined_gu, enable_depth_clamp, dynamic_smap_bias, volume_lighting, dl_smap_enabled, underwater;
 extern bool enable_gamma_correct, smoke_dlights, enable_clip_plane_z, enable_cube_map_bump_maps, enable_tt_model_indir, fast_transparent_spheres, disable_dlights;
-extern bool enable_dlight_bcubes;
+extern bool enable_dlight_bcubes, enable_ground_csm;
 extern int is_cloudy, iticks, frame_counter, display_mode, show_fog, use_smoke_for_fog, num_groups, xoff, yoff;
-extern int window_width, window_height, game_mode, draw_model, camera_mode, DISABLE_WATER, animate2, camera_coll_id;
+extern int window_width, window_height, game_mode, draw_model, camera_mode, DISABLE_WATER, animate2, camera_coll_id, stats_display_mode;
 extern unsigned smoke_tid, dl_tid, create_voxel_landscape, enabled_lights, reflection_tid, scene_smap_vbo_invalid, sky_zval_tid, skybox_tid;
 extern float zmin, light_factor, fticks, perspective_fovy, perspective_nclip, cobj_z_bias, clip_plane_z, fog_dist_scale, sky_occlude_scale, cloud_cover;
 extern double tfticks;
@@ -81,6 +81,7 @@ extern reflective_cobjs_t reflective_cobjs;
 void create_dlight_volumes();
 void create_sky_vis_zval_texture(unsigned &tid);
 void pre_bind_smap_tus(shader_t &s);
+uint64_t get_tiled_terrain_gpu_mem();
 
 
 void set_fill_mode() {
@@ -251,7 +252,7 @@ void set_indir_color(shader_t &s) {
 void set_indir_lighting_block(shader_t &s, bool use_smoke, bool use_indir) {
 
 	s.setup_scene_bounds();
-	if ((use_smoke || use_indir) && smoke_tid) {set_3d_texture_as_current(smoke_tid, 1);}
+	if ((use_smoke || use_indir) && smoke_tid) {bind_texture_tu(smoke_tid, 1);}
 	s.add_uniform_int("smoke_and_indir_tex", 1);
 	s.add_uniform_float("half_dxy", HALF_DXY);
 	s.add_uniform_float("indir_vert_offset", indir_vert_offset);
@@ -260,7 +261,7 @@ void set_indir_lighting_block(shader_t &s, bool use_smoke, bool use_indir) {
 
 	// hemispherical lighting
 	s.add_uniform_color("sky_color", colorRGB(bkg_color));
-	select_multitex(LANDSCAPE_TEX, 12, 1); // even for tiled terrain mode?
+	select_texture(LANDSCAPE_TEX, 12); // even for tiled terrain mode?
 	s.add_uniform_int("ground_tex", 12);
 }
 
@@ -280,7 +281,6 @@ void common_shader_block_post(shader_t &s, bool dlights, bool use_shadow_map, bo
 		if (world_mode == WMODE_GROUND) {set_smap_shader_for_all_lights(s, cobj_z_bias);}
 		else {pre_bind_smap_tus(s);} // TT mode still requires binding the texture units
 	}
-	set_active_texture(0);
 	s.clear_specular();
 	if (world_mode == WMODE_INF_TERRAIN) {setup_tt_fog_post(s);}
 }
@@ -292,13 +292,12 @@ bool is_smoke_in_use() {return (smoke_exists || use_smoke_for_fog);}
 
 
 void set_smoke_shader_prefixes(shader_t &s, int use_texgen, bool keep_alpha, bool direct_lighting, bool smoke_enabled,
-	bool has_lt_atten, bool use_smap, int use_bmap, bool use_spec_map, bool use_mvm, bool use_tsl, bool use_gloss_map)
+	bool has_lt_atten, bool use_smap, int use_bmap, bool use_spec_map, bool use_mvm, bool use_gloss_map)
 {
 	s.set_int_prefix("use_texgen", use_texgen, 0); // VS
 	s.set_prefix(make_shader_bool_prefix("keep_alpha",          keep_alpha),      1); // FS
 	s.set_prefix(make_shader_bool_prefix("direct_lighting",     direct_lighting), 1); // FS
 	s.set_prefix(make_shader_bool_prefix("do_lt_atten",         has_lt_atten),    1); // FS
-	s.set_prefix(make_shader_bool_prefix("two_sided_lighting",  use_tsl), 1); // FS
 	s.set_prefix(make_shader_bool_prefix("use_fg_ViewMatrix",   use_mvm), 0); // VS
 	s.set_prefix(make_shader_bool_prefix("use_fg_ViewMatrix",   use_mvm), 1); // FS
 	s.set_prefix(make_shader_bool_prefix("enable_clip_plane_z", enable_clip_plane_z), 1); // FS
@@ -314,7 +313,7 @@ void set_smoke_shader_prefixes(shader_t &s, int use_texgen, bool keep_alpha, boo
 			s.set_prefix("#define SMOKE_ENABLED", d);
 		}
 		if (volume_lighting && use_smap) {s.set_prefix("#define SMOKE_SHADOW_MAP", 1);} // FS
-		if (smoke_dlights) {s.set_prefix("#define SMOKE_DLIGHTS", 1);} // FS - TESTING
+		if (smoke_dlights) {s.set_prefix("#define SMOKE_DLIGHTS", 1);} // FS
 
 		if (use_smoke_noise()) {
 			s.set_prefix("#define SMOKE_NOISE",   1); // FS
@@ -350,12 +349,18 @@ unsigned get_sky_zval_texture() {
 
 void invalidate_snow_coverage() {free_texture(sky_zval_tid);}
 
+void setup_puddles_texture(shader_t &s) {
+	bind_texture_tu(get_noise_tex_3d(64, 1), 11); // grayscale noise
+	s.add_uniform_int("wet_noise_tex", 11);
+}
+
 
 // texture units used: 0: object texture, 1: smoke/indir lighting texture, 2-4 dynamic lighting, 5: bump map, 6-7: shadow map,
 //                     8: specular map, 9: depth map/future gloss map (unused), 10: burn mask/sky_zval, 11: noise, 12: landscape texture/blue noise,
 //                     13: depth, 14: reflection, 15: ripples/dlight bcubes, 16-31: dlight shadow maps
 // use_texgen: 0 = use texture coords, 1 = use standard texture gen matrix, 2 = use custom shader tex0_s/tex0_t,
 //             3 = use vertex id for texture, 4 = use bent quad vertex id for texture, 5 = mix between tc and texgen using tc_texgen_mix
+//             6 = similar to 5, except ensure X and Y have opposite signs so that they don't cancel on near 45 degree edges
 // use_bmap  : 0 = none, 1 = auto generate tangent vector, 2 = tangent vector in vertex attribute
 // is_outside: 0 = inside, 1 = outside, 2 = use snow coverage mask
 // enable_reflect: 0 = none, 1 = planar, 2 = cube map
@@ -382,6 +387,7 @@ void setup_smoke_shaders(shader_t &s, float min_alpha, int use_texgen, bool keep
 	if (enable_reflect ==2) {s.set_prefix("#define ENABLE_CUBE_MAP_REFLECT",1);} // FS
 	if (enable_puddles    ) {s.set_prefix("#define ENABLE_PUDDLES",         1);} // FS
 	if (is_snowy          ) {s.set_prefix("#define ENABLE_SNOW_COVERAGE",   1);} // FS
+	if (use_smap && enable_ground_csm) {s.set_prefix("#define ENABLE_CASCADED_SHADOW_MAPS", 1);} // FS
 	if (!anim_shader.empty()) {s.set_prefix("#define ENABLE_VERTEX_ANIMATION", 0);} // VS
 	if (use_clip_plane    ) {s.set_prefix("#define ENABLE_CLIP_PLANE",      0);} // VS
 	//if (0) {s.set_prefix("#define SCREEN_SPACE_DLIGHTS",   1);} // FS
@@ -390,7 +396,7 @@ void setup_smoke_shaders(shader_t &s, float min_alpha, int use_texgen, bool keep
 	common_shader_block_pre(s, dlights, use_smap, indir_lighting, min_alpha, 0, use_wet_mask);
 	bool const enable_sky_occlusion(sky_occlude_scale > 0.0 && direct_lighting && !indir_lighting); // Note: common_shader_block_pre() changes indir_lighting
 	if (enable_sky_occlusion) {s.set_prefix("#define ENABLE_SKY_OCCLUSION", 1);} // FS
-	set_smoke_shader_prefixes(s, use_texgen, keep_alpha, direct_lighting, smoke_en, has_lt_atten, use_smap, use_bmap, use_spec_map, use_mvm, force_tsl, use_gloss_map);
+	set_smoke_shader_prefixes(s, use_texgen, keep_alpha, direct_lighting, smoke_en, has_lt_atten, use_smap, use_bmap, use_spec_map, use_mvm, use_gloss_map);
 	s.set_vert_shader(anim_shader + "texture_gen.part+bump_map.part+leaf_wind.part+no_lt_texgen_smoke");
 	string fstr("linear_fog.part+bump_map.part+spec_map.part+ads_lighting.part*+shadow_map.part*+dynamic_lighting.part*+line_clip.part*+indir_lighting.part+black_body_burn.part+");
 	if (smoke_en && use_smoke_noise()) {fstr += "perlin_clouds_3d.part*+";}
@@ -410,6 +416,7 @@ void setup_smoke_shaders(shader_t &s, float min_alpha, int use_texgen, bool keep
 	if (use_spec_map ) {s.add_uniform_int("spec_map",  8);}
 	if (use_gloss_map) {s.add_uniform_int("gloss_map", 9);}
 	if (triplanar_tex) {s.add_uniform_float("tex_scale", triplanar_texture_scale);}
+	s.add_uniform_int("two_sided_lighting", force_tsl); // set as an int
 	common_shader_block_post(s, dlights, use_smap, smoke_en, indir_lighting, min_alpha);
 	float const step_delta_scale((use_smoke_for_fog || get_smoke_at_pos(get_camera_pos())) ? 1.0 : 2.0);
 	s.add_uniform_float("step_delta", step_delta_scale*HALF_DXY);
@@ -423,7 +430,7 @@ void setup_smoke_shaders(shader_t &s, float min_alpha, int use_texgen, bool keep
 		s.add_uniform_float("smoke_const_add", ((use_smoke_for_fog == 1) ? CLIP_TO_01(0.25f/fog_dist_scale) : 0.0f));
 
 		if (use_smoke_noise()) {
-			set_3d_texture_as_current(get_noise_tex_3d(64, 1), 11); // grayscale noise
+			bind_texture_tu(get_noise_tex_3d(64, 1), 11); // grayscale noise
 			s.add_uniform_int("cloud_noise_tex", 11);
 			s.add_uniform_float("smoke_noise_mag", SMOKE_NOISE_MAG);
 			s.add_uniform_float("noise_scale", 0.45);
@@ -434,19 +441,19 @@ void setup_smoke_shaders(shader_t &s, float min_alpha, int use_texgen, bool keep
 		}
 		if (volume_lighting && use_smap && shadow_map_enabled()) {
 			s.add_uniform_int("blue_noise_tex", 12);
-			select_multitex(get_texture_by_name("noise/blue_noise.png"), 12);
+			select_texture(get_texture_by_name("noise/blue_noise.png"), 12);
 		}
 	}
 	if (use_burn_mask) {
 		s.add_uniform_float("burn_tex_scale", burn_tex_scale);
 		s.add_uniform_float("burn_offset", -2.0); // starts disabled
 		s.add_uniform_int("burn_mask", 10);
-		select_multitex(DISINT_TEX, 10); // PLASMA_TEX?
+		select_texture(DISINT_TEX, 10); // PLASMA_TEX?
 	}
 	if (enable_reflect) {s.add_uniform_int("reflection_tex", 14);}
 
 	if (enable_reflect == 1) {
-		select_multitex(RIPPLE_MAP_TEX, 15);
+		select_texture(RIPPLE_MAP_TEX, 15);
 		s.add_uniform_int("ripple_tex", 15);
 		static float ripple_time(0.0);
 		static int update_frame(0);
@@ -457,14 +464,11 @@ void setup_smoke_shaders(shader_t &s, float min_alpha, int use_texgen, bool keep
 		s.add_uniform_float("reflect_plane_zbot", bcube.d[2][0]);
 		s.add_uniform_float("reflect_plane_ztop", bcube.d[2][1]);
 	}
-	if (enable_puddles) {
-		set_3d_texture_as_current(get_noise_tex_3d(64, 1), 11); // grayscale noise
-		s.add_uniform_int("wet_noise_tex", 11);
-	}
 	if (use_wet_mask || is_snowy || enable_sky_occlusion) {
 		bind_texture_tu(get_sky_zval_texture(), 10);
 		s.add_uniform_int("sky_zval_tex", 10);
 	}
+	if (enable_puddles) {setup_puddles_texture(s);}
 	// simple zval-based ambient occlusion, similar to shadow map; not as good as precomputed indirect lighting
 	if (enable_sky_occlusion) {s.add_uniform_float("sky_occlude_scale", sky_occlude_scale);}
 	// need to handle wet/outside vs. dry/inside surfaces differently, so the caller must either set is_outside properly or override wet and snow values
@@ -480,7 +484,7 @@ void set_tree_branch_shader(shader_t &s, bool direct_lighting, bool dlights, boo
 	float const water_depth(setup_underwater_fog(s, 1)); // FS
 	bool indir_lighting(direct_lighting && tree_indir_lighting);
 	common_shader_block_pre(s, dlights, use_smap, indir_lighting, 0.0, 1); // no_dl_smap=1
-	set_smoke_shader_prefixes(s, 0, 0, direct_lighting, 0, 0, use_smap, 0, 0, 0, 0, 0);
+	set_smoke_shader_prefixes(s, 0, 0, direct_lighting, 0, 0, use_smap, 0, 0, 0, 0);
 	s.set_vert_shader("texture_gen.part+bump_map.part+leaf_wind.part+no_lt_texgen_smoke");
 	s.set_frag_shader("linear_fog.part+bump_map.part+ads_lighting.part*+shadow_map.part*+dynamic_lighting.part*+line_clip.part*+indir_lighting.part+textured_with_smoke");
 	s.begin_shader();
@@ -497,12 +501,13 @@ void setup_procedural_shaders(shader_t &s, float min_alpha, bool indir_lighting,
 	common_shader_block_pre(s, dlights, use_smap, indir_lighting, min_alpha, 0);
 	
 	if (use_bmap) {
-		s.set_prefix("#define USE_BUMP_MAP",    1); // FS
-		s.set_prefix("#define BUMP_MAP_CUSTOM", 1); // FS
+		s.set_prefix("#define USE_BUMP_MAP",       1); // FS
+		s.set_prefix("#define BUMP_MAP_CUSTOM",    1); // FS
 		s.set_prefix("#define USE_BUMP_MAP_INDIR", 1); // FS
 		s.set_prefix("#define USE_BUMP_MAP_DL",    1); // FS
 		s.set_prefix(make_shader_bool_prefix("use_fg_ViewMatrix", 0), 1); // FS - disabled
 	}
+	if (use_smap && enable_ground_csm) {s.set_prefix("#define ENABLE_CASCADED_SHADOW_MAPS", 1);} // FS
 	s.set_prefix(make_shader_bool_prefix("use_noise_tex", use_noise_tex), 1); // FS
 	s.set_prefix(make_shader_bool_prefix("z_top_test",    z_top_test),    1); // FS
 	s.setup_enabled_lights(2, 2); // FS; only 2, but could be up to 8 later
@@ -520,7 +525,7 @@ void setup_procedural_shaders(shader_t &s, float min_alpha, bool indir_lighting,
 		s.add_uniform_float("tex_mix_saturate", tex_mix_saturate);
 	}
 	if (use_bmap) {
-		select_multitex(ROCK_NORMAL_TEX, 11, 1);
+		select_texture(ROCK_NORMAL_TEX, 11);
 		s.add_uniform_int("bump_map", 11);
 		s.add_uniform_float("bump_tex_scale", 4.0);
 	}
@@ -669,7 +674,7 @@ void draw_cobjs_group(vector<unsigned> const &cobjs, cobj_draw_buffer &cdb, int 
 			if (c.cp.normal_map != nm_tid) { // normal map change
 				cdb.flush();
 				nm_tid = c.cp.normal_map;
-				select_multitex(nm_tid, 5);
+				select_texture(nm_tid, 5);
 			}
 			if (bbs != bump_b_scale) {
 				cdb.flush();
@@ -1130,7 +1135,7 @@ void set_cloud_intersection_shader(shader_t &s) {
 	s.add_uniform_float   ("dx", cur_spo.dx);
 	s.add_uniform_float   ("dy", cur_spo.dy);
 	s.add_uniform_int("cloud_tex", 8);
-	select_multitex(CLOUD_TEX, 8, 1);
+	select_texture(CLOUD_TEX, 8);
 }
 
 
@@ -1330,19 +1335,14 @@ void bubble::draw(bool set_liquid_color) const {
 
 order_vect_t particle_cloud::order;
 
-
 void particle_cloud::draw(quad_batch_draw &qbd) const {
 
 	assert(status);
 	colorRGBA color(base_color);
 	color.A *= density;
-	
-	if (is_fire()) {
-		color.G *= get_rscale();
-	}
-	else {
-		color *= (no_lighting ? 1.0 : brightness)*(0.5*(1.0 - darkness));
-	}
+	if (is_fire()) {color.G *= get_rscale();}
+	else {color *= (no_lighting ? 1.0 : brightness)*(0.5*(1.0 - darkness));}
+
 	if (parts.empty()) {
 		if (status && sphere_in_camera_view(pos, radius, 0)) {draw_part(pos, radius, color, qbd);}
 	}
@@ -1494,12 +1494,11 @@ void draw_bubbles() {
 void draw_part_clouds(vector<particle_cloud> const &pc, int tid) {
 
 	enable_flares(tid);
-	//select_multitex(CLOUD_TEX, 1);
+	//select_texture(CLOUD_TEX, 1);
 	static quad_batch_draw qbd;
 	draw_objects(pc, qbd);
 	qbd.draw_and_clear(); // color will be set per object
 	disable_flares();
-	//set_active_texture(0);
 }
 
 
@@ -1699,8 +1698,8 @@ void draw_cracks_and_decals() {
 				bullet_shader.add_uniform_float("bump_tb_scale", -1.0); // invert the coordinate system (something backwards?)
 				bullet_shader.add_uniform_float("hole_depth", 0.2);
 				bullet_shader.add_uniform_int("depth_map", 9);
-				select_multitex(BULLET_N_TEX, 5, 0);
-				select_multitex(BULLET_D_TEX, 9, 1);
+				select_texture(BULLET_N_TEX, 5);
+				select_texture(BULLET_D_TEX, 9);
 			}
 			bullet_shader.enable();
 		}
@@ -1732,7 +1731,6 @@ void setup_depth_trans_texture(shader_t &s, unsigned &depth_tid) {
 	setup_depth_tex(s, depth_tu_id);
 	depth_buffer_to_texture(depth_tid);
 	bind_texture_tu(depth_tid, depth_tu_id);
-	set_active_texture(0);
 }
 
 void draw_smoke_and_fires() {
@@ -1815,7 +1813,7 @@ void draw_camera_filters(vector<camera_filter> &cfs) {
 
 point world_space_to_screen_space(point const &pos) { // returns screen space normalized to [0.0, 1.0]
 
-	double mats[2][16];
+	double mats[2][16] = {};
 	fgGetMVM().get_as_doubles(mats[0]); // Model = MVM
 	fgGetPJM().get_as_doubles(mats[1]); // Proj
 	int const view[4] = {0, 0, 1, 1};
@@ -1934,13 +1932,26 @@ void draw_splashes() {
 
 void draw_framerate(float val) {
 
-	char text[32];
-	if (display_frame_time) {sprintf(text, "%.2f", 1000.0/val);} // frame time in ms
-	else {sprintf(text, "%i", round_fp(val));} // framerate in FPS
+	char text[64];
+
+	switch (stats_display_mode) {
+	case 0: // framerate in FPS
+		sprintf(text, "%i", round_fp(val));
+		break;
+	case 1: // frame time in ms
+		sprintf(text, "%.2f", 1000.0/val);
+		break;
+	case 2: // frame stats
+		// Note: GPU memory usage is approximate and may miss some data
+		// Note: CPU memory usage would be useful to show, but there's no cross-platform way to get this
+		sprintf(text, "Time: %.2f  Draws: %u  GPU Mem: %u", 1000.0/val, num_frame_draw_calls, in_mb(get_tiled_terrain_gpu_mem()));
+		break;
+	case 3: return; // off
+	default: assert(0);
+	}
 	float const ar(((float)window_width)/((float)window_height));
 	draw_text(WHITE, -0.011*ar, -0.011, -0.02, text);
 }
-
 
 void draw_compass_and_alt() { // and temperature
 
@@ -1961,53 +1972,80 @@ void draw_compass_and_alt() { // and temperature
 	}
 }
 
+// Note: icons are from https://www.svgrepo.com
+string const icon_fns[NUM_ICONS] = {"plus", "shield", "fist", "alcohol", "toilet", "droplet", "oxygen", "carry"};
 
+int get_icon_tid(unsigned icon_id) {
+	assert(icon_id < NUM_ICONS);
+	string const fn("icons/" + icon_fns[icon_id] + ".png"); // all 128x128 PNGs
+	return get_texture_by_name(fn, 0, 0, 0); // wrap_mir=0 (clamp)
+}
+void draw_icon(shader_t &s, unsigned icon_id, float x1, float x2, float y1, float y2, float zval) {
+	s.set_cur_color(WHITE);
+	select_texture(get_icon_tid(icon_id));
+	draw_one_tquad(x1, y1, x2, y2, zval);
+	select_texture(WHITE_TEX);
+}
 void draw_stats_bar(shader_t &s, colorRGBA const &color, float max_val, float cur_val, float x, float y1, float y2, float zval) {
 	s.set_cur_color(colorRGBA(color, 0.2));
 	draw_one_tquad(-0.9*x, y1, (-0.9 + 0.2*max_val)*x, y2, zval); // full background
 	s.set_cur_color(color);
 	draw_one_tquad(-0.9*x, y1, (-0.9 + 0.2*cur_val)*x, y2, zval);
 }
-void draw_health_bar(float health, float shields, float pu_time, colorRGBA const &pu_color, float extra_bar, colorRGBA const &extra_bar_color, float poisoned) {
-
+void draw_health_bar(float health, float shields, float pu_time, colorRGBA const &pu_color, float poisoned, vector<status_bar_t> const &extra_bars) {
 	shader_t s;
-	s.begin_color_only_shader();
+	s.begin_simple_textured_shader();
+	select_texture(WHITE_TEX);
 	glDisable(GL_DEPTH_TEST);
 	enable_blend();
-	bool const building_gameplay_mode(world_mode == WMODE_INF_TERRAIN && game_mode == 2);
+	bool const building_gameplay_mode(world_mode == WMODE_INF_TERRAIN && game_mode == GAME_MODE_BUILDINGS);
 	float const zval(-1.1*perspective_nclip), tan_val(tan(perspective_fovy/TO_DEG));
 	float const y(-0.7*0.5*zval*tan_val), x((y*window_width)/window_height);
+	float const icon_sz(0.03*y), bar_height(0.02*y), bar_space(0.02*y), bar_pitch(bar_height + bar_space), grow_amt(0.005*y);
+	float const icon_x2(-0.91*x), icon_x1(icon_x2 - icon_sz), icon_yoff(-0.005*y);
 	colorRGBA hb_color(RED);
 	if (poisoned) {hb_color = blend_color(RED, YELLOW, fabs(sin(0.2*tfticks)), 0);} // slowly change between red and black
-	draw_stats_bar(s, hb_color, 1.0, min(0.01f*health, 1.0f), x, 0.92*y, 0.94*y, zval); // health bar up to 100
+	float ypos(0.92*y); // y-position on screen, with 1.0 at the top and 0.0 at the bottom; bars stack vertically down
+	draw_stats_bar(s, hb_color, 1.0, min(0.01f*health, 1.0f), x, ypos, ypos+bar_height, zval); // health bar up to 100
+	draw_icon(s, ICON_HEALTH, icon_x1, icon_x2, ypos+icon_yoff, ypos+icon_sz, zval);
 
 	if (health < 25.0 && ((int(tfticks)/12)&1)) { // low on health, add flashing red strip
 		s.set_cur_color(colorRGBA(RED, 0.5)); // translucent red
-		draw_one_tquad(-0.905*x, 0.915*y, (-0.895 + 0.002*min(health, 100.0f))*x, 0.945*y, zval);
+		draw_one_tquad(-0.905*x, ypos-grow_amt, (-0.895 + 0.002*min(health, 100.0f))*x, ypos+bar_height+grow_amt, zval);
 	}
 	if (health > 100.0) {
 		s.set_cur_color(ORANGE);
-		draw_one_tquad(-0.7*x, 0.92*y, (-0.7 + 0.002*(health - 100.0))*x, 0.94*y, zval); // extra health bar
+		draw_one_tquad(-0.7*x, ypos, (-0.7 + 0.002*(health - 100.0))*x, ypos+bar_height, zval); // extra health bar
 	}
+	ypos -= bar_pitch;
+
 	if (shields >= 0.0) { // negative shields disables the shields bar
 		// universe mode: 100%, TT building gameplay mode: 200% (drunkenness), normal: 150%
 		float const max_val((world_mode == WMODE_UNIVERSE) ? 100.0 : (building_gameplay_mode ? 200.0 : 150.0));
-		draw_stats_bar(s, (building_gameplay_mode ? GREEN : YELLOW), 0.01*max_val, 0.01*shields, x, 0.88*y, 0.90*y, zval); // shields bar up to 150
+		draw_stats_bar(s, (building_gameplay_mode ? GREEN : YELLOW), 0.01*max_val, 0.01*shields, x, ypos, ypos+bar_height, zval); // shields bar up to 150
+		draw_icon(s, (building_gameplay_mode ? ICON_DRUNK : ICON_SHIELD), icon_x1, icon_x2, ypos+icon_yoff, ypos+icon_sz, zval);
 
 		if (building_gameplay_mode && shields > 150.0 && ((int(tfticks)/12)&1)) { // flash when drunkenness is too high
 			s.set_cur_color(colorRGBA(RED, 0.5)); // translucent red
-			draw_one_tquad(-0.6*x, 0.875*y, -0.495*x, 0.905*y, zval);
+			draw_one_tquad(-0.6*x, ypos-grow_amt, -0.495*x, ypos+bar_height+grow_amt, zval);
 		}
+		ypos -= bar_pitch;
 	}
 	if (building_gameplay_mode || pu_time > 0.0) { // 0.0-1.0 range; used for building_gameplay_mode bladder fullness
-		draw_stats_bar(s, pu_color, 1.0, pu_time, x, 0.84*y, 0.86*y, zval); // full PU time background
+		draw_stats_bar(s, pu_color, 1.0, pu_time, x, ypos, ypos+bar_height, zval); // full PU time background
+		draw_icon(s, (building_gameplay_mode ? ICON_TOILET : ICON_POWER), icon_x1, icon_x2, ypos+icon_yoff, ypos+icon_sz, zval);
 
 		if (building_gameplay_mode && pu_time > 0.9 && ((int(tfticks)/12)&1)) { // flash when bladder fullness is too high
 			s.set_cur_color(colorRGBA(ORANGE, 0.5)); // translucent orange
-			draw_one_tquad(-0.905*x, 0.835*y, -0.695*x, 0.865*y, zval);
+			draw_one_tquad(-0.905*x, ypos-grow_amt, -0.695*x, ypos+bar_height+grow_amt, zval);
 		}
+		ypos -= bar_pitch;
 	}
-	if (building_gameplay_mode) {draw_stats_bar(s, extra_bar_color, 1.0, extra_bar, x, 0.80*y, 0.82*y, zval);} // carry capacity bar
+	for (status_bar_t const &b : extra_bars) {
+		draw_stats_bar(s, b.color, 1.0, b.val, x, ypos, (ypos + bar_height), zval);
+		draw_icon(s, b.icon_id, icon_x1, icon_x2, ypos+icon_yoff, ypos+icon_sz, zval);
+		ypos -= bar_pitch;
+	}
 	disable_blend();
 	glEnable(GL_DEPTH_TEST);
 }

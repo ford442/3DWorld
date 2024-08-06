@@ -670,7 +670,6 @@ void free_obj::draw(shader_t &shader, vpc_shader_t &upc_shader) const { // view 
 		transform_and_draw_obj(udd, specular, 1, !partial_shadow);
 
 		if (partial_shadow) { // partially shadowed - draw the sun's light with a stencil pass
-			// http://www.gamasutra.com/features/20021011/lengyel_05.htm
 			shader.reset_subroutine(1, "do_lighting_op", "shadow_only");
 			fgPushMatrix();
 			global_translate(pos);
@@ -700,7 +699,7 @@ void free_obj::draw(shader_t &shader, vpc_shader_t &upc_shader) const { // view 
 			set_std_blend_mode();
 			shader.reset_subroutine(1, "do_lighting_op", "normal_lighting");
 
-			if (display_mode & 0x10) { // testing
+			if (display_mode & 0x10) { // TESTING
 				set_emissive_color(colorRGBA(GREEN, 0.25), udd.shader);
 				fgPushMatrix();
 				global_translate(pos);
@@ -775,6 +774,8 @@ void stationary_obj::draw_obj(uobj_draw_data &ddata) const {
 		case SO_BLACK_HOLE:
 			ddata.draw_black_hole();
 			break;
+		case SO_ASTEROID:
+			assert(0); // not implemented
 		default:
 			assert(0);
 	}

@@ -10,15 +10,19 @@
 #include <cfloat> // for FLT_MAX
 
 bool const DYNAMIC_HELICOPTERS = 1;
+bool const POLICE_LIGHT_SHADOW = 1;
 float const MIN_CAR_STOP_SEP   = 0.25; // in units of car lengths
 
-extern bool tt_fire_button_down, enable_hcopter_shadows, city_action_key, camera_in_building, player_in_attic;
-extern int display_mode, game_mode, map_mode, animate2, player_in_basement, player_in_closet;
-extern float FAR_CLIP;
+extern bool tt_fire_button_down, enable_hcopter_shadows, city_action_key, camera_in_building, player_in_walkway;
+extern int display_mode, game_mode, map_mode, animate2, player_in_basement, player_in_closet, player_in_attic, camera_surf_collide;
+extern float fticks, FAR_CLIP;
 extern point pre_smap_player_pos;
 extern vector<light_source> dl_sources;
 extern city_params_t city_params;
 
+
+bool in_building_gameplay_mode();
+void invalidate_tile_smap_in_region(cube_t const &region, bool repeat_next_frame=0);
 
 float get_clamped_fticks() {return min(fticks, 4.0f);} // clamp to 100ms
 
@@ -61,6 +65,14 @@ void car_t::apply_scale(float scale) {
 	bcube.z2() = bcube.z1() + height; // z1 is unchanged
 	bcube.x1() = pos.x - scale*sz.x; bcube.x2() = pos.x + scale*sz.x;
 	bcube.y1() = pos.y - scale*sz.y; bcube.y2() = pos.y + scale*sz.y;
+}
+void car_t::set_correct_len_width_from_model(vector3d const &model_sz) {
+	float const scale(bcube.get_size().sum() / model_sz.sum()); // same scaling as in city_model_loader_t::draw_model()
+	float const new_height(scale*model_sz.z);
+	bcube.translate_dim(2, 0.5*(new_height - height)); // shift slightly so that the tires are still on the road
+	bcube.expand_in_dim( dim, 0.5*(scale*model_sz.x - get_length())); // resize length
+	bcube.expand_in_dim(!dim, 0.5*(scale*model_sz.y - get_width ())); // resize width
+	height = new_height;
 }
 
 void car_t::destroy() { // Note: not calling create_explosion(), so no chain reactions
@@ -138,6 +150,16 @@ void car_t::maybe_accelerate(float mult) {
 	}
 	accelerate(mult);
 }
+void car_t::accelerate(float mult) {
+	cur_speed = min(get_max_speed(), (cur_speed + mult*fticks*max_speed));
+}
+void car_t::decelerate(float mult) {
+	cur_speed  = max(0.0f, (cur_speed - mult*fticks*max_speed));
+	//is_braking = 1; // no, too much brake light toggling when following a slower car
+}
+void car_t::decelerate_fast() {
+	decelerate(10.0); // Note: large decel to avoid stopping in an intersection
+}
 
 void car_t::sleep(rand_gen_t &rgen, float min_time_secs) {
 	park();
@@ -194,6 +216,15 @@ void car_t::complete_turn_and_swap_dim() {
 	entering_city = 0; // clear flag in case we turned into the city
 }
 
+void car_t::person_in_the_way(bool is_player, bool at_stopsign) {
+	static rand_gen_t rgen;
+	bool const is_zombie(in_building_gameplay_mode() && !is_player);
+	// honk less often for zombies since they're often in the road; honk less often at stop signs because peds don't predict stop sign logic as well as traffic lights
+	unsigned const rgen_mod_val(is_player ? 2 : (is_zombie ? 24 : (at_stopsign ? 12 : 8)));
+	if ((rgen.rand() % rgen_mod_val) == 0) {honk_horn_if_close_and_fast();}
+	decelerate_fast(); // must be after honk logic
+}
+
 bool car_t::must_wait_entering_or_crossing_road(vector<car_t> const &cars, driveway_t const &driveway, unsigned road_ix, float lookahead_time) const {
 	bool const in_driveway(cur_road_type == TYPE_DRIVEWAY);
 	bool const rdim(!driveway.dim), rdir(driveway.dir ^ rdim); // dim/dir of cars on the road we're on or entering
@@ -248,7 +279,7 @@ bool car_t::run_enter_driveway_logic(vector<car_t> const &cars, driveway_t const
 
 	if (turn_dir == TURN_NONE) {
 		if (prev_bcube.intersects_xy(turn_area)) return 0; // not yet turning, and in turn area last frame - too late to turn (likely car was spawned here)
-		if (driveway.has_recent_ped()) return 1; // pedestrian(s) in driveway, wait
+		if (driveway.has_recent_ped() && get_wait_time_secs() < 60.0) return 1; // pedestrian(s) in driveway, wait unless we've already been waiting for > 60s
 		bool const dw_turn_dir(dir ^ driveway.dir ^ driveway.dim); // turn into driveway: 0=left, 1=right
 		// if turning left: check for oncoming cars, wait until clear; only done at start of turn - if a car comes along mid-turn then we can't stop
 		if (!dw_turn_dir && check_for_road_clear_and_wait(cars, driveway, cur_road)) return 1;
@@ -309,7 +340,7 @@ bool car_t::exit_driveway_to_road(vector<car_t> const &cars, driveway_t const &d
 	return 0;
 }
 
-point car_base_t::get_front(float dval) const {
+point car_base_t::get_front(float dval) const { // not correct when mid-turn
 	point car_front(get_center());
 	car_front[dim] += (dir ? dval : -dval)*get_length(); // half length
 	return car_front;
@@ -319,20 +350,23 @@ bool car_t::front_intersects_car(car_t const &c) const {
 	return (c.bcube.contains_pt(get_front(0.25)) || c.bcube.contains_pt(get_front(0.5))); // check front-middle and very front
 }
 
-void car_t::honk_horn_if_close() const {
-	point const pos(get_center());
-	
-	if (dist_less_than((pos + get_tiled_terrain_model_xlate()), get_camera_pos(), 1.0)) {
+void play_car_sound_if_close(point const &pos, int sound_id) {
+	if (map_mode || camera_in_building) return; // no sound in overhead map mode or when the player is inside a building
+
+	if (dist_less_than((pos + get_tiled_terrain_model_xlate()), get_camera_pos(), 1.0*city_params.road_spacing)) {
 #pragma omp critical(gen_sound)
-		gen_sound(SOUND_HORN, pos);
+		gen_sound(sound_id, pos, 1.0, 1.0, 0, zero_vector, 1); // skip if already playing
 	}
+}
+void car_t::honk_horn_if_close() const {
+	play_car_sound_if_close(get_center(), SOUND_HORN);
 }
 void car_t::honk_horn_if_close_and_fast() const {
 	if (cur_speed > 0.25*max_speed) {honk_horn_if_close();}
 }
 
 void car_t::on_alternate_turn_dir(rand_gen_t &rgen) {
-	honk_horn_if_close();
+	honk_horn_if_close(); // honk in frustration at waiting this long
 	// 25% chance of choosing a new destination rather than driving in circles; will be in current city
 	if (dest_driveway < 0 && (rgen.rand()&3) == 0) {dest_valid = 0;}
 }
@@ -377,7 +411,7 @@ float car_t::get_sum_len_space_for_cars_in_front(cube_t const &range) const {
 }
 
 bool car_t::proc_sphere_coll(point &pos, point const &p_last, float radius, vector3d const &xlate, vector3d *cnorm) const {
-	return sphere_cube_int_update_pos(pos, radius, (bcube + xlate), p_last, 1, 0, cnorm); // Note: approximate when car is tilted or turning
+	return sphere_cube_int_update_pos(pos, radius, (bcube + xlate), p_last, 0, cnorm); // Note: approximate when car is tilted or turning
 	//return sphere_sphere_int((bcube.get_cube_center() + xlate), pos, bcube.get_bsphere_radius(), radius, cnorm, pos); // Note: handle cnorm in if using this
 }
 
@@ -390,7 +424,7 @@ bool car_t::check_collision(car_t &c, road_gen_base_t const &road_gen) {
 		if (!to_stop) return 0;
 		to_stop->decelerate_fast(); // attempt to prevent one car from T-boning the other
 		to_stop->bcube = to_stop->prev_bcube;
-		to_stop->honk_horn_if_close_and_fast();
+		if (!is_emergency) {to_stop->honk_horn_if_close_and_fast();} // don't honk at emergency vehicles
 		return 1;
 	}
 	if (dir != c.dir) return 0; // traveling on opposite sides of the road
@@ -416,7 +450,7 @@ bool car_t::check_collision(car_t &c, road_gen_base_t const &road_gen) {
 		//if (cmove.bcube == cmove.prev_bcube) {return 1;} // collided, but not safe to move the car (init pos or second collision)
 		if (cmove.bcube != cmove.prev_bcube) { // try resetting to last frame's position
 			cmove.bcube  = cmove.prev_bcube; // restore prev frame's pos
-			//cmove.honk_horn_if_close_and_fast();
+			//if (!is_emergency) {cmove.honk_horn_if_close_and_fast();}
 			return 1; // done
 		}
 		else { // keep the car from moving outside its current segment (init collision case)
@@ -440,16 +474,6 @@ bool comp_car_road_then_pos::operator()(car_t const &c1, car_t const &c2) const 
 	return (c1.bcube.d[c1.dim][c1.dir] < c2.bcube.d[c2.dim][c2.dir]); // compare front end of car (used for collisions)
 }
 
-
-void ao_draw_state_t::draw_ao_qbd() {
-	if (ao_qbd.empty()) return;
-	enable_blend();
-	select_texture(BLUR_CENT_TEX);
-	ao_qbd.draw_and_clear();
-	select_texture(WHITE_TEX); // reset back to default/untextured
-	disable_blend();
-}
-
 void occlusion_checker_t::set_camera(pos_dir_up const &pdu) {
 	if ((display_mode & 0x08) == 0) {state.building_ids.clear(); return;} // testing
 	pos_dir_up near_pdu(pdu);
@@ -457,7 +481,7 @@ void occlusion_checker_t::set_camera(pos_dir_up const &pdu) {
 	get_city_building_occluders(near_pdu, state);
 	//cout << "occluders: " << state.building_ids.size() << endl;
 }
-bool occlusion_checker_t::is_occluded(cube_t const &c) {
+bool occlusion_checker_t::is_occluded(cube_t const &c) const {
 	if (state.building_ids.empty() && occluders.empty()) return 0;
 	float const z(c.z2()); // top edge
 	point const corners[4] = {point(c.x1(), c.y1(), z), point(c.x2(), c.y1(), z), point(c.x2(), c.y2(), z), point(c.x1(), c.y2(), z)};
@@ -474,13 +498,18 @@ bool occlusion_checker_t::is_occluded(cube_t const &c) {
 	return 0;
 }
 
-void ao_draw_state_t::pre_draw(vector3d const &xlate_, bool use_dlights_, bool shadow_only_) {
-	draw_state_t::pre_draw(xlate_, use_dlights_, shadow_only_, 1); // always_setup_shader=1 (required for model drawing)
-	
-	if (!shadow_only) {
-		occlusion_checker.set_exclude_camera_building(); // if the player is inside a building, skip occlusion culling
-		occlusion_checker.set_camera(camera_pdu);
-	}
+void ao_draw_state_t::pre_draw(vector3d const &xlate_, bool use_dlights_, bool shadow_only_, bool enable_animations) {
+	draw_state_t::pre_draw(xlate_, use_dlights_, shadow_only_, 1, enable_animations); // always_setup_shader=1 (required for model drawing)
+}
+void draw_and_clear_blur_qbd(quad_batch_draw &qbd) {
+	if (qbd.empty()) return;
+	enable_blend();
+	glDepthMask(GL_FALSE); // disable depth write
+	select_texture(BLUR_CENT_TEX);
+	qbd.draw_and_clear();
+	select_texture(WHITE_TEX); // reset back to default/untextured
+	glDepthMask(GL_TRUE);
+	disable_blend();
 }
 
 /*static*/ float car_draw_state_t::get_headlight_dist() {return 3.5*city_params.road_width;} // distance headlights will shine
@@ -493,11 +522,15 @@ void car_draw_state_t::pre_draw(vector3d const &xlate_, bool use_dlights_, bool 
 	//set_enable_normal_map(use_model3d_bump_maps()); // used only for some car models, and currently doesn't work
 	ao_draw_state_t::pre_draw(xlate_, use_dlights_, shadow_only_);
 	select_texture(WHITE_TEX);
+	last_smap_tile_id_valid = 0;
 }
 
+void car_draw_state_t::draw_remaining_cars() {
+	qbds[1].draw_and_clear(); // draw any leftover unflushed shadowed geometry using the last shadow map that was bound
+}
 void car_draw_state_t::draw_unshadowed() {
 	qbds[0].draw_and_clear();
-	draw_ao_qbd();
+	ao_draw_state_t::draw_unshadowed();
 }
 
 void car_draw_state_t::add_car_headlights(vector<car_t> const &cars, vector3d const &xlate_, cube_t &lights_bcube) {
@@ -507,9 +540,11 @@ void car_draw_state_t::add_car_headlights(vector<car_t> const &cars, vector3d co
 
 /*static*/ void car_draw_state_t::gen_car_pts(car_t const &car, bool include_top, point pb[8], point pt[8]) {
 	point const center(car.get_center());
-	cube_t const &c(car.bcube);
-	float const z1(center.z - 0.5*car.height), z2(center.z + 0.5*car.height), zmid(center.z + (include_top ? 0.1 : 0.5)*car.height), length(car.get_length());
+	cube_t c(car.bcube);
+	float const z1(center.z - 0.5*car.height), z2(center.z + 0.5*car.height), length(car.get_length());
+	float const zmid(center.z + (car.is_truck ? 0.5 : 0.1)*car.height); // cars are lower to the ground than trucks
 	bool const dim(car.dim), dir(car.dir);
+	c.expand_in_dim(!dim, -0.05*car.get_width()); // slightly narrower to account for side mirrors
 	set_cube_pts(c, z1, zmid, dim, dir, pb); // bottom
 
 	if (include_top) {
@@ -534,6 +569,86 @@ bool sphere_in_light_cone_approx(pos_dir_up const &pdu, point const &center, flo
 	float const dist(p2p_dist(pdu.pos, center)), radius_at_dist(dist*pdu.sterm), rmod(radius_at_dist + radius);
 	return pt_line_dist_less_than(center, pdu.pos, (pdu.pos + pdu.dir), rmod);
 }
+bool is_active_emergency_vehicle(car_model_loader_t const &car_model_loader, car_t const &car, bool lights, bool siren) {
+	assert(lights || siren); // at least one
+	if (!car.is_police && !car.is_ambulance) return 0;
+	if (car.is_parked()) return 0;
+	unsigned const active_mod(lights ? 4 : 8); // lights 25% of the time, sirens 12.5% of the time
+	return !(car.get_unique_id() % active_mod);
+}
+float get_flash_cycle(car_t const &car) {
+	return fract((car.is_police ? 3.0 : 1.5)*((animate2 ? tfticks/TICKS_PER_SECOND : 0.0) + 100.0*car.max_speed)); // different per car
+}
+vector3d get_car_front_dir(car_t const &car, vector3d const &front_n) {
+	vector3d dir(front_n);
+	if (front_n == zero_vector) {dir[car.dim] = (car.dir ? 1.0 : -1.0);} // approximate - correct for straight roads
+	return dir;
+}
+vector3d get_car_side_dir(car_t const &car, vector3d const &front_dir, bool left_right) {
+	return cross_product(front_dir, plus_z).get_norm()*((left_right ^ car.dim ^ car.dir) ? 1.0 : -1.0);
+}
+int get_police_car_flashing_light(car_model_loader_t const &car_model_loader, car_t const &car, vector3d const &front_n, point &lpos, colorRGBA &color) {
+	if (!car.is_police || !is_active_emergency_vehicle(car_model_loader, car, 1, 0)) return 0; // lights=1, siren=0
+	float const flash_cycle(get_flash_cycle(car));
+
+	for (unsigned d = 0; d < 2; ++d) { // L, R
+		if (d ? !(flash_cycle < 0.25) : !(flash_cycle > 0.5 && flash_cycle < 0.75)) continue; // 25% duty cycle for each light in opposite patterns
+		vector3d const front_dir(get_car_front_dir(car, front_n)), side_dir(get_car_side_dir(car, front_dir, d));
+		lpos   = car.get_center();
+		lpos  -= front_dir*0.06*car.get_length(); // slightly toward the back
+		lpos  += side_dir *0.21*car.get_width (); // to the sides
+		lpos.z = car.bcube.z2() + 0.15*car.bcube.dz(); // top; high enough to not self shadow too much
+		color  = ((d ^ (car.dim ^ car.dir)) ? RED : BLUE); // red on right, blue on left (opposite of most police cars)
+		return d+1;
+	} // for d
+	return 0;
+}
+unsigned get_ambulance_flashing_lights(car_model_loader_t const &car_model_loader, car_t const &car, vector3d const &front_n, point lpos[4], vector3d ldir[4]) {
+	if (!car.is_ambulance || !is_active_emergency_vehicle(car_model_loader, car, 1, 0)) return 0; // lights=1, siren=0
+	float const flash_cycle(get_flash_cycle(car)), length(car.get_length()), width(car.get_width()), height(car.bcube.dz());
+	vector3d const front_dir(get_car_front_dir(car, front_n)), side_dir(get_car_side_dir(car, front_dir, 0));
+	vector3d const front_delta(front_dir*length), side_delta(side_dir*width);
+	unsigned const cycle_ix(unsigned(floor(14.0*flash_cycle)));
+
+	for (unsigned n = 0; n < 4; ++n) { // 4 lights on at once
+		// 0=top middle, 1=top left, 2=top right, 3=front left, 4=front right, 5=back top middle, 6=back top left, 7=back top right
+		// 8=left front, 9=left back, 10=left bottom, 11=right front, 12=right back, 13=right bottom
+		unsigned const lix((cycle_ix + 3*n) % 14);
+		point &pos(lpos[n]);
+		vector3d &dir(ldir[n]);
+		pos = car.get_center();
+		if      (lix == 1 || lix == 3 || lix == 6) {pos -= 0.34*side_delta;} // left  front/back
+		else if (lix == 2 || lix == 4 || lix == 7) {pos += 0.34*side_delta;} // right front/back
+		else if (lix == 8 || lix == 11) {pos += 0.12 *front_delta;} // side toward front
+		else if (lix == 9 || lix == 12) {pos -= 0.415*front_delta;} // side toward back
+		else if (lix == 10|| lix == 13) {pos -= 0.335*front_delta;} // side lower
+
+		if (lix <= 4) { // front lights
+			dir  = front_dir;
+			pos += 0.18*front_delta; // toward the front
+			if (lix <= 2) {pos.z += 0.37*height;} // upper
+			else          {pos.z += 0.30*height;} // lower
+		}
+		else if (lix <= 7) { // back lights
+			dir    = -front_dir;
+			pos   += -0.48*front_delta; // at the back
+			pos.z += 0.35*height; // upper
+		}
+		else if (lix <= 10) { // left lights
+			dir  = -side_dir;
+			pos -= 0.48*side_delta;
+			if (lix <= 9) {pos.z += 0.325*height;} // top
+			else {pos.z -= 0.02*height;} // bottom
+		}
+		else if (lix <= 13) { // right lights
+			dir  = side_dir;
+			pos += 0.48*side_delta;
+			if (lix <= 12) {pos.z += 0.325*height;} // top
+			else {pos.z -= 0.02*height;} // bottom
+		}
+	} // for n
+	return 4;
+}
 
 void car_draw_state_t::draw_car(car_t const &car, bool is_dlight_shadows) { // Note: all quads
 	if (car.destroyed) return;
@@ -548,28 +663,36 @@ void car_draw_state_t::draw_car(car_t const &car, bool is_dlight_shadows) { // N
 	point const center_xlated(center + xlate);
 	if (!shadow_only && !dist_less_than(camera_pdu.pos, center_xlated, 0.5*draw_tile_dist)) return; // check draw distance, dist_scale=0.5
 	if (!camera_pdu.sphere_visible_test(center_xlated, 0.5f*car.height*CAR_RADIUS_SCALE) || !camera_pdu.cube_visible(car.bcube + xlate)) return;
-	begin_tile(center); // enable shadows
-	colorRGBA const &color(car.get_color());
 	float const dist_val(p2p_dist(camera_pdu.pos, center_xlated)/draw_tile_dist);
-	bool const draw_top(dist_val < 0.25 && !car.is_truck), dim(car.dim), dir(car.dir);
 	bool const draw_model(car_model_loader.num_models() > 0 &&
-		(is_dlight_shadows ? dist_less_than(pre_smap_player_pos, center, 0.05*draw_tile_dist) : (shadow_only || dist_val < 0.05)));
+		(is_dlight_shadows ? dist_less_than(pre_smap_player_pos, center, 0.05*draw_tile_dist) : (shadow_only || dist_val < 0.05)) &&
+		car_model_loader.is_model_valid(car.model_id));
+	if (draw_model && is_occluded(car.bcube)) return; // only check occlusion for expensive car models
+	uint64_t const tile_id(get_tile_id_containing_point_no_xyoff(center_xlated));
+		
+	if (!last_smap_tile_id_valid || tile_id != last_smap_tile_id) { // new tile shadow map
+		qbds[1].draw_and_clear(); // draw previous shadowed cars with the previous tile's shadow map
+		begin_tile(center); // maybe enable shadows for the new tile
+		last_smap_tile_id = tile_id;
+		last_smap_tile_id_valid = 1;
+	}
+	bool const draw_top(dist_val < 0.25 && !car.is_truck && !draw_model), dim(car.dim), dir(car.dir);
 	float const sign((dim^dir) ? -1.0 : 1.0);
 	point pb[8], pt[8]; // bottom and top sections
 	gen_car_pts(car, draw_top, pb, pt);
 
-	if (draw_model && car_model_loader.is_model_valid(car.model_id)) {
-		if (is_occluded(car.bcube)) return; // only check occlusion for expensive car models
+	if (draw_model) {
 		vector3d const front_n(cross_product((pb[5] - pb[1]), (pb[0] - pb[1])).get_norm()*sign);
 		bool const low_detail(!shadow_only && dist_val > 0.035);
-		car_model_loader.draw_model(s, center, car.bcube, front_n, color, xlate, car.model_id, shadow_only, low_detail);
+		cube_t non_rot_bcube(car.bcube);
+		set_wall_width(non_rot_bcube, car.bcube.zc(), 0.5*car.height, 2);
+		car_model_loader.draw_model(s, center, non_rot_bcube, front_n, car.get_color(), xlate, car.model_id, shadow_only, low_detail);
 	}
 	else { // draw simple 1-2 cube model
 		quad_batch_draw &qbd(qbds[emit_now]);
-		color_wrapper cw(color);
+		color_wrapper cw(car.get_color());
 		draw_cube(qbd, cw, center, pb, 1, (dim^dir)); // bottom (skip_bottom=1)
 		if (draw_top) {draw_cube(qbd, cw, center, pt, 1, (dim^dir));} // top (skip_bottom=1)
-		if (emit_now) {qbds[1].draw_and_clear();} // shadowed (only emit when tile changes?)
 	}
 	if (shadow_only) return; // shadow pass - done
 	if (car.cur_road_type == TYPE_BUILDING) return; // in a building, nothing else to draw
@@ -586,34 +709,33 @@ void car_draw_state_t::draw_car(car_t const &car, bool is_dlight_shadows) { // N
 			v   += center;
 			v.z += 0.06*car.height; // shift up slightly to avoid z-fighting; needs to be a bit higher for driveways
 		}
-		/*if (!car.headlights_on()) { // daytime, adjust shadow to match sun pos
-			vector3d const sun_dir(0.5*length*(center - get_sun_pos()).get_norm());
-			vector3d const offset(sun_dir.x, sun_dir.y, 0.0);
-			for (unsigned i = 0; i < 4; ++i) {pao[i] += offset;} // problems: double shadows, non-flat surfaces, buildings, texture coords/back in center, non-rectangular
-		}*/
 		ao_qbd.add_quad_pts(pao, colorRGBA(0, 0, 0, 0.9), plus_z);
 	}
 	if (dist_val > 0.3)  return; // to far - no lights to draw
 	if (car.is_parked()) return; // no lights when parked
 	vector3d const front_n(cross_product((pb[5] - pb[1]), (pb[0] - pb[1])).get_norm()*sign);
 	unsigned const lr_xor(((camera_pdu.pos[!dim] - xlate[!dim]) - center[!dim]) < 0.0f);
-	bool const brake_lights_on(car.is_almost_stopped() || car.stopped_at_light), headlights_on(car.headlights_on());
+	bool const brake_lights_on(car.is_almost_stopped() || car.stopped_at_light || car.is_braking), headlights_on(car.headlights_on());
 	float const hv1(car.is_truck ? 0.8 : 0.2), hv2(1.0 - hv1); // headlights and tail lights; blend from bottom to top
-	float const sv1(car.is_truck ? 0.8 : 0.3), sv2(1.0 - hv1); // turn signals; blend from bottom to top
+	float const sv1(car.is_truck ? 0.8 : 0.3), sv2(1.0 - sv1); // turn signals; blend from bottom to top
 
 	if (headlights_on && dist_val < 0.3) { // night time headlights
 		colorRGBA const hl_color(get_headlight_color(car));
+		float const c1(car.is_ambulance ? 0.22 : 0.1), c2(1.0 - c1);
 
 		for (unsigned d = 0; d < 2; ++d) { // L, R
 			unsigned const lr(d ^ lr_xor ^ 1);
-			point const pos((lr ? 0.2 : 0.8)*(hv1*pb[0] + hv2*pb[4]) + (lr ? 0.8 : 0.2)*(hv1*pb[1] + hv2*pb[5]));
+			point pos((lr ? c1 : c2)*(hv1*pb[0] + hv2*pb[4]) + (lr ? c2 : c1)*(hv1*pb[1] + hv2*pb[5]));
+			if (car.is_ambulance) {pos.z += 0.12*car.bcube.dz();} // shift upward
 			add_light_flare(pos, front_n, hl_color, 2.0, 0.65*car.height); // pb 0,1,4,5
 		}
 	}
 	if ((brake_lights_on || headlights_on || car.in_reverse) && dist_val < 0.2) { // brake/tail/backup lights
+		float const bv1((car.is_truck || car.is_ambulance) ? 0.15 : 0.2), bv2(1.0 - bv1);
+
 		for (unsigned d = 0; d < 2; ++d) { // L, R
 			unsigned const lr(d ^ lr_xor);
-			point const pos((lr ? 0.2 : 0.8)*(hv1*pb[2] + hv2*pb[6]) + (lr ? 0.8 : 0.2)*(hv1*pb[3] + hv2*pb[7]));
+			point const pos((lr ? bv1 : bv2)*(hv1*pb[2] + hv2*pb[6]) + (lr ? bv2 : bv1)*(hv1*pb[3] + hv2*pb[7]));
 			colorRGBA const bl_color(car.in_reverse ? colorRGBA(1.0, 0.9, 0.7, 1.0) : colorRGBA(1.0, 0.1, 0.05, 1.0)); // yellow-white/near red; pb 2,3,6,7
 			add_light_flare(pos, -front_n, bl_color, (brake_lights_on ? 1.0 : 0.5), 0.5*car.height);
 		}
@@ -622,21 +744,53 @@ void car_draw_state_t::draw_car(car_t const &car, bool is_dlight_shadows) { // N
 		float const ts_period = 1.5; // in seconds
 		double const time(fract((tfticks + 1000.0*car.max_speed)/(double(ts_period)*TICKS_PER_SECOND))); // use car max_speed as seed to offset time base
 
-		if (time > 0.5) { // flash on and off
+		if (time > 0.5 || !animate2) { // flash on and off; always on when time is stopped to help with visual debugging
 			bool const tdir((car.turn_dir == TURN_LEFT) ^ dim ^ dir); // R=1,2,5,6 or L=0,3,4,7
 			vector3d const side_n(cross_product((pb[6] - pb[2]), (pb[1] - pb[2])).get_norm()*sign*(tdir ? 1.0 : -1.0));
 
 			for (unsigned d = 0; d < 2; ++d) { // B, F
-				point const pos(sv1*pb[tdir ? (d ? 1 : 2) : (d ? 0 : 3)] + sv2*pb[tdir ? (d ? 5 : 6) : (d ? 4 : 7)]);
+				point pos(sv1*pb[tdir ? (d ? 1 : 2) : (d ? 0 : 3)] + sv2*pb[tdir ? (d ? 5 : 6) : (d ? 4 : 7)]);
+				
+				if (car.is_ambulance && d == 1) { // ambulance cab is slightly shorter and narrower
+					pos -= (tdir ? 1.0 : -1.0)*0.06*car.get_width()*side_n; // move inward
+					pos.z += 0.12*car.bcube.dz(); // shift upward
+				}
 				add_light_flare(pos, (side_n + (d ? 1.0 : -1.0)*front_n).get_norm(), colorRGBA(1.0, 0.75, 0.0, 1.0), 1.5, 0.3*car.height); // normal points out 45 degrees
 			}
 		}
+	}
+	point lpos, alpos[4];
+	vector3d aldir[4];
+	colorRGBA lcolor;
+	int const ret(get_police_car_flashing_light(car_model_loader, car, front_n, lpos, lcolor));
+
+	if (ret) {
+		bool const side(ret - 1);
+		float const radius(0.1*car.get_width());
+		vector3d const front_offset(front_n*0.3*radius);
+		vector3d const side_offset(cross_product(front_n, plus_z).get_norm()*sign*(side ? 1.0 : -1.0)*0.6*radius);
+		lpos.z -= 0.7*radius;
+
+		for (unsigned d = 0; d < 2; ++d) { // for each side of light bar
+			vector3d const delta((d ? 1.0 : -1.0)*front_offset), normal(delta.get_norm());
+			for (unsigned n = 0; n < 4; ++n) {add_light_flare((lpos + delta + (n - 1.5)*side_offset), normal, lcolor, 1.0, radius);} // 4 segments
+		}
+		if (lpos.z + xlate.z < camera_pdu.pos.z) { // lights on the top
+			for (unsigned n = 0; n < 4; ++n) {add_light_flare((lpos + 0.2*radius*plus_z + (n - 1.5)*side_offset), plus_z, lcolor, 1.0, radius);} // 4 segments
+		}
+		// light on the end
+		point const end_pos(lpos + 2.0*side_offset);
+		add_light_flare(end_pos, side_offset.get_norm(), lcolor, 1.0, radius);
+	}
+	else {
+		unsigned const num(get_ambulance_flashing_lights(car_model_loader, car, front_n, alpos, aldir));
+		for (unsigned n = 0; n < num; ++n) {add_light_flare(alpos[n], aldir[n], RED, 1.0, 0.2*car.get_width());} // always red
 	}
 }
 
 void car_draw_state_t::draw_helicopter(helicopter_t const &h, bool shadow_only) {
 	if (shadow_only && !h.dynamic_shadow && h.state != helicopter_t::STATE_WAIT) return; // don't draw moving helicopters in the shadow pass; wait until they land
-	if (!check_cube_visible(h.bcube, (shadow_only ? 0.0 : 0.75))) return; // dist_scale=0.75
+	if (!check_cube_visible(h.bcube, (shadow_only ? 0.0 : 0.5))) return; // dist_scale=0.5
 	if (is_occluded(h.bcube)) return; // yes, this seems to work
 	assert(helicopter_model_loader.is_model_valid(h.model_id));
 	point const center(h.bcube.get_cube_center());
@@ -645,40 +799,98 @@ void car_draw_state_t::draw_helicopter(helicopter_t const &h, bool shadow_only) 
 	unsigned blade_mat_mask(0);
 
 	if (h.blade_rot != 0.0 && model.blade_mat_id >= 0) { // separate blades from the rest of the model for custom rotation
-		blade_mat_mask = ~(1 << model.blade_mat_id); // skip prop blades material
-		vector3d dir(h.dir);
-		rotate_vector3d(plus_z, h.blade_rot, dir);
-		helicopter_model_loader.draw_model(s, center, h.bcube, dir, WHITE, xlate, h.model_id, shadow_only, 0, nullptr, blade_mat_mask); // draw prop blades only
+		blade_mat_mask = ~(1 << model.blade_mat_id); // skip all but prop blades material
+
+		if (shadow_only || (h.bcube + xlate).closest_dist_less_than(camera_pdu.pos, 0.25*draw_tile_dist)) { // skip drawing blades if distant
+			vector3d dir(h.dir);
+			rotate_vector3d(plus_z, h.blade_rot, dir);
+			helicopter_model_loader.draw_model(s, center, h.bcube, dir, WHITE, xlate, h.model_id, shadow_only, 0, nullptr, blade_mat_mask); // draw prop blades only
+		}
 		blade_mat_mask = ~blade_mat_mask;
 	}
-	helicopter_model_loader.draw_model(s, center, h.bcube, h.dir, WHITE, xlate, h.model_id, shadow_only, 0, nullptr, blade_mat_mask); // low_detail=0, enable_animations=0
+	helicopter_model_loader.draw_model(s, center, h.bcube, h.dir, WHITE, xlate, h.model_id, shadow_only, 0, nullptr, blade_mat_mask); // low_detail=0, no animations
 }
 
-void car_draw_state_t::add_car_headlights(car_t const &car, cube_t &lights_bcube) {
+void car_draw_state_t::add_car_headlights(car_t const &car, cube_t &lights_bcube) const {
+	point lpos, alpos[4];
+	vector3d aldir[4];
+	colorRGBA lcolor;
+
+	if (get_police_car_flashing_light(car_model_loader, car, zero_vector, lpos, lcolor)) {
+		float const light_dist(0.8*get_headlight_dist());
+		cube_t pl_bcube(lpos);
+		pl_bcube.expand_by(light_dist);
+
+		if (lights_bcube.contains_cube_xy(pl_bcube) && camera_pdu.cube_visible(pl_bcube + xlate)) {
+			min_eq(lights_bcube.z1(), pl_bcube.z1());
+			max_eq(lights_bcube.z2(), pl_bcube.z2());
+
+			if (POLICE_LIGHT_SHADOW) { // shadowed
+				for (unsigned bf = 0; bf < 2; ++bf) { // back, front
+					vector3d light_dir;
+					light_dir[car.dim] = ((car.dir ^ bool(bf)) ? 1.0 : -1.0);
+					dl_sources.emplace_back(light_dist, lpos, lpos, lcolor, 1, light_dir, 0.3);
+				}
+			}
+			else { // omnidirectional unshadowed
+				dl_sources.emplace_back(light_dist, lpos, lpos, lcolor, 1, zero_vector, 1.0);
+				dl_sources.back().disable_shadows(); // disable shadows for now
+			}
+		}
+	}
+	else {
+		unsigned const num(get_ambulance_flashing_lights(car_model_loader, car, zero_vector, alpos, aldir));
+
+		for (unsigned n = 0; n < num; ++n) {
+			lpos = alpos[n];
+			float const light_dist(0.5*get_headlight_dist());
+			cube_t pl_bcube(lpos);
+			pl_bcube.expand_by(light_dist);
+
+			if (lights_bcube.contains_cube_xy(pl_bcube) && camera_pdu.cube_visible(pl_bcube + xlate)) {
+				min_eq(lights_bcube.z1(), pl_bcube.z1());
+				max_eq(lights_bcube.z2(), pl_bcube.z2());
+
+				if (POLICE_LIGHT_SHADOW) { // shadowed
+					dl_sources.emplace_back(light_dist, lpos, lpos, RED, 1, aldir[n], 0.35);
+				}
+				else { // omnidirectional unshadowed
+					dl_sources.emplace_back(light_dist, lpos, lpos, RED, 1, aldir[n], 0.5); // hemisphere
+					dl_sources.back().disable_shadows(); // disable shadows for now
+				}
+			}
+		} // for n
+	}
 	if (!car.headlights_on()) return;
 	float const headlight_dist(get_headlight_dist());
-	cube_t bcube(car.bcube);
-	bcube.expand_by(headlight_dist);
-	if (!lights_bcube.contains_cube_xy(bcube))   return; // not contained within the light volume
-	if (!camera_pdu.cube_visible(bcube + xlate)) return; // VFC
-	float const sign((car.dim^car.dir) ? -1.0 : 1.0);
+	cube_t hl_bcube(car.bcube);
+	hl_bcube.expand_by(headlight_dist);
+	hl_bcube.d[car.dim][!car.dir] = car.bcube.d[car.dim][car.dir]; // in front of the car only
+	if (!lights_bcube.contains_cube_xy(hl_bcube))   return; // not contained within the light volume
+	if (!camera_pdu.cube_visible(hl_bcube + xlate)) return; // VFC
+	min_eq(lights_bcube.z1(), hl_bcube.z1());
+	max_eq(lights_bcube.z2(), hl_bcube.z2());
+	float const sign((car.dim ^ car.dir) ? -1.0 : 1.0);
 	point pb[8], pt[8]; // bottom and top sections
 	gen_car_pts(car, 0, pb, pt); // draw_top=0
 	vector3d const front_n(cross_product((pb[5] - pb[1]), (pb[0] - pb[1])).get_norm()*sign);
 	vector3d const dir((0.5*front_n - 0.5*plus_z).get_norm()); // point slightly down
 	colorRGBA const color(get_headlight_color(car));
+	vector3d const zoff(car.is_ambulance ? 0.12*car.bcube.dz()*plus_z : zero_vector);
+	float const hv1(car.is_truck ? 0.8 : 0.2), hv2(1.0 - hv1); // headlights and tail lights; blend from bottom to top
+	point const p1(hv1*pb[0] + hv2*pb[4]), p2(hv1*pb[1] + hv2*pb[5]);
 	float const beamwidth = 0.08;
-	min_eq(lights_bcube.z1(), bcube.z1());
-	max_eq(lights_bcube.z2(), bcube.z2());
 
 	if (!dist_less_than((car.get_center() + xlate), camera_pdu.pos, 2.0*headlight_dist)) { // single merged headlight when far away
-		point const pos(0.5*(0.2*pb[0] + 0.8*pb[4] + 0.2*pb[1] + 0.8*pb[5]));
-		dl_sources.push_back(light_source(headlight_dist, pos, pos, color*1.333, 1, dir, 1.2*beamwidth));
+		point const pos(0.5*(p1 + p2) + zoff);
+		dl_sources.emplace_back(headlight_dist, pos, pos, color*1.333, 1, dir, 1.2*beamwidth);
 	}
 	else { // two separate left/right headlights
+		float const c1(car.is_ambulance ? 0.22 : 0.1), c2(1.0 - c1);
+
 		for (unsigned d = 0; d < 2; ++d) { // L, R
-			point const pos((d ? 0.2 : 0.8)*(0.2*pb[0] + 0.8*pb[4]) + (d ? 0.8 : 0.2)*(0.2*pb[1] + 0.8*pb[5]));
-			dl_sources.push_back(light_source(headlight_dist, pos, pos, color, 1, dir, beamwidth)); // share shadow maps between headlights?
+			point const pos((d ? c1 : c2)*p1 + (d ? c2 : c1)*p2 + zoff);
+			dl_sources.emplace_back(headlight_dist, pos, pos, color, 1, dir, beamwidth); // share shadow maps between headlights?
 		}
 	}
 }
@@ -712,10 +924,18 @@ void car_manager_t::assign_car_model_size_color(car_t &car, rand_gen_t &local_rg
 			if (FORCE_MODEL_ID >= 0) {car.model_id = (unsigned char)FORCE_MODEL_ID;}
 			else {car.model_id = ((num_models > 1) ? (local_rgen.rand() % num_models) : 0);}
 			city_model_t const &model(car_model_loader.get_model(car.model_id));
-			// if there are multiple models to choose from, and this car is in a garage, try for a model that's not scaled up (the truck) (what about driveways?)
-			if (FORCE_MODEL_ID < 0 && num_models > 1 && is_in_garage && n+1 < 20 && model.scale > 1.0) continue;
+			
+			// if there are multiple models to choose from, and this car is in a garage, try for a model that's not scaled up (truck or ambulance) (what about driveways?)
+			if (FORCE_MODEL_ID < 0 && is_in_garage && model.scale > 1.0) {
+				if (num_models > 1 && n+1 < 20) continue; // try a different model
+				// don't scale the model because it may not fit; instead, add a small truck if we can't place a car
+			}
+			else {
+				car.apply_scale(model.scale);
+				// set correct bcube that matches the model; needed for pedestrians; can't modify cars in garages
+				if (!is_in_garage) {car.set_correct_len_width_from_model(car_model_loader.get_model_world_space_size(car.model_id));}
+			}
 			fixed_color = model.fixed_color_id;
-			car.apply_scale(model.scale);
 			break; // done
 		} // for n
 	}
@@ -723,9 +943,14 @@ void car_manager_t::assign_car_model_size_color(car_t &car, rand_gen_t &local_rg
 		car_model_loader.get_model(car.model_id).custom_color = car_model_loader.get_avg_color(car.model_id); // precompute and cache; may require loading models here
 		car.color_id = 255; // special 'use model file custom color' value
 	}
-	if      (fixed_color == -2) {car.color_id = 255;} // special 'use model file custom color' value; custom_color should already be set
+	else if (fixed_color == -2) {car.color_id = 255;} // special 'use model file custom color' value; custom_color should already be set
 	else if (fixed_color == -1) {car.color_id = (local_rgen.rand() % NUM_CAR_COLORS);} // choose a random color
-	else {car.color_id = fixed_color;} // use this specific fixed color
+	else                        {car.color_id = fixed_color;} // use this specific fixed color
+	// the best we can do is to search for the string 'police' and 'ambulance' in the filename
+	string const &fn(car_model_loader.get_model(car.model_id).fn);
+	if      (fn.find("Police"   ) != string::npos || fn.find("police"   ) != string::npos) {car.is_police    = 1;}
+	else if (fn.find("Ambulance") != string::npos || fn.find("ambulance") != string::npos) {car.is_ambulance = 1;}
+	car.is_emergency = is_active_emergency_vehicle(car_model_loader, car, 1, 1); // both lights and siren
 	assert(car.is_valid());
 }
 void car_manager_t::finalize_cars() {
@@ -805,6 +1030,10 @@ bool car_manager_t::proc_sphere_coll(point &pos, point const &p_last, float radi
 			if (cars[c].proc_sphere_coll(pos, p_last, radius, xlate, cnorm)) return 1;
 		}
 	} // for cb
+	for (helicopter_t const &h : helicopters) { // check helicopters, for player on helipad
+		if (h.state == helicopter_t::STATE_FLY) continue; // optimization; what about STATE_TAKEOFF and STATE_LAND?
+		if (sphere_cube_int_update_pos(pos, radius, (h.bcube + xlate), p_last, 0, cnorm)) return 1; // approximate/conservative
+	}
 	return 0;
 }
 
@@ -826,8 +1055,7 @@ void car_manager_t::destroy_cars_in_radius(point const &pos_in, float radius) {
 			if (is_pt ? car.bcube.contains_pt(pos) : dist_less_than(car.get_center(), pos, radius)) { // destroy if within the sphere
 				car.destroy();
 				car_destroyed = 1;
-				// invalidate tile shadow map for destroyed parked cars
-				if (city_params.car_shadows && car.is_parked()) {invalidate_tile_smap_at_pt((car.get_center() + xlate), 0.5*car.get_length());} // radius = length/2
+				if (city_params.car_shadows && car.is_parked()) {invalidate_tile_smap_in_region(car.bcube + xlate);} // invalidate tile shadow map for destroyed parked cars
 			}
 		} // for c
 	} // for cb
@@ -852,7 +1080,10 @@ bool car_manager_t::get_color_at_xy(point const &pos, colorRGBA &color, int int_
 			assert(ix_end <= cars.size());
 
 			for (unsigned c = v.ix; c != ix_end; ++c) {
-				if (cars[c].bcube.contains_pt_xy(pos)) {color = cars[c].get_color(); return 1;}
+				if (!cars[c].bcube.contains_pt_xy(pos)) continue;
+				color = cars[c].get_color();
+				if (color == GRAY) {color = colorRGBA(0.6, 0.6, 0.6, 1.0);} // trucks blend in with the road, make them lighter
+				return 1;
 			}
 		}
 	} // for cb
@@ -964,26 +1195,31 @@ int car_manager_t::find_next_car_after_turn(car_t &car) {
 }
 
 bool car_manager_t::check_car_for_ped_colls(car_t &car) const {
-	if (car.cur_city >= peds_crossing_roads.peds.size())  return 0; // no peds in this city (includes connector road network)
 	if (car.turn_val != 0.0 || car.turn_dir != TURN_NONE) return 0; // for now, don't check for cars when turning as this causes problems with blocked intersections
+	if (car.cur_city >= peds_crossing_roads.peds.size())  return 0; // no peds in this city (includes connector road network); ignores player
 	auto const &peds_by_road(peds_crossing_roads.peds[car.cur_city]);
-	if (car.cur_road >= peds_by_road.size()) return 0; // no peds in this road
+	if (car.cur_road >= peds_by_road.size()) return 0; // no peds in this road; ignores player
+	point const player_pos(camera_pdu.pos - dstate.xlate);
+	bool const check_player(camera_surf_collide && !camera_in_building && dist_less_than(car.get_center(), player_pos, (X_SCENE_SIZE + Y_SCENE_SIZE)));
 	auto const &peds(peds_by_road[car.cur_road]);
-	if (peds.empty()) return 0;
+	if (peds.empty() && !check_player) return 0;
 	cube_t coll_area(car.bcube);
 	coll_area.d[ car.dim][!car.dir] = coll_area.d[car.dim][car.dir]; // exclude the car itself
 	coll_area.d[ car.dim][car.dir] += (car.dir ? 1.25 : -1.25)*car.get_length(); // extend the front
 	coll_area.d[!car.dim][0] -= 0.5*car.get_width();
 	coll_area.d[!car.dim][1] += 0.5*car.get_width();
-	static rand_gen_t rgen;
+	bool const at_stopsign(car.in_isect() && get_car_isec(car).has_stopsign);
 
 	for (auto i = peds.begin(); i != peds.end(); ++i) {
 		if (coll_area.contains_pt_xy_exp(i->pos, i->radius)) {
-			car.decelerate_fast();
-			if ((rgen.rand()&3) == 0) {car.honk_horn_if_close_and_fast();}
+			car.person_in_the_way(0, at_stopsign); // is_player=0
 			return 1;
 		}
-	} // for i
+	}
+	if (check_player && coll_area.contains_pt_xy_exp(player_pos, CAMERA_RADIUS)) { // check for player collision
+		car.person_in_the_way(1, at_stopsign); // is_player=1
+		return 1;
+	}
 	return 0;
 }
 
@@ -994,10 +1230,11 @@ void car_manager_t::next_frame(ped_manager_t const &ped_manager, float car_speed
 	// Warning: not really thread safe, but should be okay; the ped state should valid at all points (thought maybe inconsistent) and we don't need it to be exact every frame
 	ped_manager.get_peds_crossing_roads(peds_crossing_roads);
 	//timer_t timer("Update Cars"); // 4K cars = 0.7ms / 2.1ms with destinations + navigation
+	comp_car_road_then_pos const sort_func(camera_pdu.pos - dstate.xlate);
 #pragma omp critical(modify_car_data)
 	{
 		if (car_destroyed) {remove_destroyed_cars();} // at least one car was destroyed in the previous frame - remove it/them
-		sort(cars.begin(), cars.end(), comp_car_road_then_pos(camera_pdu.pos - dstate.xlate)); // sort by city/road/position for intersection tests and tile shadow map binds
+		sort(cars.begin(), cars.end(), sort_func); // sort by city/road/position for intersection tests and tile shadow map binds
 	}
 	entering_city.clear();
 	car_blocks.clear();
@@ -1022,6 +1259,7 @@ void car_manager_t::next_frame(ped_manager_t const &ped_manager, float car_speed
 		if (i->entering_city) {entering_city.push_back(cix);} // record for use in collision detection
 		if (!i->stopped_at_light && i->is_almost_stopped() && i->in_isect()) {get_car_isec(*i).stoplight.mark_blocked(i->dim, i->dir);} // blocking intersection
 		register_car_at_city(*i);
+		if (is_active_emergency_vehicle(car_model_loader, *i, 0, 1)) {play_car_sound_if_close(i->get_center(), SOUND_POLICE);} // lights=0, siren=1
 	} // for i
 	if (!saw_parked && !car_blocks.empty()) {car_blocks.back().first_parked = cars.size();} // no parked cars in final city
 	car_blocks.emplace_back(cars.size(), 0); // add terminator
@@ -1053,8 +1291,8 @@ void car_manager_t::next_frame(ped_manager_t const &ped_manager, float car_speed
 	update_cars(); // run update logic
 
 	if (map_mode) { // create cars_by_road
-		// cars have moved since the last sort and may no longer be in city/road order, but this algorithm doesn't require that;
-		// out-of-order cars will end up in their own blocks, which is less efficient but still correct
+		// cars have moved since the last sort and may no longer be in city/road order, so we need to re-sort them
+		sort(cars.begin(), cars.end(), sort_func);
 		car_blocks_by_road.clear();
 		cars_by_road.clear();
 		unsigned cur_city(1<<31), cur_road(1<<31); // start at invalid values
@@ -1114,11 +1352,13 @@ float get_flight_path_zmax(point const &p1, point const &p2, float radius) {
 
 
 void helicopter_t::invalidate_tile_shadow_map(vector3d const &shadow_offset, bool repeat_next_frame) const {
+	// Note: we use the sphere version rather than the bcube version, since the helicopter may be rotated from its nominal bcube
 	invalidate_tile_smap_at_pt((bcube.get_cube_center() + shadow_offset), 0.5*max(bcube.dx(), bcube.dy()), repeat_next_frame);
 }
 
 float get_tt_building_sound_gain() { // quieter when the player is in a building/closet/attic; no sound in basement
-	return (player_in_basement ? 0.0 : (camera_in_building ? ((player_in_attic || player_in_closet) ? 0.25 : 0.5) : 1.0));
+	if (player_in_walkway) return 0.5;
+	return (player_in_basement ? 0.0 : (camera_in_building ? ((player_in_attic || player_in_closet) ? 0.2 : 0.4) : 1.0));
 }
 
 void car_manager_t::helicopters_next_frame(float car_speed) {
@@ -1132,6 +1372,7 @@ void car_manager_t::helicopters_next_frame(float car_speed) {
 	vector3d const shadow_dir(-get_light_pos().get_norm()); // primary light direction (sun/moon)
 	float dmin_sq(0.0);
 	point closest_pos;
+	vector<bridge_t> const &bridges(get_bridges());
 
 	for (auto i = helicopters.begin(); i != helicopters.end(); ++i) {
 		if (i->state == helicopter_t::STATE_WAIT) { // stopped, assumed on a helipad
@@ -1165,6 +1406,11 @@ void car_manager_t::helicopters_next_frame(float car_speed) {
 			i->state     = helicopter_t::STATE_TAKEOFF;
 			i->invalidate_tile_shadow_map(xlate, 0); // update static shadows for this tile to remove the helicopter shadow; resting on roof, no need to compute shadow_offset
 
+			for (bridge_t const &bridge : bridges) {
+				cube_t bbc(bridge.get_drawn_bcube());
+				bbc.expand_by_xy(avoid_dist);
+				if (check_line_clip_xy(p1, p2, bbc.d)) {max_eq(i->fly_zval, (bbc.z2() + min_vert_clearance));}
+			}
 			// check if the flight path intersects another helicopter and increase fly_zval to avoid it
 			for (auto j = helicopters.begin(); j != helicopters.end(); ++j) {
 				if (i == j) continue; // skip self
@@ -1269,9 +1515,9 @@ void car_manager_t::helicopters_next_frame(float car_speed) {
 		} // end moving case
 	} // for i
 	// player a looping helicopter sound if close and not in a basement, but don't attenuate the gain with dist because it will only be updated at the beginning of each loop
-	if (!player_in_basement && dist_less_than(closest_pos, camera_bs, 0.25f*(X_SCENE_SIZE + Y_SCENE_SIZE))) {
+	if (!map_mode && !player_in_basement && closest_pos != all_zeros && dist_less_than(closest_pos, camera_bs, 0.25f*(X_SCENE_SIZE + Y_SCENE_SIZE))) {
 #pragma omp critical(gen_sound)
-		gen_sound(SOUND_HELICOPTER, closest_pos, get_tt_building_sound_gain(), 1.0, 0, zero_vector, 1); // skip_if_already_playing=1
+		gen_sound(SOUND_HELICOPTER, (closest_pos + xlate), get_tt_building_sound_gain(), 1.0, 0, zero_vector, 1); // skip_if_already_playing=1
 	}
 	// show flight path debug lines?
 }
@@ -1296,10 +1542,8 @@ void car_manager_t::draw(int trans_op_mask, vector3d const &xlate, bool use_dlig
 		fgPushMatrix();
 		translate_to(xlate);
 		dstate.pre_draw(xlate, use_dlights, shadow_only);
-		
-		if (!shadow_only) {
-			dstate.s.add_uniform_float("hemi_lighting_normal_scale", 0.0); // disable hemispherical lighting normal because the transforms make it incorrect
-		}
+		// disable hemispherical lighting normal because the transforms make it incorrect
+		if (!shadow_only) {dstate.s.add_uniform_float("hemi_lighting_normal_scale", 0.0);}
 		float const draw_tile_dist(dstate.draw_tile_dist);
 
 		for (auto cb = car_blocks.begin(); cb+1 < car_blocks.end(); ++cb) {
@@ -1316,6 +1560,7 @@ void car_manager_t::draw(int trans_op_mask, vector3d const &xlate, bool use_dlig
 				dstate.draw_car(car, is_dlight_shadows);
 			}
 		} // for cb
+		dstate.draw_remaining_cars(); // draw cars from last shadow tile
 		if (!is_dlight_shadows) {draw_helicopters(shadow_only);} // draw helicopters in the normal draw pass
 		if (!shadow_only) {dstate.s.add_uniform_float("hemi_lighting_normal_scale", 1.0);} // restore shader uniform
 		dstate.post_draw();

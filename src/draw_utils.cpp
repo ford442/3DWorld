@@ -205,6 +205,8 @@ void clear_vbo_ring_buffer() {
 	vbo_ring_buffer[1].clear();
 }
 
+unsigned get_vbo_ring_buffers_size() {return (vbo_ring_buffer[0].get_alloced_size() + vbo_ring_buffer[1].get_alloced_size());}
+
 void const *get_dynamic_vbo_ptr(void const *const verts, unsigned size_bytes) {
 	assert(verts != NULL && size_bytes > 0);
 
@@ -435,7 +437,7 @@ void quad_batch_draw::add_quad_pts_vert_norms(point const pts[4], vector3d const
 void quad_batch_draw::add_quad_dirs(point const &pos, vector3d const &dx, vector3d const &dy,
 	colorRGBA const &c, vector3d const &n, tex_range_t const &tr)
 {
-	color_wrapper cw; cw.set_c4(c);
+	color_wrapper cw(c);
 
 	if (tr.clip_quad) { // clip point to tex coords
 		vector3d const dx1((1.0 - 2.0*tr.x1)*dx), dy1((1.0 - 2.0*tr.y1)*dy), dx2((-1.0 + 2.0*tr.x2)*dx), dy2((-1.0 + 2.0*tr.y2)*dy);
@@ -463,8 +465,8 @@ void quad_batch_draw::add_xlated_billboard(point const &pos, point const &xlate,
 	colorRGBA const &c, float xsize, float ysize, tex_range_t const &tr, bool minimize_fill, vector3d const *const normal_)
 {
 	vector3d const vdir(viewer - pos); // z
-	vector3d const v1((cross_product(vdir, up_dir).get_norm())*xsize); // x (what if colinear?)
-	vector3d const v2(cross_product(v1, vdir).get_norm()*ysize); // y
+	vector3d const v1(cross_product(vdir, up_dir).get_norm()*xsize); // x (what if colinear?)
+	vector3d const v2(cross_product(v1,   vdir  ).get_norm()*ysize); // y
 	vector3d const normal(normal_ ? *normal_ : vdir.get_norm());
 
 	if (minimize_fill) { // draw as octagon
@@ -538,6 +540,7 @@ template<typename T> void indexed_mesh_draw<T>::render() const {
 	bind_vbo(ivbo, 1);
 	set_ptr_state(&verts.front(), verts.size());
 	glDrawRangeElements(GL_TRIANGLES, 0, verts.size(), ivbo_size, GL_UNSIGNED_INT, NULL);
+	++num_frame_draw_calls;
 	bind_vbo(0, 1);
 	unset_ptr_state(&verts.front());
 }
@@ -651,6 +654,7 @@ void icosphere_drawer_t::draw() const {
 	pre_render(1, 1); // using_index, do_bind_vbo=1
 	vert_wrap_t::set_vbo_arrays();
 	glDrawRangeElements((using_tess_shader ? GL_PATCHES : GL_TRIANGLES), 0, nverts, nindices, GL_UNSIGNED_INT, nullptr);
+	++num_frame_draw_calls;
 	post_render();
 }
 
@@ -732,6 +736,7 @@ void vbo_block_manager_t<vert_type_t>::render_range(unsigned six, unsigned eix, 
 	}
 	else {
 		glDrawArraysInstanced(prim_type, offsets[six], count, num_instances); // default is quads
+		++num_frame_draw_calls;
 	}
 }
 
@@ -809,13 +814,13 @@ class quad_ix_buffer_t {
 	}
 public:
 	quad_ix_buffer_t() : ivbo_16(0), ivbo_32(0), size_16(0), size_32(0) {}
-	
+	unsigned get_alloced_size() const {return (size_16*sizeof(unsigned short) + size_32*sizeof(unsigned));}
+
 	void free_context() {
 		delete_and_zero_vbo(ivbo_16);
 		delete_and_zero_vbo(ivbo_32);
 		size_16 = size_32 = 0;
 	}
-
 	bool bind_quads_as_tris_ivbo(unsigned num_quad_verts) {
 		assert((num_quad_verts & 3) == 0); // must be a multiple of 4
 		unsigned const num_tri_verts(6*(num_quad_verts/4));
@@ -829,18 +834,12 @@ public:
 			cur_size = max(96U, max(num_tri_verts, 2U*cur_size)); // at least double
 		}
 		assert(num_tri_verts <= cur_size);
-
-		if (use_32_bit) { // use 32-bit verts
-			ensure_quad_ixs<unsigned>(ivbo, cur_size);
-		}
-		else { // use 16-bit verts
-			ensure_quad_ixs<unsigned short>(ivbo, cur_size);
-		}
+		if (use_32_bit) {ensure_quad_ixs<unsigned      >(ivbo, cur_size);} // use 32-bit verts
+		else            {ensure_quad_ixs<unsigned short>(ivbo, cur_size);} // use 16-bit verts
 		assert(ivbo != 0);
 		bind_vbo(ivbo, 1);
 		return use_32_bit;
 	}
-
 	void draw_quads_as_tris(unsigned num_quad_verts, unsigned start_quad_vert, unsigned num_instances) { // # vertices
 		if (num_quad_verts == 0) return; // nothing to do
 		assert((num_quad_verts & 3) == 0 && (start_quad_vert & 3) == 0); // must be a multiple of 4
@@ -854,12 +853,14 @@ public:
 		else {
 			glDrawElementsBaseVertex(GL_TRIANGLES, num_tri_verts, index_type, 0, start_quad_vert);
 		}
+		++num_frame_draw_calls;
 		bind_vbo(0, 1);
 	}
 };
 
 quad_ix_buffer_t quad_ix_buffer; // singleton
 
+unsigned get_quad_ix_buffer_size () {return quad_ix_buffer.get_alloced_size();}
 void clear_quad_ix_buffer_context() {quad_ix_buffer.free_context();}
 void draw_quads_as_tris(unsigned num_quad_verts, unsigned start_quad_vert, unsigned num_instances) {
 	quad_ix_buffer.draw_quads_as_tris(num_quad_verts, start_quad_vert, num_instances);

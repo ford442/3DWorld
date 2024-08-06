@@ -16,24 +16,26 @@ float const CAR_LANE_OFFSET         = 0.15; // in units of road width
 float const CITY_LIGHT_FALLOFF      = 0.2;
 
 
-float city_dlight_pcf_offset_scale(1.0), cur_dlight_pcf_offset(0.0);
+bool had_building_interior_coll(0), city_lights_custom_bcube(0);
 vector2d actual_max_road_seg_len;
 city_params_t city_params;
-point pre_smap_player_pos(all_zeros);
+point pre_smap_player_pos(all_zeros), actual_player_pos(all_zeros); // Note: pre_smap_player_pos can be security cameras, but actual_player_pos is always the player
 
-extern bool enable_dlight_shadows, dl_smap_enabled, flashlight_on, camera_in_building, have_indir_smoke_tex, disable_city_shadow_maps;
+extern bool enable_dlight_shadows, dl_smap_enabled, enable_dlight_bcubes, flashlight_on, camera_in_building, have_indir_smoke_tex, disable_city_shadow_maps;
+extern bool player_in_walkway, player_in_skyway, player_on_moving_ww;
 extern int rand_gen_index, display_mode, animate2, draw_model, player_in_basement;
 extern unsigned shadow_map_sz, cur_display_iter;
-extern float shadow_map_pcf_offset, cobj_z_bias, rain_wetness;
+extern float cobj_z_bias, rain_wetness, NEAR_CLIP;
 extern building_params_t global_building_params;
 extern vector<light_source> dl_sources;
 
 
-void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh);
+void add_dynamic_lights_city(cube_t const &scene_bcube, float &dlight_add_thresh, float falloff);
 void add_buildings_exterior_lights(vector3d const &xlate, cube_t &lights_bcube);
 void disable_shadow_maps(shader_t &s);
 vector3d get_tt_xlate_val();
 float get_max_house_size();
+bool proc_buildings_sphere_coll(point &pos, point const &p_last, float radius, vector3d *cnorm=nullptr, bool check_interior=0, bool exclude_city=0);
 
 
 template<typename S, typename T> void get_all_bcubes(vector<T> const &v, S &bcubes) {
@@ -54,24 +56,23 @@ void set_city_lighting_shader_opts(shader_t &s, cube_t const &lights_bcube, bool
 		}
 	}
 	if (use_smap) {
-		cur_dlight_pcf_offset = 0.0005*pcf_scale*city_dlight_pcf_offset_scale; // record this value so that we can reset it when drawing building interior objects
-		s.add_uniform_float("z_bias", pcf_scale*cobj_z_bias); // I guess pcf_scale is really some sort of light size scale and should apply to the z-bias as well
-		s.add_uniform_float("pcf_offset", 8.0*pcf_scale*shadow_map_pcf_offset);
-		s.add_uniform_float("dlight_pcf_offset", cur_dlight_pcf_offset);
+		s.add_uniform_float("z_bias", pcf_scale*cobj_z_bias); // I guess pcf_scale is really a light size scale and should apply to the z-bias as well
+		s.add_uniform_float("shad_bias_scale", CITY_BIAS_SCALE); // fix for sun/moon shadows that are too far shifted on buildings
 	}
 }
 
 // use_smap: 0=no, 1=sun/moon + dynamic lights; enable in shader and set shadow map uniforms, 2=dynamic lights only; disable in shader but set shadow map uniforms
 void city_shader_setup(shader_t &s, cube_t const &lights_bcube, bool use_dlights, int use_smap, int use_bmap,
-	float min_alpha, bool force_tsl, float pcf_scale, bool use_texgen, bool indir_lighting, bool is_outside)
+	float min_alpha, bool force_tsl, float pcf_scale, int use_texgen, bool indir_lighting, bool is_outside)
 {
 	use_dlights &= (lights_bcube.is_strictly_normalized() && !dl_sources.empty());
 	have_indir_smoke_tex = indir_lighting; // assume someone is going to set the indir texture in this case
 	if (indir_lighting) {s.set_prefix("#define USE_ALT_SCENE_BOUNDS", 1);} // FS; need to use different scene_llc_scale for dynamic lighting vs. building indir lighting
-	//if ((display_mode & 0x10) && use_dlights) {s.set_prefix("#define LINEAR_DLIGHT_ATTEN", 1);} // FS
 	// Note: here use_texgen mode 5 is used as a hack so that the shader still has binding points for tex coords (can't optimize it out)
-	// and we can share the same VAO between texgen and texcoords modes without having to worry about which mode we were in when the VAO was created
-	setup_smoke_shaders(s, min_alpha, (use_texgen ? 5 : 0), 0, indir_lighting, 1, use_dlights, 0, 0,
+	// and we can share the same VAO between texgen and texcoords modes without having to worry about which mode we were in when the VAO was created;
+	// use texgen mode 6 instead for cylinder buildings
+	int const use_texgen_val(use_texgen ? ((use_texgen == 2) ? 6 : 5) : 0);
+	setup_smoke_shaders(s, min_alpha, use_texgen_val, 0, indir_lighting, 1, use_dlights, 0, 0,
 		((use_smap == 1) ? 2 : 0), use_bmap, 0, (use_dlights || indir_lighting), force_tsl, 0.0, 0.0, 0, 0, is_outside); // use_spec_map=0
 	set_city_lighting_shader_opts(s, lights_bcube, use_dlights, (use_smap != 0), pcf_scale);
 	if (use_texgen) {s.add_uniform_float("tc_texgen_mix", 0.0);} // always uses texgen in this mode
@@ -83,7 +84,7 @@ void draw_state_t::begin_tile(point const &pos, bool will_emit_now, bool ensure_
 	emit_now = (use_smap && try_bind_tile_smap_at_point((pos + xlate), s));
 	if (will_emit_now && !emit_now) {disable_shadow_maps(s);} // not using shadow maps or second (non-shadow map) pass - disable shadow maps
 }
-void draw_state_t::pre_draw(vector3d const &xlate_, bool use_dlights_, bool shadow_only_, bool always_setup_shader) {
+void draw_state_t::pre_draw(vector3d const &xlate_, bool use_dlights_, bool shadow_only_, bool always_setup_shader, bool enable_animations) {
 	xlate       = xlate_;
 	camera_bs   = camera_pdu.pos - xlate;
 	shadow_only = shadow_only_;
@@ -91,10 +92,17 @@ void draw_state_t::pre_draw(vector3d const &xlate_, bool use_dlights_, bool shad
 	use_smap    = (shadow_map_enabled() && !shadow_only && !disable_city_shadow_maps);
 	draw_tile_dist = get_draw_tile_dist();
 	if (!use_smap && !always_setup_shader) return;
-	if (shadow_only) {s.begin_simple_textured_shader();}
+
+	if (shadow_only) {
+		if (enable_animations) {setup_smoke_shaders(s, 0.0, 0, 0, 0, 0, 0, 0);} // use main shader with all lighting and effects disabled to get animations
+		else {s.begin_simple_textured_shader();}
+	}
 	else {
+		bool const force_tsl = 0; // helps with hedges and flags, but causes problems with other models
 		cube_t const &lights_bcube(use_building_lights ? get_building_lights_bcube() : get_city_lights_bcube());
-		city_shader_setup(s, lights_bcube, use_dlights, use_smap, (use_bmap && !shadow_only), DEF_CITY_MIN_ALPHA, 0, 0.5);
+		city_shader_setup(s, lights_bcube, use_dlights, use_smap, (use_bmap && !shadow_only), DEF_CITY_MIN_ALPHA, force_tsl, 0.5);
+		occlusion_checker.set_exclude_camera_building(); // if the player is inside a building, skip occlusion culling
+		occlusion_checker.set_camera(camera_pdu);
 	}
 }
 void draw_state_t::end_draw() {
@@ -117,7 +125,7 @@ void draw_state_t::unset_untextured_material() {
 }
 void draw_state_t::ensure_shader_active() {
 	if (s.is_setup()) return; // already active
-	if (shadow_only) {s.begin_color_only_shader();}
+	if (shadow_only) {s.begin_shadow_map_shader();}
 	else {city_shader_setup(s, get_city_lights_bcube(), use_dlights, 0, use_bmap, DEF_CITY_MIN_ALPHA, 0, 0.5);} // no smap
 }
 void draw_state_t::draw_and_clear_light_flares() {
@@ -184,39 +192,45 @@ void draw_state_t::draw_cube(quad_batch_draw &qbd, color_wrapper const &cw, poin
 		else                                     {point const pts[4] = {p[3], p[0], p[4], p[7]}; qbd.add_quad_pts(pts, cw, -right_n, tr_right);} // right
 	}
 }
-void draw_state_t::draw_cube(quad_batch_draw &qbd, cube_t const &c, color_wrapper const &cw,
-	bool skip_bottom, float tscale, unsigned skip_dims, bool mirror_x, bool mirror_y, bool swap_tc_xy) const
+void draw_state_t::draw_cube(quad_batch_draw &qbd, cube_t const &c, color_wrapper const &cw, bool skip_bottom, float tscale, unsigned skip_dims,
+	bool mirror_x, bool mirror_y, bool swap_tc_xy, float tscale_x, float tscale_y, float tscale_z, bool skip_top, bool no_cull) const
 {
 	point p[8];
 	set_cube_pts(c, 0, 0, p);
 	//draw_cube(qbd, cw, c.get_cube_center(), p, skip_bottom, 0, tscale, skip_dims); // customized for axis aligned cube below
-	vector3d const cview_dir(camera_bs - c.get_cube_center());
+	vector3d const cview_dir(no_cull ? zero_vector : (camera_bs - c.get_cube_center()));
 	tex_range_t tr_top, tr_front, tr_right;
 	if (swap_tc_xy) {tr_top.swap_xy = tr_front.swap_xy = tr_right.swap_xy = 1;}
 
-	if (tscale > 0.0) { // compute texture s/t parameters from cube side lengths to get a 1:1 AR
-		float const ts01(tscale*c.dy()), ts12(tscale*c.dx()), ts15(tscale*c.dz());
+	if (tscale != 0.0) { // tscale: compute texture s/t parameters from cube side lengths to get a 1:1 AR
+		float const ts01(tscale*tscale_y*c.dy()), ts12(tscale*tscale_x*c.dx()), ts15(tscale*tscale_z*c.dz());
 		tr_top  .x2 = ts01; tr_top  .y2 = ts12;
 		tr_front.x2 = ts01; tr_front.y2 = ts15;
 		tr_right.x2 = ts12; tr_right.y2 = ts15;
+		if (swap_tc_xy) {swap(tr_top.x2, tr_top.y2); swap(tr_front.x2, tr_front.y2); swap(tr_right.x2, tr_right.y2);}
 	}
 	if (!(skip_dims & 4)) { // Z
 		if (mirror_x) {tr_top.mirror_x();}
 		if (mirror_y) {tr_top.mirror_y();}
-		if (cview_dir.z > 0.0) {qbd.add_quad_pts(p+4, cw,  plus_z, tr_top);} // top
-		else if (!skip_bottom) {qbd.add_quad_pts(p+0, cw, -plus_z, tr_top);} // bottom - not always drawn
+
+		if (cview_dir.z >= 0.0) {
+			if (!skip_top   ) {qbd.add_quad_pts(p+4, cw,  plus_z, tr_top);} // top - not always drawn
+		}
+		if (cview_dir.z <= 0.0) {
+			if (!skip_bottom) {qbd.add_quad_pts(p+0, cw, -plus_z, tr_top);} // bottom - not always drawn
+		}
 	}
 	if (!(skip_dims & 1)) { // X
 		if (mirror_x) {tr_front.mirror_x();}
 		if (mirror_y) {tr_front.mirror_y();}
-		if (cview_dir.x < 0.0) {point const pts[4] = {p[0], p[1], p[5], p[4]}; qbd.add_quad_pts(pts, cw, -plus_x, tr_front);} // back
-		else                   {point const pts[4] = {p[2], p[3], p[7], p[6]}; qbd.add_quad_pts(pts, cw,  plus_x, tr_front);} // front
+		if (cview_dir.x <= 0.0) {point const pts[4] = {p[0], p[1], p[5], p[4]}; qbd.add_quad_pts(pts, cw, -plus_x, tr_front);} // back
+		if (cview_dir.x >= 0.0) {point const pts[4] = {p[2], p[3], p[7], p[6]}; qbd.add_quad_pts(pts, cw,  plus_x, tr_front);} // front
 	}
 	if (!(skip_dims & 2)) { // Y
 		if (mirror_x) {tr_right.mirror_x();}
 		if (mirror_y) {tr_right.mirror_y();}
-		if (cview_dir.y < 0.0) {point const pts[4] = {p[1], p[2], p[6], p[5]}; qbd.add_quad_pts(pts, cw, -plus_y, tr_right);} // left
-		else                   {point const pts[4] = {p[3], p[0], p[4], p[7]}; qbd.add_quad_pts(pts, cw,  plus_y, tr_right);} // right
+		if (cview_dir.y <= 0.0) {point const pts[4] = {p[1], p[2], p[6], p[5]}; qbd.add_quad_pts(pts, cw, -plus_y, tr_right);} // left
+		if (cview_dir.y >= 0.0) {point const pts[4] = {p[3], p[0], p[4], p[7]}; qbd.add_quad_pts(pts, cw,  plus_y, tr_right);} // right
 	}
 }
 bool draw_state_t::add_light_flare(point const &flare_pos, vector3d const &n, colorRGBA const &color, float alpha, float radius) {
@@ -253,9 +267,9 @@ template<typename T> bool check_bcubes_sphere_coll(vector<T> const &bcubes, poin
 }
 template bool check_bcubes_sphere_coll(vector<cube_t> const &bcubes, point const &sc, float radius, bool xy_only); // explicit instantiation
 
-template<typename T> void get_bcubes_sphere_coll(vector<T> const &bcubes, vect_cube_t &out, point const &sc, float radius, bool xy_only, vector3d const &xlate) {
-	for (auto i = bcubes.begin(); i != bcubes.end(); ++i) {
-		if (check_bcube_sphere_coll(get_bcube(*i), sc, radius, xy_only)) {out.push_back(get_bcube(*i) + xlate);} // Note: out is in camera space
+template<typename T> void get_bcubes_region_coll_xy(vector<T> const &bcubes, vect_cube_t &out, cube_t const &region, vector3d const &xlate) {
+	for (T const &c : bcubes) {
+		if (c.intersects_xy(region)) {out.push_back(get_bcube(c) + xlate);} // Note: out is in camera space
 	}
 }
 template<typename T> cube_t calc_cubes_bcube(vector<T> const &cubes) {
@@ -264,19 +278,6 @@ template<typename T> cube_t calc_cubes_bcube(vector<T> const &cubes) {
 	for (auto r = cubes.begin()+1; r != cubes.end(); ++r) {bcube.union_with_cube(*r);} // skip first cube
 	return bcube;
 }
-
-template<typename T> bool has_bcube_int_xy(cube_t const &bcube, vector<T> const &bcubes, float pad_dist) { // T must derive from cube_t
-	cube_t tc(bcube);
-	tc.expand_by_xy(pad_dist);
-
-	for (auto c = bcubes.begin(); c != bcubes.end(); ++c) {
-		if (c->intersects_xy(tc)) return 1; // intersection
-	}
-	return 0;
-}
-// explicit instantiations
-template bool has_bcube_int_xy(cube_t const &bcube, vector<cube_t    > const &bcubes, float pad_dist);
-template bool has_bcube_int_xy(cube_t const &bcube, vector<elevator_t> const &bcubes, float pad_dist);
 
 point rand_xy_pt_in_cube(cube_t const &c, float radius, rand_gen_t &rgen) {
 	return point(rgen.rand_uniform(c.x1()+radius, c.x2()-radius), rgen.rand_uniform(c.y1()+radius, c.y2()-radius), c.z1());
@@ -369,19 +370,19 @@ public:
 		flatten_region_to(x1, y1, x2, y2, slope_width, elevation);
 		return elevation;
 	}
-	bool check_plot_sphere_coll(point const &pos, float radius, bool xy_only=1) const { // Note: cities, not blocks
+	bool check_plot_sphere_coll(point const &pos, float radius, bool xy_only=1) const { // Note: cities, not blocks; pos is in camera space
 		if (plots.empty()) return 0;
 		point const query_pos(pos - get_camera_coord_space_xlate()); // convert from camera space to global city space
 		radius += 0.5*city_params.road_width; // add extra padding around city plots
 		if (!check_bcube_sphere_coll(bcube, query_pos, radius, xy_only)) return 0;
 		return check_bcubes_sphere_coll(plots, query_pos, radius, xy_only);
 	}
-	void get_plots_sphere_coll(point const &pos, float radius, bool xy_only, vect_cube_t &out) const { // Note: pos is in camera space, and out is returned in camera space
+	void get_plots_in_region(cube_t const &region, vect_cube_t &out) const { // Note: region is in camera space, and out is returned in camera space
 		if (plots.empty()) return;
 		vector3d const xlate(get_camera_coord_space_xlate());
-		point const query_pos(pos - xlate); // in global city space
-		if (!check_bcube_sphere_coll(bcube, query_pos, radius, xy_only)) return;
-		get_bcubes_sphere_coll(plots, out, query_pos, radius, xy_only, xlate);
+		cube_t const query_region(region - xlate); // in global city space
+		if (!bcube.intersects_xy(query_region)) return;
+		get_bcubes_region_coll_xy(plots, out, query_region, xlate);
 	}
 }; // city_plot_gen_t
 
@@ -440,11 +441,8 @@ class road_network_t : public streetlights_t { // AKA city center
 	vector<city_id_pair_t> road_to_city; // indexed by road ID
 	vector<vector<unsigned>> city_to_seg; // maps city_id to set of road segments connecting to that city
 
-	struct cmp_by_tile { // not the most efficient solution, but no memory overhead
-		bool operator()(cube_t const &a, cube_t const &b) const {return (get_tile_id_for_cube(a) < get_tile_id_for_cube(b));}
-	};
 	struct tile_block_t { // collection of road parts for a given tile
-		range_pair_t ranges[NUM_RD_TYPES]; // {plot, seg, isec2, isec3, isec4, park_lot, tracks, park, driveway, building}
+		range_pair_t ranges[NUM_RD_TYPES]; // {plot, seg, isec2, isec3, isec4, park_lot, tracks, park, driveway, road_skirt, building}
 		quad_batch_draw quads[NUM_RD_TYPES];
 		cube_t bcube;
 		tile_block_t(cube_t const &bcube_) : bcube(bcube_) {}
@@ -473,6 +471,11 @@ class road_network_t : public streetlights_t { // AKA city center
 	road_seg_t const &get_seg(unsigned seg_ix) const {
 		assert(seg_ix < segs.size());
 		return segs[seg_ix];
+	}
+	road_isec_t const &get_isec(unsigned type_ix, unsigned isec_ix) const {
+		assert(type_ix < 3);
+		assert(isec_ix < isecs[type_ix].size());
+		return isecs[type_ix][isec_ix];
 	}
 public:
 	road_network_t() : bcube(all_zeros), city_id(CONN_CITY_IX), cluster_id(0), plot_id_offset(0), tot_road_len(0.0), num_cars(0), is_residential(0) {} // global road network ctor
@@ -504,21 +507,6 @@ public:
 		c.z2() += max(stoplight_ns::stoplight_max_height(), streetlight_ns::get_streetlight_height());
 		return c;
 	}
-	void clear() {
-		roads.clear();
-		segs.clear();
-		conn_roads.clear();
-		plots.clear();
-		bridges.clear();
-		tunnels.clear();
-		tracks.clear();
-		track_segs.clear();
-		for (unsigned i = 0; i < 3; ++i) {isecs[i].clear();}
-		streetlights.clear();
-		city_obj_placer.clear();
-		tile_blocks.clear();
-		plot_colliders.clear();
-	}
 	bool gen_road_grid(float road_width, vector2d const &road_spacing) {
 		if (road_width > 0.5*min(road_spacing.x, road_spacing.y)) {
 			cerr << "Error: City road_width should not be set larger than half the road spacing" << endl;
@@ -545,13 +533,14 @@ public:
 			roads.emplace_back(point(bcube.x1(), y, zval), point(bcube.x2(), y, zval), road_width, false, false, roads.size());
 		}
 		unsigned const num_r(roads.size()), num_y(num_r - num_x);
-		if (num_x <= 1 || num_y <= 1) {clear(); return 0;} // not enough space for roads
+		if (num_x <= 1 || num_y <= 1) {roads.clear(); return 0;} // not enough space for roads; this city will be removed
 		bcube.x1() = roads[0      ].x1(); // actual bcube x1 from first x road
 		bcube.x2() = roads[num_x-1].x2(); // actual bcube x2 from last  x road
 		bcube.y1() = roads[num_x  ].y1(); // actual bcube y1 from first y road
 		bcube.y2() = roads[num_r-1].y2(); // actual bcube y2 from last  y road
 
 		// create road segments and intersections
+		bool const add_stoplights(!is_residential); // add stoplights in cities, and stop signs in residential neighborhoods
 		plot_xy.nx = num_x - 1; plot_xy.ny = num_y - 1;
 		segs .reserve(num_x*(num_y-1) + (num_x-1)*num_y + 4); // X + Y segments, allocate one extra per side for connectors
 		plots.reserve(plot_xy.num());
@@ -568,7 +557,7 @@ public:
 				unsigned const num_conn((!FX) + (!LX) + (!FY) + (!LY));
 				if (num_conn < 2) continue; // error?
 				uint8_t const conn(((!FX) << 0) | ((!LX) << 1) | ((!FY) << 2) | ((!LY) << 3)); // 1-15
-				isecs[num_conn - 2].emplace_back(cube_t(rx.x1(), rx.x2(), ry.y1(), ry.y2(), zval, zval), y, x, conn, false); // intersections
+				isecs[num_conn - 2].emplace_back(cube_t(rx.x1(), rx.x2(), ry.y1(), ry.y2(), zval, zval), y, x, conn, false, (add_stoplights && num_conn > 2)); // intersections
 					
 				if (!LX) { // skip last y segment
 					cube_t const &rxn(roads[x+1]);
@@ -929,7 +918,8 @@ public:
 			ibc.d[!dim][1] = c.d[!dim][1];
 			uint8_t const conns[4] = {7, 11, 13, 14};
 			int const other_rix(encode_neg_ix(grn_rix)); // make negative
-			isecs[1].emplace_back(ibc, (dim ? seg.road_ix : (int)other_rix), (dim ? other_rix : (int)seg.road_ix), conns[2*(!dim) + dir], true, dest_city_id); // 3-way
+			bool const add_stoplights = 1; // always true for connector roads or !is_residential?
+			isecs[1].emplace_back(ibc, (dim ? seg.road_ix : (int)other_rix), (dim ? other_rix : (int)seg.road_ix), conns[2*(!dim) + dir], true, add_stoplights, dest_city_id); // 3-way
 		}
 	}
 
@@ -1001,10 +991,10 @@ public:
 			replay_fops.push_back(hq.last_flatten_op);
 				
 			if (!check_only) {
+				if (bridge.make_bridge) {bridges.push_back(bridge); s->register_bridge_or_tunnel(bridge, 1);}
+				if (tunnel.enabled())   {tunnels.push_back(tunnel); s->register_bridge_or_tunnel(bridge, 0);}
 				roads.push_back(*s);
 				road_to_city.emplace_back(city1, city2); // Note: city index is specified even for internal (non-terminal) roads
-				if (bridge.make_bridge) {bridges.push_back(bridge);}
-				if (tunnel.enabled()) {tunnels.push_back(tunnel);}
 			}
 			last_was_bridge = bridge.make_bridge; // Note: conservative; used to prevent two consecutive bridges with no (or not enough) mesh in between
 			last_was_tunnel = tunnel.enabled(); // same thing for tunnels
@@ -1018,7 +1008,7 @@ public:
 	}
 	void create_connector_bend(cube_t const &int_bcube, bool dx, bool dy, unsigned road_ix_x, unsigned road_ix_y) {
 		uint8_t const conns[4] = {6, 5, 10, 9};
-		isecs[0].emplace_back(int_bcube, road_ix_x, road_ix_y, conns[2*dy + dx], true);
+		isecs[0].emplace_back(int_bcube, road_ix_x, road_ix_y, conns[2*dy + dx], true, false); // add_stoplights=0
 		//blockers.push_back(int_bcube); // ???
 	}
 	void split_connector_roads(float road_spacing) { // required for correct shadow maps, since default segments may be too long
@@ -1032,21 +1022,23 @@ public:
 			unsigned const num_segs(ceil(len/road_spacing));
 			float const seg_len(len/num_segs), z1(r->d[2][slope]), z2(r->d[2][!slope]); // use fixed-length segments
 			assert(seg_len <= road_spacing);
-			cube_t c(*r); // start by copying the road's bcube
+			road_t c(*r); // start by copying the road's bcube
 				
 			for (unsigned n = 0; n < num_segs; ++n) {
 				c.d[d][1] = ((n+1 == num_segs) ? r->d[d][1] : (c.d[d][0] + seg_len)); // make sure it ends exactly at the correct location
 				for (unsigned e = 0; e < 2; ++e) {c.d[2][e] = z1 + (z2 - z1)*((c.d[d][e] - r->d[d][0])/len);} // interpolate road height across segments
 				if (c.z2() < c.z1()) {swap(c.z2(), c.z1());} // swap zvals if needed
 				assert(c.is_normalized());
-				segs.emplace_back(c, rix, d, r->slope);
+				segs.emplace_back(c, rix);
+				if (c.has_bridge) {segs.back().has_bridge = has_bcube_int_xy(c, bridges);} // check if bridge overlaps this segment
+				if (c.has_tunnel) {segs.back().has_tunnel = has_bcube_int_xy(c, tunnels);} // check if tunnel overlaps this segment
 				c.d[d][0] = c.d[d][1]; // shift segment end point
 			} // for n
 		} // for r
 	}
 	void finalize_bridges_and_tunnels() {
-		for (auto b = bridges.begin(); b != bridges.end(); ++b) {b->add_streetlights();}
-		for (auto b = tunnels.begin(); b != tunnels.end(); ++b) {b->add_streetlights();}
+		for (bridge_t &b : bridges) {b.add_streetlights();}
+		for (tunnel_t &t : tunnels) {t.add_streetlights();}
 	}
 
 	void gen_tile_blocks() {
@@ -1060,13 +1052,14 @@ public:
 		//cout << "tile_to_block_map: " << tile_to_block_map.size() << ", tile_blocks: " << tile_blocks.size() << endl;
 	}
 	void gen_parking_lots_and_place_objects(vector<car_t> &cars, bool have_cars, bool &have_plot_dividers) {
-		city_obj_placer.clear();
+		city_obj_placer = city_obj_placer_t(); // clear; should be empty anyway, since city_obj_placer is not reused
 		city_obj_placer.set_plot_subdiv_sz(get_plot_subdiv_sz());
-		city_obj_placer.gen_parking_and_place_objects(plots, plot_colliders, cars, roads, city_id, have_cars, is_residential, !streetlights.empty());
+		city_obj_placer.gen_parking_and_place_objects(plots, plot_colliders, cars, roads, isecs, bcube, city_id, have_cars, is_residential, !streetlights.empty());
 		add_tile_blocks(city_obj_placer.parking_lots, tile_to_block_map, TYPE_PARK_LOT); // need to do this later, after gen_tile_blocks()
 		add_tile_blocks(city_obj_placer.driveways,    tile_to_block_map, TYPE_DRIVEWAY);
 		tile_to_block_map.clear(); // no longer needed
-		city_obj_placer.move_and_connect_streetlights(*this);
+		city_obj_placer.finalize_streetlights_and_power(*this, plot_colliders);
+		for (auto i = plot_colliders.begin(); i != plot_colliders.end(); ++i) {sort(i->begin(), i->end(), [](cube_t const &a, cube_t const &b) {return (a.x1() < b.x1());});}
 		have_plot_dividers |= !city_obj_placer.has_plot_dividers();
 	}
 	void add_streetlights() {
@@ -1074,14 +1067,19 @@ public:
 		streetlights.reserve(4*plots.size()); // one on each side of each plot
 		// spacing from light pos to plot edge, relative to plot size (placed just outside the plot, so spacing is negative)
 		float const b(-(SIDEWALK_WIDTH*city_params.road_width - 0.5f*streetlight_ns::get_streetlight_pole_radius())/city_params.road_spacing), a(1.0 - b);
+		assert(plot_colliders.size() == plots.size());
 
 		for (auto i = plots.begin(); i != plots.end(); ++i) {
-			streetlights.emplace_back(point((a*i->x1() + b*i->x2()), (0.75*i->y1() + 0.25*i->y2()), i->z2()), -plus_x); // left   edge one   quarter  up
-			streetlights.emplace_back(point((a*i->x2() + b*i->x1()), (0.25*i->y1() + 0.75*i->y2()), i->z2()),  plus_x); // right  edge three quarters up
-			streetlights.emplace_back(point((0.25*i->x1() + 0.75*i->x2()), (a*i->y1() + b*i->y2()), i->z2()), -plus_y); // bottom edge three quarters right
-			streetlights.emplace_back(point((0.75*i->x1() + 0.25*i->x2()), (a*i->y2() + b*i->y1()), i->z2()),  plus_y); // top    edge one   quarter  right
+			unsigned const plot_ix(i - plots.begin());
+			streetlights.emplace_back(point((a*i->x1() + b*i->x2()), (0.75*i->y1() + 0.25*i->y2()), i->z2()), -plus_x, 0, plot_ix); // left   edge one   quarter  up
+			streetlights.emplace_back(point((a*i->x2() + b*i->x1()), (0.25*i->y1() + 0.75*i->y2()), i->z2()),  plus_x, 0, plot_ix); // right  edge three quarters up
+			streetlights.emplace_back(point((0.25*i->x1() + 0.75*i->x2()), (a*i->y1() + b*i->y2()), i->z2()), -plus_y, 0, plot_ix); // bottom edge three quarters right
+			streetlights.emplace_back(point((0.75*i->x1() + 0.25*i->x2()), (a*i->y2() + b*i->y1()), i->z2()),  plus_y, 0, plot_ix); // top    edge one   quarter  right
 		}
 		sort_streetlights_by_yx();
+	}
+	bool update_depth_if_underwater(point const &pos, float &depth) const { // Note: pos is in building space
+		return city_obj_placer.update_depth_if_underwater(pos, depth);
 	}
 	void get_road_bcubes(vect_cube_t &bcubes) const {
 		get_all_bcubes(roads,  bcubes);
@@ -1100,7 +1098,7 @@ public:
 				if (city_obj_placer.subdivide_plot_for_residential(*i, roads, plot_subdiv_sz, cur_global_plot_ix, city_id, zones)) continue;
 			}
 			zones.emplace_back(*i, 0.0, i->is_park, is_residential, 0, 0, cur_global_plot_ix, city_id, max_floors); // cube, zval, park, res, sdir, capacity, ppix, cix, max_floors
-		} // for i
+		}
 		vector3d const city_radius(0.5*bcube.get_size());
 		point const city_center(bcube.get_cube_center());
 
@@ -1122,7 +1120,7 @@ public:
 		if (check_bcubes_sphere_coll(roads, query_pos, radius, xy_only)) { // collision with a road
 			if (!exclude_bridges_and_tunnels ||
 				!(check_bcubes_sphere_coll(bridges, query_pos, radius, xy_only) ||
-					check_bcubes_sphere_coll(tunnels, query_pos, radius, xy_only))) return 1; // ignore collisions with bridges and tunnels
+				  check_bcubes_sphere_coll(tunnels, query_pos, radius, xy_only))) return 1; // ignore collisions with bridges and tunnels
 		}
 		if (include_intersections) { // used for global road network
 			for (unsigned i = 0; i < 3; ++i) { // {2-way, 3-way, 4-way}
@@ -1133,33 +1131,27 @@ public:
 		return 0;
 	}
 	// Note: returns cubes in local pos space
-	void get_roads_sphere_coll(point const &pos, float radius, bool include_intersections, bool xy_only, vect_cube_t &out, vect_cube_t *out_bt) const {
+	void get_roads_in_region(cube_t const &region, vect_cube_t &out, vect_cube_t &out_bt) const {
 		if (roads.empty()) return;
 		vector3d const xlate(get_camera_coord_space_xlate());
-		point const query_pos(pos - xlate);
-		if (!check_bcube_sphere_coll(bcube, query_pos, radius, xy_only)) return;
-		get_bcubes_sphere_coll(roads, out, query_pos, radius, xy_only, xlate);
-				
-		if (include_intersections) { // used for global road network
-			for (unsigned i = 0; i < 3; ++i) { // {2-way, 3-way, 4-way}
-				get_bcubes_sphere_coll(isecs[i], out, query_pos, radius, xy_only, xlate);
-			}
-		}
-		if (out_bt) {
-			get_bcubes_sphere_coll(bridges, *out_bt, query_pos, radius, xy_only, xlate);
-			get_bcubes_sphere_coll(tunnels, *out_bt, query_pos, radius, xy_only, xlate);
-		}
-		get_bcubes_sphere_coll(tracks, out, query_pos, radius, xy_only, xlate);
+		cube_t const query_region(region - xlate);
+		if (!bcube.intersects_xy(query_region)) return;
+		get_bcubes_region_coll_xy(roads, out, query_region, xlate);	
+		// include global road network intersections
+		for (unsigned i = 0; i < 3; ++i) {get_bcubes_region_coll_xy(isecs[i], out, query_region, xlate);} // {2-way, 3-way, 4-way}
+		get_bcubes_region_coll_xy(bridges, out_bt, query_region, xlate);
+		get_bcubes_region_coll_xy(tunnels, out_bt, query_region, xlate);
+		get_bcubes_region_coll_xy(tracks,  out,    query_region, xlate);
 	}
 	bool proc_sphere_coll(point &pos, point const &p_last, vector3d const &xlate, float dist, float radius, float prev_frame_zval, vector3d *cnorm) const { // pos in camera space
-		if (!sphere_cube_intersect_xy(pos, (radius + dist), (bcube + xlate))) return 0;
+		if (!moving_sphere_cube_intersect_xy(pos, p_last, (bcube + xlate), dist, radius)) return 0;
 		bool plot_coll(0);
 			
 		if (!plots.empty()) {
 			float const max_obj_z(bcube.z1() + radius);
 			if (pos.z < max_obj_z) {pos.z = max_obj_z; plot_coll = 1;} // make sure the sphere is above the city road/plot surface
 		}
-		for (unsigned n = 1; n < 3; ++n) { // intersections with stoplights (3-way, 4-way)
+		for (unsigned n = 1; n < 3; ++n) { // intersections, possibly with stoplights (3-way, 4-way)
 			for (auto i = isecs[n].begin(); i != isecs[n].end(); ++i) {
 				if (i->proc_sphere_coll(pos, p_last, radius, xlate, dist, cnorm)) return 1;
 			}
@@ -1170,11 +1162,12 @@ public:
 		for (auto i = tunnels.begin(); i != tunnels.end(); ++i) {
 			if (i->proc_sphere_coll(pos, p_last, radius, prev_frame_zval, xlate, cnorm)) return 1;
 		}
+		// test city objects before streetlights so that player doesn't fall through a walkway when over a streetlight
+		if (city_obj_placer.proc_sphere_coll(pos, p_last, xlate, radius, cnorm)) return 1;
+
 		if ((pos.z - xlate.z - radius) < (bcube.z2() + streetlight_ns::get_streetlight_height())) { // below the level of the streetlights
 			if (proc_streetlight_sphere_coll(pos, radius, xlate, cnorm)) return 1;
 		}
-		if (city_obj_placer.proc_sphere_coll(pos, p_last, xlate, radius, cnorm)) return 1;
-			
 		if (0 && plot_coll) { // no other collisions - return collision with plot or road - doesn't work correctly for bouncing balls
 			if (cnorm) {*cnorm = plus_z;}
 			return 1;
@@ -1185,7 +1178,7 @@ public:
 		bool ret(0);
 			
 		if (get_bcube_inc_stoplights_and_streetlights().line_intersects(p1, p2)) { // z2 too small for streetlights?
-			for (unsigned n = 1; n < 3; ++n) { // intersections with stoplights (3-way, 4-way)
+			for (unsigned n = 1; n < 3; ++n) { // intersections, possibly with stoplights (3-way, 4-way)
 				for (auto i = isecs[n].begin(); i != isecs[n].end(); ++i) {ret |= i->line_intersect(p1, p2, t);}
 			}
 			for (auto i = bridges.begin(); i != bridges.end(); ++i) {ret |= i->line_intersect(p1, p2, t);}
@@ -1195,27 +1188,43 @@ public:
 		ret |= city_obj_placer.line_intersect(p1, p2, t);
 		return ret;
 	}
-	bool check_mesh_disable(point const &pos, float radius) const {
+	bool check_mesh_disable(point const &pos, float radius) const { // Note: pos is in camera space
 		if (tunnels.empty()) return 0;
 		point const query_pos(pos - get_camera_coord_space_xlate());
 		cube_t query_region; query_region.set_from_sphere(query_pos, radius); // actually a cube, not a sphere
+		if (!bcube.intersects_xy(query_region)) return 0;
 
-		for (auto i = tunnels.begin(); i != tunnels.end(); ++i) {
-			if (i->check_mesh_disable(query_region)) return 1;
+		for (tunnel_t const &t : tunnels) {
+			if (t.check_mesh_disable(query_region)) return 1;
 		}
 		return 0;
 	}
-	bool tile_contains_tunnel(cube_t const &tile_bcube) const {
-		for (auto i = tunnels.begin(); i != tunnels.end(); ++i) {
-			if (i->intersects_xy(tile_bcube)) return 1;
+	bool tile_contains_tunnel(cube_t const &tile_bcube) const { // Note: cube is in global space
+		if (tunnels.empty() || !bcube.intersects_xy(tile_bcube)) return 0;
+
+		for (tunnel_t const &t : tunnels) {
+			if (t.intersects_xy(tile_bcube)) return 1;
 		}
 		return 0;
 	}
-	bool point_in_tunnel(point const &pos) const {
-		for (auto i = tunnels.begin(); i != tunnels.end(); ++i) {
-			if (i->contains_pt(pos)) return 1; // Note: checks z-val
+	bool point_in_tunnel(point const &pos) const { // Note: pos is in global space
+		if (tunnels.empty() || !bcube.contains_pt_xy(pos)) return 0;
+
+		for (tunnel_t const &t : tunnels) {
+			if (t.contains_pt(pos)) return 1; // Note: checks z-val
 		}
 		return 0;
+	}
+	bool cube_intersect_tunnel(cube_t const &c) const { // Note: cube is in global space
+		if (tunnels.empty() || !bcube.intersects_xy(c)) return 0;
+
+		for (tunnel_t const &t : tunnels) {
+			if (t.get_tunnel_bcube().intersects(c)) return 1; // use outer bounding cube
+		}
+		return 0;
+	}
+	bool cube_int_underground_obj(cube_t const &c) const {
+		return (c.intersects_xy(bcube)) && city_obj_placer.cube_int_underground_obj(c);
 	}
 	bool choose_pt_in_park(point &park_pos, rand_gen_t &rgen) const {
 		if (parks.empty()) return 0;
@@ -1248,16 +1257,11 @@ public:
 	bool cube_overlaps_pl_or_dw_xy(cube_t const &c) const {
 		return (cube_overlaps_tile_group_xy(city_obj_placer.parking_lots, c, TYPE_PARK_LOT) || cube_overlaps_tile_group_xy(city_obj_placer.driveways, c, TYPE_DRIVEWAY));
 	}
-	template<typename T> static bool check_vect_cube_contains_pt_xy(vector<T> const &cubes, point const &pos) {
-		for (auto i = cubes.begin(); i != cubes.end(); ++i) {
-			if (i->contains_pt_xy(pos)) return 1;
-		}
-		return 0;
-	}
 	int get_color_at_xy(point const &pos, colorRGBA &color) const { // Note: return value is currently unused, but it could be used for something in the future
 		// Note: query results are mutually exclusive since there's no overlap, so can early terminate on true
 		if (!bcube.contains_pt_xy(pos)) return 0;
 		if (check_vect_cube_contains_pt_xy(tunnels, pos)) {color = BROWN; return INT_ROAD;}
+		if (city_obj_placer.get_color_at_xy_pre_road(pos, color)) return INT_BUILDING; // walkway
 			
 		for (auto i = bridges.begin(); i != bridges.end(); ++i) {
 			if (i->contains_pt_xy_exp(pos, 1.0*city_params.road_width)) {color = WHITE; return INT_ROAD;}
@@ -1278,7 +1282,7 @@ public:
 			if (check_vect_cube_contains_pt_xy(isecs[0], pos)) {color = GRAY; return INT_ROAD;} // 2-way intersections
 		}
 		if (check_tile_group_contains_pt_xy(city_obj_placer.parking_lots, pos, TYPE_PARK_LOT)) {color = DK_GRAY; return INT_PARKING;}
-		if (check_tile_group_contains_pt_xy(city_obj_placer.driveways,    pos, TYPE_DRIVEWAY)) {color = LT_GRAY; return INT_PARKING;}
+		if (check_tile_group_contains_pt_xy(city_obj_placer.driveways,    pos, TYPE_DRIVEWAY)) {color = (is_residential ? LT_GRAY : colorRGBA(0.4, 0.4, 0.4)); return INT_PARKING;}
 		if (city_obj_placer.get_color_at_xy(pos, color, 1)) {return INT_PLOT;} // hit a detail object, but still in a plot; skip objects in roads such as fire hydrants
 			
 		if (!plots.empty()) { // inside a city and not over a road - must be over a plot or park
@@ -1295,15 +1299,21 @@ public:
 		for (auto i = roads.begin(); i != roads.end(); ++i) {if (i->intersects(c)) return 1;}
 		return 0;
 	}
-	void get_occluders(vect_cube_t &occluders) const {
-		if (bcube.contains_pt_xy(camera_pdu.pos)) {city_obj_placer.get_occluders(camera_pdu, occluders);} // only add if this city contains the camera
+	void get_occluders(vect_cube_t &occluders, vector3d const &xlate) const {
+		if (bcube.contains_pt_xy(camera_pdu.pos - xlate)) {city_obj_placer.get_occluders(camera_pdu, xlate, occluders);} // only add if this city contains the camera
 	}
-	static void set_road_normal_map  () {select_multitex(get_texture_by_name("normal_maps/dirt_normal.jpg", 1), 5);}
-	static void reset_road_normal_map() {select_multitex(FLAT_NMAP_TEX, 5);}
+	vector<bridge_t> const &get_bridges() const {return bridges;}
+	bool have_animations() const {return city_obj_placer.have_animations();}
+	static void set_road_normal_map  () {select_texture(get_texture_by_name("normal_maps/dirt_normal.jpg", 1), 5);}
+	static void reset_road_normal_map() {bind_default_flat_normal_map();} // no normal map
 
 	void draw(road_draw_state_t &dstate, bool shadow_only, bool is_connector_road) {
 		city_obj_placer.draw_detail_objects(dstate, shadow_only); // always drawn; does its own VFC and distance test
-		if (empty()) return;
+		if (!empty()) {draw_roads_and_plots(dstate, shadow_only, is_connector_road);}
+		dstate.end_cur_tile(); // once for all tiles, to draw shadow casters and untextured streetlights
+		city_obj_placer.draw_transparent_objects(dstate, shadow_only);
+	}
+	void draw_roads_and_plots(road_draw_state_t &dstate, bool shadow_only, bool is_connector_road) {
 		if (!dstate.check_cube_visible(get_bcube_inc_stoplights_and_streetlights(), 1.0)) return; // VFC/too far
 
 		if (shadow_only) {
@@ -1311,12 +1321,17 @@ public:
 				// Note: we can store the contents of qbd_sl in a VBO to avoid recreating it every frame for the shadow pass
 				for (auto b = tile_blocks.begin(); b != tile_blocks.end(); ++b) {
 					if (!dstate.check_cube_visible(b->bcube, 0.16)) continue; // VFC/too far; dist_scale=0.16
-					for (unsigned i = 1; i < 3; ++i) {dstate.draw_stoplights(isecs[i], roads, b->ranges[TYPE_ISEC2 + i], city_id, 1);} // isecs with stoplights (3-way, 4-way)
+					
+					for (unsigned i = 1; i < 3; ++i) { // isecs with stoplights (3-way, 4-way)
+						dstate.draw_stoplights_and_street_signs(isecs[i], roads, b->ranges[TYPE_ISEC2 + i], city_id, 1);
+					}
 				}
-				dstate.end_cur_tile(); // once for all tiles, since shadows aren't used
 			}
 		}
-		else {
+		else { // regular draw pass
+			// it would be nice to have raised sidewalks here, or possibly curbs;
+			// however, they would need to apply to all tiles, including city plots and curved road segments, which makes it difficult;
+			// also, we would have to adjust the height of pedestrians, fire hydrants, etc.
 			bool const use_road_normal_maps(rain_wetness > 0.0); // use dirt normal map texture for rain effects
 
 			for (auto b = tile_blocks.begin(); b != tile_blocks.end(); ++b) {
@@ -1325,17 +1340,30 @@ public:
 
 				// if the player is in the basement, don't draw the plot over the basement stairs; the player can't see any of this anyway
 				if (!player_in_basement || is_connector_road) {
-					if (is_residential) { // draw all plots with grass, using the park materials
-						dstate.draw_city_region(plots, b->ranges[TYPE_PLOT], b->quads[TYPE_PLOT], TYPE_PARK, 1); // draw_all=1
-					}
-					else {
-						dstate.draw_city_region(plots, b->ranges[TYPE_PLOT], b->quads[TYPE_PLOT], TYPE_PLOT); // concrete
-						dstate.draw_city_region(plots, b->ranges[TYPE_PLOT], b->quads[TYPE_PARK], TYPE_PARK); // grass parks (stored as plots)
+					if (!plots.empty()) { // draw plots if not global connector road network
+						cube_t const plot_exclude(get_cur_basement());
+						if (!plot_exclude.is_all_zeros() && plot_exclude.intersects_xy(b->bcube)) {b->quads[TYPE_PLOT].clear();} // clear and rebuild plot cache
+
+						if (is_residential) { // draw all plots with grass, using the park materials
+							dstate.plot_cuts.clear();
+							cube_t const plot_exclude(get_cur_basement()); // clip out basement
+							if (!plot_exclude.is_all_zeros() && plot_exclude.intersects_xy(b->bcube)) {dstate.plot_cuts.push_back(plot_exclude);}
+							city_obj_placer.get_plot_cuts(b->bcube, dstate.plot_cuts);
+							dstate.draw_city_region(plots, b->ranges[TYPE_PLOT], b->quads[TYPE_PLOT], TYPE_PARK, 1); // draw_all=1
+							dstate.plot_cuts.clear();
+						}
+						else {
+							dstate.draw_city_region(plots, b->ranges[TYPE_PLOT], b->quads[TYPE_PLOT], TYPE_PLOT); // concrete
+							dstate.draw_city_region(plots, b->ranges[TYPE_PLOT], b->quads[TYPE_PARK], TYPE_PARK); // grass parks (stored as plots)
+						}
 					}
 					if (use_road_normal_maps) {set_road_normal_map();} // set normal maps for roads, parking lots, and driveways
 					dstate.draw_city_region(segs, b->ranges[TYPE_RSEG], b->quads[TYPE_RSEG], TYPE_RSEG); // road segments
 					dstate.draw_city_region(city_obj_placer.parking_lots, b->ranges[TYPE_PARK_LOT], b->quads[TYPE_PARK_LOT], TYPE_PARK_LOT); // parking lots
 
+					if (is_connector_road) { // draw road skirts
+						dstate.draw_city_region(segs, b->ranges[TYPE_RSEG], b->quads[TYPE_ROAD_SKIRT], TYPE_ROAD_SKIRT); // same ranges as the road, but a different type
+					}
 					if (!city_obj_placer.driveways.empty()) {
 						glPolygonOffset(-1.0, -1.0); // useful for avoiding z-fighting with grassy ground under driveways
 						glEnable(GL_POLYGON_OFFSET_FILL);
@@ -1353,14 +1381,18 @@ public:
 				if (use_road_normal_maps) {reset_road_normal_map();}
 
 				for (unsigned i = 1; i < 3; ++i) { // intersections (3-way, 4-way)
-					dstate.draw_stoplights(isecs[i], roads, b->ranges[TYPE_ISEC2 + i], city_id, 0);
+					dstate.draw_stoplights_and_street_signs(isecs[i], roads, b->ranges[TYPE_ISEC2 + i], city_id, 0);
 				}
 				dstate.end_cur_tile();
 			} // for b
+		} // end !shadow_only
+		if (!is_connector_road) { // draw exterior edges (skirts) of city to cover the gap above the terrain
+			// it's okay to draw under connector roads, and these are vertical and generally have no light or shadows
+			dstate.draw_city_skirt(bcube, shadow_only);
 		}
 		draw_streetlights(dstate, shadow_only, 0);
 			
-		// draw bridges and tunnels; only in connector road network; bridgesand tunnels are sparse/uncommon, so don't need to be batched by blocks
+		// draw bridges and tunnels; only in connector road network; bridges and tunnels are sparse/uncommon, so don't need to be batched by blocks
 		for (auto b = bridges.begin(); b != bridges.end(); ++b) {
 			dstate.draw_bridge(*b, shadow_only);
 			b->draw_streetlights(dstate, shadow_only, 0);
@@ -1374,6 +1406,7 @@ public:
 		add_streetlight_dlights(xlate, lights_bcube, 0);
 		for (auto b = bridges.begin(); b != bridges.end(); ++b) {b->add_streetlight_dlights(xlate, lights_bcube, 0);}
 		for (auto t = tunnels.begin(); t != tunnels.end(); ++t) {t->add_streetlight_dlights(xlate, lights_bcube, 1);} // always_on=1
+		city_obj_placer.add_lights(xlate, lights_bcube);
 	}
 
 	// cars/peds
@@ -1437,6 +1470,12 @@ public:
 	road_plot_t const &get_plot_from_global_id(unsigned global_plot_id) const {return plots         [decode_plot_id(global_plot_id)];}
 	vect_cube_t const &get_colliders_for_plot (unsigned global_plot_id) const {return plot_colliders[decode_plot_id(global_plot_id)];}
 
+	int get_global_plot_id_for_pos(point const &pos) const { // pos is in building space
+		for (unsigned i = 0; i < plots.size(); ++i) {
+			if (plots[i].contains_pt_xy(pos)) return encode_plot_id(i);
+		}
+		return -1; // not found
+	}
 	// plot = current plot, dest_plot = final destination plot; returns next plot adj to cur plot on path to dest_plot
 	unsigned get_next_plot(unsigned global_plot, unsigned global_dest_plot, int exclude_plot) const {
 		if (global_plot == global_dest_plot) {return global_plot;} // identity, at destination, no change
@@ -1482,6 +1521,34 @@ public:
 		if (!select_building_in_plot(global_plot, rgen.rand(), building)) return 0; // no buildings in plot (maybe it's a park)
 		return 1;
 	}
+	bool check_future_isec_stop(car_t &car, vector<road_network_t> const &road_networks, road_network_t const &global_rn) const {
+		if (car.is_stopped() || car.stopped_at_light) return 0;
+		if (car.cur_road_type != TYPE_RSEG)           return 0; // not on a road segment; maybe already stopped
+		road_seg_t const &seg(get_car_seg(car));
+		unsigned const next_road_type(seg.conn_type[car.dir]);
+		if (!is_isect(next_road_type)) return 0; // skip if this is an adjacent segment (for global connector roads)
+		float const stop_dist(0.6f*car.get_length()); // distance we should begin decelerating
+		float const dist_to_end(max((car.dir ? 1.0f : -1.0f)*(seg.d[car.dim][car.dir] - car.bcube.d[car.dim][car.dir]), 0.0f));
+		if (dist_to_end > stop_dist) return 0; // not close enough
+		unsigned const cur_seg(seg.conn_ix[car.dir]), isec_type(next_road_type - TYPE_ISEC2);
+		unsigned isec_city(city_id); // default to ourself
+
+		if (!road_to_city.empty()) { // on connector road
+			assert(seg.road_ix < road_to_city.size());
+			unsigned const city_ix(road_to_city[seg.road_ix].id[car.dir]);
+			if (city_ix != CONN_CITY_IX) {isec_city = city_ix;} // moving into a city
+		}
+		road_isec_t const &isec(get_city(isec_city, road_networks, global_rn).get_isec(isec_type, cur_seg));
+		if (!isec.has_stopsign && isec.can_go_now(car)) return 0; // green light, no stop sign
+		// it's difficult to calculate the correct decleration to stop at the right spot, especially when framerate is variable, so directly adjust the speed instead
+		// use linear deceleration to 10% of max speed (for static vs. kinetic friction); should this vary per-car?
+		float const max_speed(0.1f*car.max_speed + (dist_to_end/stop_dist)*car.get_max_speed());
+		assert(max_speed > 0.0);
+		if (car.cur_speed < max_speed) return 0;
+		car.cur_speed  = max_speed; // clamp to the max
+		car.is_braking = 1;
+		return 1;
+	}
 	void find_car_next_seg(car_t &car, vector<road_network_t> const &road_networks, road_network_t const &global_rn) const {
 		if (car.cur_road_type == TYPE_RSEG) {
 			road_seg_t const &seg(get_car_seg(car));
@@ -1494,17 +1561,19 @@ public:
 				unsigned const city_ix(road_to_city[car.cur_road].id[car.dir]);
 					
 				if (car.in_isect() && city_ix != CONN_CITY_IX) { // moving into a city
+					assert(city_ix < road_networks.size());
 					road_network_t const &rn(road_networks[city_ix]);
-					vector<road_isec_t> const &isecs(rn.isecs[car.get_isec_type()]); // must be a 3-way or 4-way intersection
-					car.cur_city = city_ix;
-					assert(car.cur_seg < isecs.size());
+					road_isec_t const &isec(rn.get_isec(car.get_isec_type(), car.cur_seg)); // must be a 3-way or 4-way intersection
+					unsigned orient(0);
 						
 					if (car.cur_road_type == TYPE_ISEC4 && car.turn_dir == TURN_NONE) { // straight through a 4-way isec (but may not have entered isec yet, so turn_dir isn't valid)
-						car.cur_road = isecs[car.cur_seg].rix_xy[car.get_orient()];
+						orient = car.get_orient();
 					}
 					else {
-						car.cur_road = isecs[car.cur_seg].rix_xy[2*(!car.dim) + 0]; // use the road in the other dim, since it must be within the new city (dir doesn't matter)
+						orient = 2*(!car.dim) + 0; // use the road in the other dim, since it must be within the new city (dir doesn't matter)
 					}
+					car.cur_city = city_ix;
+					car.cur_road = isec.rix_xy[orient];
 					assert(car.cur_road < rn.roads.size());
 					car.entering_city = 1; // flag so that collision detection works
 				}
@@ -1516,10 +1585,12 @@ public:
 			find_and_set_car_road_and_seg(car);
 			return;
 		}
+		// else it must be in an intersection
 		road_isec_t const &isec(get_car_isec(car)); // conn_ix: {-x, +x, -y, +y}
 		unsigned const orient(car.get_orient());
 		int conn_ix(isec.conn_ix[orient]), rix(isec.rix_xy[car.get_orient()]);
 		assert(isec.conn & (1<<orient));
+		isec.notify_leaving_car(car);
 
 		if (conn_ix < 0) { // city connector road case, use global_rn
 			assert(rix < 0);
@@ -1560,7 +1631,7 @@ public:
 	}
 	bool car_can_go_now(car_t const &car, road_network_t const &global_rn) const {
 		if (!car.in_isect()) return 1; // not at an intersection
-		if (car.cur_road_type != TYPE_ISEC2 && !get_car_isec(car).can_go_now(car)) return 0; // check stoplights and blocked intersections
+		if (car.cur_road_type != TYPE_ISEC2 && !get_car_isec(car).can_go_now(car)) return 0; // check stoplights, stopsigns, and blocked intersections
 		return car_can_fit_in_seg(car, global_rn); // check if there's space, to avoid blocking the intersection
 	}
 private:
@@ -1591,7 +1662,7 @@ private:
 			else if (car.car_in_front && car.car_in_front->get_wait_time_secs() > 60.0) {choose_another_dir(car, rgen, isec);} // car in front has been stopped for > 60s
 		}
 		car.stopped_at_light = 1;
-		car.decelerate_fast();
+		car.stop();
 		float const wait_secs(car.get_wait_time_secs());
 
 		if (wait_secs > 60.0 && yellow_light && isec.contains_pt_xy(car.get_center())) { // car in the intersection
@@ -1647,7 +1718,8 @@ private:
 	bool run_car_in_driveway_logic(car_t &car, vector<car_t> const &cars, rand_gen_t &rgen) const {
 		assert(city_params.cars_use_driveways);
 		driveway_t const &driveway(get_driveway(car.cur_seg));
-		if (driveway.has_recent_ped()) {car.sleep(rgen, 0.5); return 1;} // pedestrian(s) in driveway, stop and wait
+		// if pedestrian(s) in driveway, stop and wait unless we've been waiting for > 60s
+		if (driveway.has_recent_ped() && car.get_wait_time_secs() < 60.0) {car.sleep(rgen, 0.5); return 1;}
 
 		if (car.dest_driveway == (int)car.cur_seg) { // entering driveway
 			car.pull_into_driveway(driveway, rgen);
@@ -1674,6 +1746,7 @@ public:
 	void update_car(car_t &car, vector<car_t> const &cars, rand_gen_t &rgen, vector<road_network_t> const &road_networks, road_network_t const &global_rn) const {
 		assert(car.cur_city == city_id);
 		if (car.is_parked()) return; // stopped, no update (for now)
+		car.is_braking = 0; // reset for this frame
 			
 		if (car.cur_road_type == TYPE_DRIVEWAY) { // moving in a driveway
 			if (run_car_in_driveway_logic(car, cars, rgen)) return;
@@ -1685,9 +1758,12 @@ public:
 			road_isec_t const &isec(get_car_isec(car));
 			isec.notify_waiting_car(car); // even if not stopped
 
-			// unclear why this was needed (how was stopped_at_light not set earlier?)
-			if (isec.contains_pt_xy(car.get_front()) && !isec.contains_pt_xy(car.get_center()) && !car_can_fit_in_seg(car, global_rn)) { // not yet in the isec - stop and wait
+			// if we started to pull into the intersection but aren't at least halfway inside, and we can't fit ourselves in the dest road,
+			// then wait at the light rather than blocking the intersection
+			if (isec.contains_pt_xy(car.get_front()) && !isec.contains_pt_xy(car.get_center()) && !car_can_fit_in_seg(car, global_rn)) {
+				bool const was_stopped(car.stopped_at_light);
 				stop_and_wait_car(car, rgen, road_networks, isec);
+				if (!was_stopped) {isec.notify_leaving_car(car);} // unset the entering flag so that we don't keep ourselves from entering again (and deadlocking)
 				return;
 			}
 		}
@@ -1695,8 +1771,10 @@ public:
 			bool const was_stopped(car.is_stopped());
 			if (car_can_go_now(car, global_rn)) {car.stopped_at_light = 0;} // can go now
 			else if (car.in_isect()) {stop_and_wait_car(car, rgen, road_networks, get_car_isec(car));} // Note: is_isect test allows cars to coast through lights when decel is very low
+			if (was_stopped) {car.stopped_for_ssign = 1;} // maybe at stop sign, or maybe at stoplight; after checking to ensure a full stop
 			if (was_stopped) return; // no update needed
 		}
+		else if (check_future_isec_stop(car, road_networks, global_rn)) {} // no update
 		else {car.maybe_accelerate();}
 
 		cube_t const road_bcube(get_road_bcube_for_car(car));
@@ -1712,7 +1790,7 @@ public:
 			float const road_len(road_bcube.get_sz_dim(dim));
 			assert(road_len > TOLERANCE);
 			float const t((car_pos - road_bcube.d[dim][0])/road_len); // car pos along road in (0.0, 1.0)
-			float const road_z(road_bcube.d[2][slope] + t*(road_bcube.d[2][!slope] - road_bcube.d[2][slope]));
+			float const road_z(t*road_bcube.d[2][!slope] + (1.0 - t)*road_bcube.d[2][slope]);
 			float const car_len(car.get_length());
 			car.dz = ((slope ^ car.dir) ? 1.0 : -1.0)*road_bcube.dz()*(car_len/road_len);
 			car.bcube.z1() = road_z - 0.5*fabs(car.dz);
@@ -1732,11 +1810,15 @@ public:
 			assert(car.in_isect());
 			float const isec_center(road_bcube.get_cube_center()[dim]);
 			float const centerline(isec_center + (((car.turn_dir == TURN_RIGHT) ^ car.dir) ? 1.0 : -1.0)*get_car_lane_offset());
+			car_t const car_pre_turn(car); // make a copy before turning that we can pass into isec.notify_leaving_car()
 			car.maybe_apply_turn(centerline, 0); // for_driveway=0
 
 			if (car.turn_dir == TURN_NONE) { // turn has been completed
 				road_isec_t const &isec(get_car_isec(car));
-
+				// special case for stop signs to handle orient change
+				isec.notify_leaving_car(car_pre_turn); // leaving this orient, entering the exit orient
+				isec.notify_turned_car (car); // register in new orient so that waiting cars don't see this slot as open for one frame
+				
 				if (isec.conn_ix[car.get_orient()] >= 0) {
 					short const rix(isec.rix_xy[car.get_orient()]);
 					assert(rix >= 0); // not connector road
@@ -1820,11 +1902,12 @@ public:
 				}
 				assert(isec.conn & (1<<orients[car.turn_dir]));
 				car.front_car_turn_dir = TURN_UNSPEC; // reset state now that it's been used
-				car.stopped_at_light   = (isec.red_or_yellow_light(car) || !car_rn.car_can_go_now(car, global_rn));
-				if (car.stopped_at_light) {car.decelerate_fast();}
+				car.stopped_for_ssign  = 0; // reset for this intersection
+				car.stopped_at_light   = (isec.red_or_yellow_light(car) || !car_rn.car_can_go_now(car, global_rn)); // is the red_or_yellow_light() call redundant?
+				if (car.stopped_at_light) {car.stop();}
 				if (car.turn_dir != TURN_NONE) {car.begin_turn();} // capture car centerline before the turn
 			}
-		}
+		} // end move to another road segment
 		assert(get_car_rn(car, road_networks, global_rn).get_road_bcube_for_car(car, global_rn).intersects_xy(car.bcube)); // sanity check
 	}
 	bool is_car_at_dest_isec(car_t const &car) const {
@@ -1858,8 +1941,10 @@ private:
 		return nullptr; // not found, caller can error check
 	}
 	bool select_avail_driveway(car_t &car, rand_gen_t &rgen) const { // consider destination driveways, since these are easier to handle than parking lots
-		if (city_obj_placer.driveways.empty()) return 0; // not a residential city
-			
+		// here we skip driveways that are commercial city parking lot entrances (even though it works) because cars shouldn't stop there;
+		// ideally, we should select a free parking space and navigate to it, though this is much more complex and has some failure conditions
+		if (!is_residential || city_obj_placer.driveways.empty()) return 0; // not a residential city
+		
 		for (unsigned n = 0; n < 10; ++n) { // make 10 attempts to find a valid driveway
 			unsigned const dix(rgen.rand()%city_obj_placer.driveways.size());
 			driveway_t const &driveway(get_driveway(dix));
@@ -1924,6 +2009,8 @@ public:
 		for (auto i = segs.begin(); i != segs.end(); ++i) {i->next_frame();}
 		//cout << TXT(city_id) << TXT(tot_road_len) << TXT(num_cars) << TXT(get_traffic_density()) << endl;
 		num_cars = 0;
+		city_obj_placer.next_frame();
+		city_obj_placer.play_sounds();
 	}
 	static road_network_t const &get_city(unsigned city_ix, vector<road_network_t> const &road_networks, road_network_t const &global_rn) {
 		if (city_ix == CONN_CITY_IX) return global_rn;
@@ -1988,13 +2075,13 @@ public:
 	bool mark_crosswalk_in_use(point const &pos, bool dim, bool dir) const {
 		road_isec_t const *isec(find_isec_containing_pt(pos, 1, 3)); // 2-way can be skipped because there's no light/crosswalk
 		if (isec == nullptr) return 0; // ped not at a crosswalk, maybe crossing in the middle of the street; this is okay for now, nothing else to do in this case
-		isec->stoplight.mark_crosswalk_in_use(dim, dir);
+		isec->mark_crosswalk_in_use(dim, dir);
 		return 1;
 	}
-	bool check_isec_sphere_coll(point const &pos, float radius) const {
+	bool check_isec_sphere_coll(point const &pos, float radius, cube_t &coll_cube) const {
 		road_isec_t const *isec(find_isec_containing_pt(pos, 1, 3)); // 2-way can be skipped because there's no light/crosswalk
 		if (isec == nullptr) return 0;
-		return isec->check_sphere_coll(pos, radius);
+		return isec->check_sphere_coll(pos, radius, coll_cube);
 	}
 	int get_nearby_road_ix(point const &pos, bool road_dim) const {
 		for (auto r = roads.begin(); r != roads.end(); ++r) {
@@ -2057,14 +2144,28 @@ public:
 	vect_cube_t const &get_colliders_for_plot(unsigned city_ix, unsigned global_plot_id) const {return get_city(city_ix).get_colliders_for_plot(global_plot_id);}
 	cube_t const &get_car_dest_bcube(car_t const &car, bool isec_only) const {return get_city(car.dest_city).get_car_dest(car, road_networks, global_rn, isec_only);}
 
+	bool cube_int_underground_obj(cube_t const &c) const {
+		if (global_rn.cube_intersect_tunnel(c)) return 1;
+
+		for (road_network_t const &rn : road_networks) {
+			if (rn.cube_int_underground_obj(c)) return 1;
+		}
+		return 0;
+	}
 	cube_t get_city_bcube_for_cars(unsigned city_ix) const {
 		cube_t bcube(get_city_bcube(city_ix));
 		bcube.expand_by_xy(city_params.get_max_car_size().x); // expand by car length to fully include cars that are partially inside connector road intersections
 		return bcube;
 	}
-	cube_t get_city_bcube_at_pt(point const &pos) const {
+	cube_t get_city_bcube_at_pt(point const &pos) const { // skips global_rn
 		for (road_network_t const &rn : road_networks) {
 			if (rn.get_bcube().contains_pt_xy(pos)) return rn.get_bcube();
+		}
+		return cube_t(); // not found
+	}
+	cube_t get_city_bcube_overlapping(cube_t const &c) const { // skips global_rn
+		for (road_network_t const &rn : road_networks) {
+			if (rn.get_bcube().intersects_xy(c)) return rn.get_bcube(); // return the first overlapping cube; assumes c is small and doesn't overlap multiple cities
 		}
 		return cube_t(); // not found
 	}
@@ -2523,6 +2624,29 @@ public:
 	void get_city_bcubes(vect_cube_t &bcubes) const {
 		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {bcubes.push_back(r->get_bcube());}
 	}
+	int check_city_contains_overlaps(cube_t const &query) const { // XY only; 0=no intersection, 1=overlaps, 2=contains; ignores global connector RN
+		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {
+			if (r->get_bcube().contains_cube_xy(query)) return 2;
+			if (r->get_bcube().intersects_xy   (query)) return 1;
+		}
+		return 0;
+	}
+	bool check_inside_city(point const &pos, float radius) const { // Note: pos is in camera space
+		cube_t query; query.set_from_sphere((pos - get_camera_coord_space_xlate()), radius);
+
+		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {
+			if (r->get_bcube().contains_cube_xy(query)) return 1;
+		}
+		return 0;
+	}
+	bool update_depth_if_underwater(point const &pos, float &depth) const { // Note: pos is in camera space
+		point const pos_bs(pos - get_camera_coord_space_xlate());
+
+		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {
+			if (r->update_depth_if_underwater(pos_bs, depth)) return 1;
+		}
+		return 0;
+	}
 	void get_all_road_bcubes(vect_cube_t &bcubes, bool connector_only) const {
 		global_rn.get_road_bcubes(bcubes); // not sure if this should be included
 		if (connector_only) return;
@@ -2553,13 +2677,13 @@ public:
 		}
 		return 0;
 	}
-	void get_roads_sphere_coll(point const &pos, float radius, bool include_intersections, bool xy_only, vect_cube_t &out, vect_cube_t *out_bt) const {
-		global_rn.get_roads_sphere_coll(pos, radius, 1, xy_only, out, out_bt);
+	void get_roads_in_region(cube_t const &region, vect_cube_t &out, vect_cube_t &out_bt) const {
+		global_rn.get_roads_in_region(region, out, out_bt);
 	}
 	bool choose_pt_in_park(point const &pos, point &park_pos, rand_gen_t &rgen) const {
-		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {
-			if (!r->get_bcube().contains_pt_xy(pos)) continue; // point not in this city
-			if (r->choose_pt_in_park(park_pos, rgen)) return 1;
+		for (road_network_t const &r : road_networks) {
+			if (!r.get_bcube().contains_pt_xy(pos))  continue; // point not in this city
+			if (r.choose_pt_in_park(park_pos, rgen)) return 1;
 		}
 		return 0;
 	}
@@ -2567,8 +2691,8 @@ public:
 	bool tile_contains_tunnel(cube_t const &bcube) const {return global_rn.tile_contains_tunnel(bcube);}
 
 	int get_color_at_xy(point const &pos, colorRGBA &color) const {
-		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {
-			int const ret(r->get_color_at_xy(pos, color));
+		for (road_network_t const &r : road_networks) {
+			int const ret(r.get_color_at_xy(pos, color));
 			if (ret) return ret;
 		}
 		return global_rn.get_color_at_xy(pos, color);
@@ -2577,23 +2701,31 @@ public:
 		vector3d const xlate(get_camera_coord_space_xlate());
 		float const dist(p2p_dist(pos, p_last));
 
-		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {
-			if (r->proc_sphere_coll(pos, p_last, xlate, dist, radius, prev_frame_zval, cnorm)) return 1;
+		for (road_network_t const &r : road_networks) {
+			if (r.proc_sphere_coll(pos, p_last, xlate, dist, radius, prev_frame_zval, cnorm)) return 1;
 		}
 		return global_rn.proc_sphere_coll(pos, p_last, xlate, dist, radius, prev_frame_zval, cnorm); // needed for bridges and tunnels
 	}
 	bool line_intersect(point const &p1, point const &p2, float &t) const {
 		bool ret(0);
-		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {ret |= r->line_intersect(p1, p2, t);}
+		for (road_network_t const &r : road_networks) {ret |= r.line_intersect(p1, p2, t);}
 		ret |= global_rn.line_intersect(p1, p2, t); // bridges and tunnels
 		return ret;
 	}
 	void add_city_lights(vector3d const &xlate, cube_t &lights_bcube) const {
 		global_rn.add_city_lights(xlate, lights_bcube); // no streetlights, but may need to add lights for bridges and tunnels
-		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {r->add_city_lights(xlate, lights_bcube);}
+		for (road_network_t const &r : road_networks) {r.add_city_lights(xlate, lights_bcube);}
 	}
 	void get_occluders(vect_cube_t &occluders) const {
-		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {r->get_occluders(occluders);}
+		for (road_network_t const &r : road_networks) {r.get_occluders(occluders, dstate.xlate);}
+	}
+	vector<bridge_t> const &get_bridges() const {return global_rn.get_bridges();}
+
+	bool have_animations() const {
+		for (road_network_t const &r : road_networks) {
+			if (r.have_animations()) return 1;
+		}
+		return global_rn.have_animations();
 	}
 	void draw(int trans_op_mask, vector3d const &xlate, bool use_dlights, bool shadow_only) { // non-const because dstate/qbd is modified
 		if (road_networks.empty() && global_rn.empty()) return;
@@ -2606,14 +2738,17 @@ public:
 
 			if (1 || have_plot_dividers) { // enable normal maps for fences and walls; also applies to tunnels and power poles
 				dstate.set_enable_normal_map(1);
-				select_multitex(FLAT_NMAP_TEX, 5); // set flat normal map texture as the default
+				bind_default_flat_normal_map(); // set flat normal map texture as the default
 			}
+			if (have_animations()) {enable_animations_for_shader(dstate.s);}
+			if (!shadow_only) {enable_dlight_bcubes |= city_lights_custom_bcube;}
 			dstate.pre_draw(xlate, use_dlights, shadow_only, 1); // always_setup_shader=1
 			assert(dstate.s.is_setup());
 			for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {r->draw(dstate, shadow_only, 0);}
 			global_rn.draw(dstate, shadow_only, 1); // connector road may have bridges, and therefore needs shadows
 			draw_transmission_lines();
 			dstate.post_draw();
+			if (!shadow_only) {enable_dlight_bcubes = 0;}
 			set_std_depth_func();
 			fgPopMatrix();
 		}
@@ -2633,7 +2768,7 @@ public:
 		if (!animate2) return;
 		//timer_t timer("Update Stoplights");
 		//for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {cout << r->get_traffic_density() << " ";} cout << endl;
-		for (auto r = road_networks.begin(); r != road_networks.end(); ++r) {r->next_frame();}
+		for (road_network_t &r : road_networks) {r.next_frame();}
 		global_rn.next_frame(); // not needed since there are no 3/4-way intersections/stoplights?
 	}
 	void register_car_at_city(unsigned city_id) const {get_city(city_id).register_car();} // Note: must be const
@@ -2648,6 +2783,7 @@ public:
 	}
 	bool is_city_residential(unsigned city_id) const {return get_city(city_id).get_is_residential();}
 	road_plot_t const &get_plot_from_global_id(unsigned city_id, unsigned global_plot_id) const {return get_city(city_id).get_plot_from_global_id(global_plot_id);}
+	int get_global_plot_id_for_pos(unsigned city_id, point const &pos) const {return get_city(city_id).get_global_plot_id_for_pos(pos);}
 	unsigned get_next_plot(unsigned city_id, unsigned plot, unsigned dest_plot, int exclude_plot) const {return get_city(city_id).get_next_plot(plot, dest_plot, exclude_plot);}
 	bool choose_dest_building(unsigned city_id, unsigned &plot, unsigned &building, rand_gen_t &rgen) const {return get_city(city_id).choose_dest_building(plot, building, rgen);}
 	
@@ -2666,7 +2802,7 @@ public:
 			auto const &conn(get_city_by_ix(car.cur_city).get_connected());
 			float const new_city_prob(city_params.new_city_prob*min(0.4f, 0.1f*conn.size())); // 10% to 40% chance, depending on the number of connecting cities (to reduce traffic congestion)
 
-			if (rgen.rand_float() < new_city_prob) { // select a different city when there are multiple cities
+			if (rgen.rand_probability(new_city_prob)) { // select a different city when there are multiple cities
 				if (rgen.rand_float() < city_params.traffic_balance_val) { // choose the connected city with the lowest traffic density
 					float min_td(0.0);
 
@@ -2731,7 +2867,7 @@ void car_manager_t::setup_occluders() {
 	dstate.get_occluders().clear();
 	if ((display_mode & 0x08) && !cars.empty()) {road_gen.get_occluders(dstate.get_occluders());}
 }
-
+vector<bridge_t> const &car_manager_t::get_bridges() const {return road_gen.get_bridges();}
 
 struct cmp_light_source_sz_dist {
 	point const &cpos;
@@ -2754,13 +2890,16 @@ void filter_dlights_to(vector<light_source> &lights, unsigned max_num, point con
 // Note: these ped_manager_t functions are defined here because they use road_gen
 road_plot_t const &ped_manager_t::get_city_plot_for_peds(unsigned city_ix, unsigned plot_ix) const {return road_gen.get_plot_from_global_id(city_ix, plot_ix);}
 road_isec_t const &ped_manager_t::get_car_isec(car_base_t const &car) const {return road_gen.get_car_isec(car);}
+int ped_manager_t::get_global_plot_id_for_pos(unsigned city_ix, point const &pos) const {return road_gen.get_global_plot_id_for_pos(city_ix, pos);}
+
 dw_query_t ped_manager_t::get_nearby_driveway(unsigned city_ix, unsigned plot_ix, point const &pos, float dist) const {
 	return road_gen.get_nearby_driveway(city_ix, plot_ix, pos, dist);
 }
 bool ped_manager_t::is_city_residential(unsigned city_ix) const {return road_gen.is_city_residential(city_ix);}
+cube_t ped_manager_t::get_city_bcube_for_peds(unsigned city_ix) const {return road_gen.get_city_bcube(city_ix);}
 
 cube_t ped_manager_t::get_expanded_city_bcube_for_peds(unsigned city_ix) const {
-	cube_t bcube(road_gen.get_city_bcube(city_ix));
+	cube_t bcube(get_city_bcube_for_peds(city_ix));
 	expand_cube_for_ped(bcube);
 	return bcube;
 }
@@ -2777,20 +2916,24 @@ bool ped_manager_t::mark_crosswalk_in_use(pedestrian_t const &ped) {
 	bool const dim(fabs(ped.dir.y) > fabs(ped.dir.x)), dir(ped.dir[dim] > 0); // something like this?
 	return road_gen.get_city(ped.city).mark_crosswalk_in_use(ped.pos, dim, dir);
 }
-bool ped_manager_t::check_isec_sphere_coll(pedestrian_t const &ped) const {
-	return road_gen.get_city(ped.city).check_isec_sphere_coll(ped.pos, 0.6*ped.radius); // Note: no xlate is required since peds and city are in the same coord space
+bool ped_manager_t::check_isec_sphere_coll(pedestrian_t const &ped, cube_t &coll_cube) const {
+	return road_gen.get_city(ped.city).check_isec_sphere_coll(ped.pos, 0.6*ped.radius, coll_cube); // Note: no xlate is required since peds and city are in the same coord space
 }
-bool ped_manager_t::check_streetlight_sphere_coll(pedestrian_t const &ped) const {
-	return road_gen.get_city(ped.city).check_streetlight_sphere_coll_xy(ped.pos, ped.radius);
+bool ped_manager_t::check_streetlight_sphere_coll(pedestrian_t const &ped, cube_t &coll_cube) const {
+	return road_gen.get_city(ped.city).check_streetlight_sphere_coll_xy(ped.pos, ped.radius, coll_cube);
 }
 int ped_manager_t::get_road_ix_for_ped_crossing(pedestrian_t const &ped, bool road_dim) const { // returns -1 on failure (ped not in the road)
 	return road_gen.get_city(ped.city).get_nearby_road_ix(ped.pos, road_dim);
+}
+void ped_manager_t::setup_occluders() {
+	dstate.get_occluders().clear();
+	if ((display_mode & 0x08) && !peds.empty()) {road_gen.get_occluders(dstate.get_occluders());}
 }
 
 // path finding
 bool ped_manager_t::choose_dest_building_or_parked_car(pedestrian_t &ped) { // modifies rgen, non-const
 	unsigned const prev_dest_plot(ped.dest_plot);
-	ped.has_dest_bldg = ped.has_dest_car = ped.at_dest = 0; // will choose a new dest
+	ped.clear_current_dest(); // will choose a new dest
 
 	if (city_params.num_cars == 0 || (rgen.rand() & 3) != 0) { // choose a dest building 75% of the time, 100% of the time if there are no cars
 		ped.has_dest_bldg = road_gen.choose_dest_building(ped.city, ped.dest_plot, ped.dest_bldg, rgen);
@@ -2868,34 +3011,45 @@ bool city_lights_manager_t::begin_lights_setup(vector3d const &xlate, float ligh
 }
 
 void city_lights_manager_t::finalize_lights(vector<light_source> &lights) { // Note: lights is always dl_sources and not passed into calls below
-	add_dynamic_lights_city(lights_bcube, dlight_add_thresh);
+	add_dynamic_lights_city(lights_bcube, dlight_add_thresh, CITY_LIGHT_FALLOFF);
 	upload_dlights_textures(lights_bcube, dlight_add_thresh);
 	prev_had_lights = !lights.empty();
 }
 
-void city_lights_manager_t::setup_shadow_maps(vector<light_source> &light_sources, point const &cpos, unsigned max_smaps) {
+struct sel_smap_light_t {
+	unsigned lix;
+	bool matched_smap_id;
+	sel_smap_light_t(unsigned lix_, bool matched) : lix(lix_), matched_smap_id(matched) {}
+};
+void city_lights_manager_t::setup_shadow_maps(vector<light_source> &light_sources, point const &cpos, unsigned max_smaps, bool sec_camera_mode) {
 	unsigned const num_smaps(min((unsigned)light_sources.size(), min(max_smaps, MAX_DLIGHT_SMAPS)));
 	dl_smap_enabled = 0;
 	if (!enable_dlight_shadows || shadow_map_sz == 0 || num_smaps == 0) return;
 	sort_lights_by_dist_size(light_sources, cpos); // Note: may already be sorted for enabled lights selection, but okay to sort again
 	cmp_light_source_sz_dist sz_cmp(cpos);
-	unsigned num_used(0);
 	unsigned const smap_size(city_params.smap_size); // 0 = use default shadow map resolution
 	// capture player pos in global coordinate space before replacing with light pos so it can be used for LOD during model drawing
-	pre_smap_player_pos = get_camera_building_space();
+	pre_smap_player_pos = cpos; // player or security camera (or maybe reflected pos in the future)
+	if (!sec_camera_mode) {actual_player_pos = pre_smap_player_pos;} // actual_player_pos only applies to the player
 	// Note: if using a dynamic (distance-based) sm_size, need to maintain a pool of different sm resolutions somehow
 	check_gl_error(430);
-
 	// Note: slow to recreate shadow maps every frame, but most city lights are either dynamic (headlights) or include dynamic shadow casters (cars) and need to be updated every frame anyway
 	// Do we want to gradually fade in new shadow maps and fade out old ones? But how do we track which lights are associated with old shadow maps?
 	// Tracking positions won't work for car headlights because they move. We don't have object pointers to track either. And what about lights that are no longer in our list?
-	for (auto i = light_sources.begin(); i != light_sources.end() && num_used < num_smaps; ++i) {
-		if (i->has_no_shadows()) continue; // shadows not enabled for this light
+	vector<sel_smap_light_t> selected;
+	selected.reserve(num_smaps);
+
+	for (auto i = light_sources.begin(); i != light_sources.end() && selected.size() < num_smaps; ++i) {
+		if (i->has_no_shadows())       continue; // shadows not enabled for this light
 		if (!i->is_very_directional()) continue; // not a spotlight
 		if (sz_cmp.get_value(*i) < 0.002) break; // light influence is too low, skip even though we have enough shadow maps; can break because sort means all later lights also fail
-		dl_smap_enabled |= i->setup_shadow_map(CITY_LIGHT_FALLOFF, 0, 0, 0, smap_size);
-		++num_used;
+		bool matched_smap_id(0);
+		if (!i->alloc_shadow_map(matched_smap_id, smap_size)) break; // out of shadow maps, done
+		selected.emplace_back((i - light_sources.begin()), matched_smap_id);
 	} // for i
+	// now that all smaps have been allocated, we can create them without worrying about the backing texture array getting resized and overwriting earlier shadow maps
+	for (sel_smap_light_t const &s : selected) {light_sources[s.lix].update_shadow_map(s.matched_smap_id, CITY_LIGHT_FALLOFF);}
+	dl_smap_enabled |= !selected.empty();
 	check_gl_error(431);
 }
 
@@ -2943,8 +3097,8 @@ public:
 		}
 		if (!cities_bcube.is_all_zeros()) {set_buildings_pos_range(cities_bcube);}
 		road_gen.connect_all_cities(heightmap, xsize, ysize, city_params.road_width, city_params.road_spacing);
-		road_gen.add_streetlights();
 		road_gen.gen_tile_blocks();
+		road_gen.add_streetlights();
 		car_manager.init_cars(city_params.num_cars);
 		init_city_spectate_manager(car_manager, ped_manager);
 	}
@@ -2963,9 +3117,12 @@ public:
 		car_manager.add_helicopters(hp_locs);
 		ped_manager.init(city_params.num_peds); // must be after buildings are placed
 	}
-	cube_t get_city_bcube(unsigned city_id) const {return road_gen.get_city_bcube(city_id);}
-	cube_t get_city_bcube_at_pt(point const &pos) {return road_gen.get_city_bcube_at_pt(pos);}
-	void get_city_bcubes(vect_cube_t &bcubes) const {road_gen.get_city_bcubes(bcubes);}
+	cube_t get_city_bcube(unsigned city_id)               const {return road_gen.get_city_bcube(city_id);}
+	cube_t get_city_bcube_at_pt(point const &pos)         const {return road_gen.get_city_bcube_at_pt(pos);}
+	cube_t get_city_bcube_overlapping(cube_t const &c)    const {return road_gen.get_city_bcube_overlapping(c);}
+	void get_city_bcubes(vect_cube_t &bcubes)             const {road_gen.get_city_bcubes(bcubes);}
+	int check_city_contains_overlaps(cube_t const &query) const {return road_gen.check_city_contains_overlaps(query);}
+	bool update_depth_if_underwater(point const &pos, float &depth) const {return road_gen.update_depth_if_underwater(pos, depth);}
 	void get_all_road_bcubes(vect_cube_t &bcubes, bool connector_only) const {road_gen.get_all_road_bcubes(bcubes, connector_only);}
 	void get_all_plot_zones(vect_city_zone_t &zones) {road_gen.get_all_plot_zones(zones);} // caches plot_id_offset, so non-const
 
@@ -2979,10 +3136,10 @@ public:
 	}
 	bool check_tline_cube_intersect_xy(cube_t const &c) const {return road_gen.check_tline_cube_intersect_xy(c);}
 
-	void get_sphere_coll_cubes(point const &pos, float radius, bool include_intersections, bool xy_only, vect_cube_t &out, vect_cube_t *out_bt) const { // pos in camera space
-		get_plots_sphere_coll(pos, radius, xy_only, out);
-		road_gen.get_roads_sphere_coll(pos, radius, include_intersections, xy_only, out, out_bt);
-		get_driveway_sphere_coll_cubes((pos - get_camera_coord_space_xlate()), radius, xy_only, out); // convert pos from camera space to city/building space
+	void get_grass_coll_cubes(cube_t const &region, vect_cube_t &out, vect_cube_t &out_bt) const { // region is in camera space
+		get_plots_in_region(region, out);
+		road_gen.get_roads_in_region(region, out, out_bt);
+		get_road_segs_in_region((region - get_camera_coord_space_xlate()), out); // convert region from camera space to city/building space
 	}
 	bool proc_city_sphere_coll(point &pos, point const &p_last, float radius, float prev_frame_zval, bool inc_cars, vector3d *cnorm) const { // pos is in camera space
 		if (road_gen.proc_sphere_coll(pos, p_last, radius, prev_frame_zval, cnorm)) return 1;
@@ -2996,9 +3153,11 @@ public:
 		ret |= ped_manager.line_intersect_peds(p1x, p2x, t);
 		return ret;
 	}
-	bool choose_pt_in_park(point const &pos, point &park_pos, rand_gen_t &rgen) const {return road_gen.choose_pt_in_park(pos, park_pos, rgen);}
+	bool choose_pt_in_park (point const &pos, point &park_pos, rand_gen_t &rgen) const {return road_gen.choose_pt_in_park(pos, park_pos, rgen);}
 	bool check_mesh_disable(point const &pos, float radius ) const {return road_gen.check_mesh_disable(pos, radius);}
+	bool check_inside_city (point const &pos, float radius ) const {return road_gen.check_inside_city (pos, radius);}
 	bool tile_contains_tunnel (cube_t const &bcube) const {return road_gen.tile_contains_tunnel(bcube);}
+	bool cube_int_underground_obj(cube_t const &c ) const {return road_gen.cube_int_underground_obj(c);}
 
 	void destroy_in_radius(point const &pos, float radius) {
 		car_manager.destroy_cars_in_radius(pos, radius);
@@ -3022,7 +3181,8 @@ public:
 		if (!use_threads_2_3 || omp_get_thread_num_3dw() == 2) {ped_manager.next_frame();} // thread=2
 	}
 	void draw(int shadow_only, int reflection_pass, int trans_op_mask, vector3d const &xlate) { // shadow_only: 0=non-shadow pass, 1=sun/moon shadow, 2=dynamic shadow
-		if (player_in_basement >= 2) return; // player is fully in the basement, not on stairs - don't draw anything
+		if (player_in_basement >= 2)            return; // player is fully in the basement, not on stairs - don't draw anything
+		if (player_cant_see_outside_building()) return; // player can't see outside the building (in ext basement, parking garage, attic, or windowless building)
 		if (!shadow_only && !reflection_pass && (trans_op_mask & 1)) {setup_city_lights(xlate);} // setup lights on first (opaque) non-shadow pass
 		bool const use_dlights(enable_lights()), is_dlight_shadows(shadow_only == 2);
 		if (reflection_pass == 0) {road_gen.draw(trans_op_mask, xlate, use_dlights, (shadow_only != 0));} // roads don't cast shadows/aren't reflected in water, but stoplights cast shadows
@@ -3036,11 +3196,13 @@ public:
 	void set_car_model_color(car_t &car) {car_manager.set_car_model_color(car);}
 	void gen_and_draw_people_in_building(ped_draw_vars_t const &pdv) {ped_manager.gen_and_draw_people_in_building(pdv);}
 	void draw_player_model(shader_t &s, vector3d const &xlate, bool shadow_only) {ped_manager.draw_player_model(s, xlate, shadow_only);}
+	bool is_player_model_female() {return ped_manager.is_player_model_female();}
 
 	void setup_city_lights(vector3d const &xlate) {
 		if (world_mode != WMODE_INF_TERRAIN) return; // TT only
 		if (prev_city_lights_setup_frame == cur_display_iter) return; // already called this frame
 		prev_city_lights_setup_frame = cur_display_iter;
+		city_lights_custom_bcube     = 0;
 		//timer_t timer("City Dlights Setup");
 		float const light_radius(1.0*light_radius_scale*get_tile_smap_dist()); // distance from the camera where headlights and streetlights are drawn
 		if (!begin_lights_setup(xlate, light_radius, dl_sources)) return;
@@ -3054,6 +3216,7 @@ public:
 	}
 	virtual bool enable_lights() const {return (is_night(max(STREETLIGHT_ON_RAND, HEADLIGHT_ON_RAND)) || road_gen.has_tunnels() || flashlight_on);} // only have lights at night
 	void next_ped_animation() {ped_manager.next_animation();}
+	void get_pedestrians_in_area(cube_t const &area, int building_ix, vector<point> &pts) const {ped_manager.get_pedestrians_in_area(area, building_ix, pts);}
 	void free_context() {car_manager.free_context(); ped_manager.free_context();}
 	unsigned get_model_gpu_mem() const {return (ped_manager.get_model_gpu_mem() + car_manager.get_model_gpu_mem());}
 }; // city_gen_t
@@ -3081,7 +3244,10 @@ void gen_cities(float *heightmap, unsigned xsize, unsigned ysize) {
 void gen_city_details() {city_gen.gen_details();} // called after gen_buildings()
 cube_t get_city_bcube(unsigned city_id) {return city_gen.get_city_bcube(city_id);}
 cube_t get_city_bcube_at_pt(point const &pos) {return city_gen.get_city_bcube_at_pt(pos);}
+cube_t get_city_bcube_overlapping(cube_t const &c) {return city_gen.get_city_bcube_overlapping(c);}
 void get_city_bcubes(vect_cube_t &bcubes) {city_gen.get_city_bcubes(bcubes);}
+int check_city_contains_overlaps(cube_t const &query) {return city_gen.check_city_contains_overlaps(query);}
+bool update_depth_if_underwater(point const &pos, float &depth) {return city_gen.update_depth_if_underwater(pos, depth);}
 void get_city_road_bcubes(vect_cube_t &bcubes, bool connector_only) {city_gen.get_all_road_bcubes(bcubes, connector_only);}
 void get_city_plot_zones(vect_city_zone_t &zones) {city_gen.get_all_plot_zones(zones);}
 void next_city_frame(bool use_threads_2_3) {city_gen.next_frame(use_threads_2_3);}
@@ -3091,18 +3257,25 @@ void setup_city_lights(vector3d const &xlate) {city_gen.setup_city_lights(xlate)
 
 void gen_and_draw_people_in_building(ped_draw_vars_t const &pdv) {city_gen.gen_and_draw_people_in_building(pdv);}
 void draw_player_model(shader_t &s, vector3d const &xlate, bool shadow_only) {city_gen.draw_player_model(s, xlate, shadow_only);}
+bool is_player_model_female() {return city_gen.is_player_model_female();}
+float get_road_height() {return ROAD_HEIGHT;} // for rain splashes
 
 // Note: pos is in global space for these next two calls
 unsigned check_city_sphere_coll(point const &pos, float radius, bool exclude_bridges_and_tunnels, bool ret_first_coll, unsigned check_mask) {
 	if (!have_cities()) return 0;
 	return city_gen.check_city_sphere_coll((pos + get_tt_xlate_val()), radius, 1, exclude_bridges_and_tunnels, ret_first_coll, check_mask); // apply xlate for all static objects
 }
-void get_city_sphere_coll_cubes(point const &pos, float radius, bool include_intersections, bool xy_only, vect_cube_t &out, vect_cube_t *out_bt) { // Note: out is in camera space
-	city_gen.get_sphere_coll_cubes((pos + get_tt_xlate_val()), radius, include_intersections, xy_only, out, out_bt); // convert from city/building space to camera space
+void get_city_grass_coll_cubes(cube_t const &region, vect_cube_t &out, vect_cube_t &out_bt) { // Note: region and out are in camera space
+	city_gen.get_grass_coll_cubes(region, out, out_bt);
 }
-bool proc_city_sphere_coll(point &pos, point const &p_last, float radius, float prev_frame_zval, bool xy_only, bool inc_cars, vector3d *cnorm, bool check_interior) {
-	if (proc_buildings_sphere_coll(pos, p_last, radius, xy_only, cnorm, check_interior)) return 1;
-	return city_gen.proc_city_sphere_coll(pos, p_last, radius, prev_frame_zval, inc_cars, cnorm); // Note: no xy_only for cities
+// primarily used for player collision (typically check_interior=1), but also used for gameplay dynamic cobjs
+bool proc_city_sphere_coll(point &pos, point const &p_last, float radius, float prev_frame_zval, bool inc_cars, vector3d *cnorm, bool check_interior) {
+	if (check_interior) {player_in_walkway = player_in_skyway = player_on_moving_ww = 0;} // reset for next iteration if this is the player
+	had_building_interior_coll = 0;
+	bool ret(proc_buildings_sphere_coll(pos, p_last, radius, cnorm, check_interior));
+	if (ret && had_building_interior_coll) return ret; // skip city coll if player is in a building
+	ret |= city_gen.proc_city_sphere_coll(pos, p_last, radius, prev_frame_zval, inc_cars, cnorm); // check city as well
+	return ret;
 }
 bool line_intersect_city(point const &p1, point const &p2, float &t, bool ret_any_pt) {
 	unsigned hit_bix(0); // unused
@@ -3167,7 +3340,8 @@ model_bcube_checker_t model_bcube_checker;
 
 bool check_valid_scenery_pos(point const &pos, float radius, bool is_tall) {
 	point const pos_cs(pos + get_tt_xlate_val()); // convert from city/building space to camera space
-	if (check_buildings_sphere_coll(pos_cs, radius, 0, 0, 0, 1)) return 0; // apply_tt_xlate=0, xy_only=0, check_interior=0, exclude_city=1 (since we're checking plots below)
+	point center(pos_cs); // make a copy; not actually modified
+	if (proc_buildings_sphere_coll(center, pos_cs, radius, nullptr, 0, 1)) return 0; // check_interior=0, exclude_city=1 (since we're checking plots below)
 	if (world_mode != WMODE_INF_TERRAIN) return 1; // the checks below are for tiled terrain mode only
 
 	if (have_cities()) {
@@ -3181,13 +3355,19 @@ bool check_mesh_disable(point const &pos, float radius) { // Note: pos is in glo
 	if (!have_cities()) return 0;
 	return city_gen.check_mesh_disable((pos + get_tt_xlate_val()), radius); // apply xlate for all static objects
 }
+bool check_inside_city(point const &pos, float radius) { // Note: pos is in global space
+	if (!have_cities()) return 0;
+	return city_gen.check_inside_city((pos + get_tt_xlate_val()), radius); // apply xlate for all static objects
+}
+bool cube_int_underground_obj(cube_t const &c) {return city_gen.cube_int_underground_obj(c);} // Note: cube is in global space
 bool choose_pt_in_city_park(point const &pos, point &park_pos, rand_gen_t &rgen) {return city_gen.choose_pt_in_park(pos, park_pos, rgen);}
-bool tile_contains_tunnel(cube_t const &bcube) {return city_gen.tile_contains_tunnel(bcube + get_tt_xlate_val());}
+bool tile_contains_tunnel(cube_t const &bcube) {return city_gen.tile_contains_tunnel(bcube);}
 void destroy_city_in_radius(point const &pos, float radius) {city_gen.destroy_in_radius(pos, radius);}
 bool get_city_color_at_xy(float x, float y, colorRGBA &color) {return city_gen.get_color_at_xy(x, y, color);}
 cube_t get_city_lights_bcube() {return city_gen.get_lights_bcube();}
 unsigned get_city_model_gpu_mem() {return city_gen.get_model_gpu_mem();}
 void next_pedestrian_animation() {city_gen.next_ped_animation();}
+void get_pedestrians_in_area(cube_t const &area, int building_ix, vector<point> &pts) {city_gen.get_pedestrians_in_area(area, building_ix, pts);}
 void free_city_context() {city_gen.free_context();}
 bool has_city_trees() {return (city_params.max_trees_per_plot > 0);}
 vector3d get_nom_car_size() {return city_params.get_nom_car_size();}

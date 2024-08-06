@@ -488,6 +488,9 @@
     <ClCompile Include="src\building_animal_draw.cpp" />
     <ClCompile Include="src\building_attic.cpp" />
     <ClCompile Include="src\building_basement.cpp" />
+    <ClCompile Include="src\building_clocks.cpp" />
+    <ClCompile Include="src\building_ext_basement.cpp" />
+    <ClCompile Include="src\building_fish.cpp" />
     <ClCompile Include="src\building_floorplan.cpp" />
     <ClCompile Include="src\building_gameplay.cpp" />
     <ClCompile Include="src\building_geom.cpp" />
@@ -502,6 +505,8 @@
     <ClCompile Include="src\building_room_geom.cpp" />
     <ClCompile Include="src\building_room_item_draw.cpp" />
     <ClCompile Include="src\building_room_obj_expand.cpp" />
+    <ClCompile Include="src\building_room_obj_place.cpp" />
+    <ClCompile Include="src\building_water.cpp" />
     <ClCompile Include="src\build_world.cpp">
       <Optimization Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">MaxSpeed</Optimization>
       <Optimization Condition="'$(Configuration)|$(Platform)'=='Tracy|Win32'">MaxSpeed</Optimization>
@@ -527,11 +532,14 @@
       <BrowseInformation Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</BrowseInformation>
     </ClCompile>
     <ClCompile Include="src\cars.cpp" />
+    <ClCompile Include="src\city_birds.cpp" />
     <ClCompile Include="src\city_building_params.cpp" />
     <ClCompile Include="src\city_gen.cpp" />
     <ClCompile Include="src\city_interact.cpp" />
     <ClCompile Include="src\city_model.cpp" />
     <ClCompile Include="src\city_objects.cpp" />
+    <ClCompile Include="src\city_obj_placer.cpp" />
+    <ClCompile Include="src\city_skyway.cpp" />
     <ClCompile Include="src\city_terrain.cpp" />
     <ClCompile Include="src\clouds.cpp" />
     <ClCompile Include="src\cobj_bsp_tree.cpp" />
@@ -1010,6 +1018,7 @@
     <ClInclude Include="src\mesh2d.h" />
     <ClInclude Include="src\mesh_intersect.h" />
     <ClInclude Include="src\model3d.h" />
+    <ClInclude Include="src\nav_grid.h" />
     <ClInclude Include="src\openal_wrap.h" />
     <ClInclude Include="src\pedestrians.h" />
     <ClInclude Include="src\physics_objects.h" />
@@ -1086,6 +1095,7 @@
     <None Include="README.defaults" />
     <None Include="README.md" />
     <None Include="shaders\alpha_mask.frag" />
+    <None Include="shaders\alpha_mask_shadow.frag" />
     <None Include="shaders\asteroid.frag" />
     <None Include="shaders\asteroid.vert" />
     <None Include="shaders\asteroid_dust.frag" />
@@ -1094,8 +1104,11 @@
     <None Include="shaders\atmosphere.vert" />
     <None Include="shaders\bcc_noise.part.frag" />
     <None Include="shaders\black_body_burn.part.frag" />
+    <None Include="shaders\building_water.frag" />
+    <None Include="shaders\building_water.vert" />
     <None Include="shaders\bump_map.part.frag" />
     <None Include="shaders\bump_map.part.vert" />
+    <None Include="shaders\caustics_overlay.frag" />
     <None Include="shaders\circular_portal.frag" />
     <None Include="shaders\clouds.frag" />
     <None Include="shaders\clouds.vert" />
@@ -1106,7 +1119,10 @@
     <None Include="shaders\common_header.geom" />
     <None Include="shaders\common_header.vert" />
     <None Include="shaders\common_header_shared.part" />
+    <None Include="shaders\convert_to_grayscale.frag" />
     <None Include="shaders\craters.part.frag" />
+    <None Include="shaders\csm_layers.geom" />
+    <None Include="shaders\csm_layers_tc.geom" />
     <None Include="shaders\cube_map.frag" />
     <None Include="shaders\cube_map.vert" />
     <None Include="shaders\depth_of_field.frag" />
@@ -1117,6 +1133,7 @@
     <None Include="shaders\draw_mesh.vert" />
     <None Include="shaders\drunken_wave.frag" />
     <None Include="shaders\dynamic_lighting.part" />
+    <None Include="shaders\empty_shader.frag" />
     <None Include="shaders\exponential_fog.part.frag" />
     <None Include="shaders\fish_animate.vert" />
     <None Include="shaders\flowers.frag" />
@@ -1145,6 +1162,7 @@
     <None Include="shaders\grass_with_dlights.frag" />
     <None Include="shaders\heat_waves.frag" />
     <None Include="shaders\indir_lighting.part.frag" />
+    <None Include="shaders\lava_lamp.frag" />
     <None Include="shaders\leaf_lighting.part.vert" />
     <None Include="shaders\leaf_lighting_comp.part" />
     <None Include="shaders\leaf_lighting_ppl.frag" />
@@ -1155,6 +1173,7 @@
     <None Include="shaders\model_animation.part.vert" />
     <None Include="shaders\moon_draw.frag" />
     <None Include="shaders\moon_draw.vert" />
+    <None Include="shaders\msdf_text.frag" />
     <None Include="shaders\multitex_2.vert" />
     <None Include="shaders\nebula.frag" />
     <None Include="shaders\nebula.vert" />
@@ -1166,6 +1185,7 @@
     <None Include="shaders\ocean.frag" />
     <None Include="shaders\output_textured_quad.part.geom" />
     <None Include="shaders\particle_draw.vert" />
+    <None Include="shaders\passthrough.geom" />
     <None Include="shaders\pedestrian_animation.part.vert" />
     <None Include="shaders\perlin_clouds.part" />
     <None Include="shaders\perlin_clouds_3d.part" />
@@ -1190,6 +1210,7 @@
     <None Include="shaders\point_to_quad.geom" />
     <None Include="shaders\postproc_bloom.frag" />
     <None Include="shaders\postproc_bloom_2d.frag" />
+    <None Include="shaders\postproc_water_fog.frag" />
     <None Include="shaders\pos_only.vert" />
     <None Include="shaders\procedural_gen.frag" />
     <None Include="shaders\procedural_gen.vert" />
@@ -1208,6 +1229,10 @@
     <None Include="shaders\screen_space_blur.frag" />
     <None Include="shaders\screen_space_blur_1d.frag" />
     <None Include="shaders\shadow_map.part" />
+    <None Include="shaders\shadow_map.vert" />
+    <None Include="shaders\shadow_map_csm.vert" />
+    <None Include="shaders\shadow_map_csm_tc.vert" />
+    <None Include="shaders\shadow_map_csm_xlate_scale.vert" />
     <None Include="shaders\ship_draw.frag" />
     <None Include="shaders\ship_draw.vert" />
     <None Include="shaders\ship_shields.frag" />
@@ -1263,6 +1288,7 @@
     <None Include="shaders\wind.part" />
     <None Include="shaders\window_lights.frag" />
     <None Include="shaders\window_lights.vert" />
+    <None Include="shaders\world_space_offset_rot.part.vert" />
     <None Include="shaders\write_const_depth.frag" />
     <None Include="shaders\write_depth.frag" />
     <None Include="shaders\write_normal.frag" />

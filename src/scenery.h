@@ -52,8 +52,6 @@ public:
 	unsigned get_num_verts() const;
 	void add_cobjs();
 	void draw(float sscale, bool shadow_only, bool reflection_pass, vector3d const &xlate, float scale_val, vbo_vnt_block_manager_t &vbo_manager) const;
-	void update_points_vbo(vbo_vnt_block_manager_t &vbo_manager);
-	bool update_zvals(int x1, int y1, int x2, int y2, vbo_vnt_block_manager_t &vbo_manager);
 	void destroy();
 };
 
@@ -162,11 +160,27 @@ public:
 };
 
 
+struct texture_binder_t {
+	int cur_tid=-1;
+	void do_bind(int tid);
+};
+
 struct plant_base : public burnable_scenery_obj { // size = 32
 
+	struct shader_state_t {
+		int color_scale_loc, normal_scale_loc, wind_scale_loc, wind_add_loc;
+		float wind_scale;
+		texture_binder_t texture_binder;
+		shader_state_t() : color_scale_loc(-1), normal_scale_loc(-1), wind_scale_loc(-1), wind_add_loc(-1), wind_scale(1.0) {}
+		void set_color_scale(shader_t &s, colorRGBA const &color);
+		void set_normal_scale(shader_t &s, float normal_scale);
+		void set_wind_scale(shader_t &s, float wscale);
+		void set_wind_add(shader_t &s, float w_add);
+	};
 	int vbo_mgr_ix;
 
 	plant_base() : vbo_mgr_ix(-1) {}
+	bool operator<(plant_base const &p) const {return (type < p.type);}
 	int create(int x, int y, int use_xy, float minz);
 	void next_frame();
 	colorRGBA get_plant_color(vector3d const &xlate) const;
@@ -181,26 +195,15 @@ class s_plant : public plant_base { // size = 56
 	vector<vert_wrap_t> berries;
 
 public:
-	struct shader_state_t {
-		int color_scale_loc, normal_scale_loc, wind_scale_loc, wind_add_loc;
-		float wind_scale;
-		shader_state_t() : color_scale_loc(-1), normal_scale_loc(-1), wind_scale_loc(-1), wind_add_loc(-1), wind_scale(1.0) {}
-		void set_color_scale(shader_t &s, colorRGBA const &color);
-		void set_normal_scale(shader_t &s, float normal_scale);
-		void set_wind_scale(shader_t &s, float wscale);
-		void set_wind_add(shader_t &s, float w_add);
-	};
-
 	s_plant() : coll_id2(-1), height(1.0) {}
 	virtual float get_bsphere_radius() const {return 0.5f*(height + radius);}
 	point get_top_pt() const {return pos + point(0.0, 0.0, height);}
 	bool is_water_plant() const;
-	bool operator<(s_plant const &p) const {return (type < p.type);}
 	colorRGBA const &get_leaf_color() const;
 	colorRGBA const &get_stem_color() const;
 	int get_leaf_tid() const;
-	int create(int x, int y, int use_xy, float minz, vbo_vnc_block_manager_t &vbo_manager, vector<vert_norm_comp> &pts);
-	void create2(point const &pos_, float height_, float radius_, int type_, int calc_z, vbo_vnc_block_manager_t &vbo_manager, vector<vert_norm_comp> &pts);
+	int create(int x, int y, int use_xy, float minz);
+	void create2(point const &pos_, float height_, float radius_, int type_, int calc_z);
 	void create_no_verts(point const &pos_, float height_, float radius_, int type_, int calc_z=0, bool land_plants_only=0);
 	void add_cobjs();
 	bool check_sphere_coll(point &center, float sphere_radius) const;
@@ -240,7 +243,7 @@ public:
 	void next_frame();
 	bool update_zvals(int x1, int y1, int x2, int y2, vbo_vnt_block_manager_t &vbo_manager);
 	int get_tid() const;
-	void draw_leaves(shader_t &s, bool shadow_only, bool reflection_pass, vector3d const &xlate, s_plant::shader_state_t &state, vbo_vnt_block_manager_t &vbo_manager) const;
+	void draw_leaves(shader_t &s, bool shadow_only, bool reflection_pass, vector3d const &xlate, shader_state_t &state, vbo_vnt_block_manager_t &vbo_manager) const;
 };
 
 

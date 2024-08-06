@@ -11,6 +11,8 @@ buildings num_place 100000
 buildings place_radius  0.0 # no radius clipping - place in a square
 buildings max_altitude 5.00 # same for all buildings
 buildings add_secondary_buildings 1
+buildings cities_all_bldg_mats 0 # allows smaller brick and block buildings with windows in commercial cities
+buildings small_city_buildings 0 # commercial cities use smaller non-skyscraper buildings with window cutouts
 buildings sec_extra_spacing 0.1
 buildings pos_range -110.0 60.0  -65.0 30.0 # for secondary buildings
 buildings place_radius 80.0 # for secondary buildings
@@ -18,6 +20,7 @@ buildings place_radius 80.0 # for secondary buildings
 buildings max_rot_angle 0.0 # terrain flatten doesn't work well for rotated buildings because it uses their unrotated bbox
 include building_materials.txt
 buildings tt_only 1
+buildings show_player_model 0 # works, but we can see down the neck and the shoulders are clipped off
 
 # building AI logic
 buildings ai_opens_doors      2 # AI can open closed building doors rather than stopping at them: 0=don't open doors, 1=only open if player closed door after path selection; 2=always open doors
@@ -45,7 +48,7 @@ buildings rat_size_max 0.20 # length relative to floor spacing
 # building spiders
 buildings num_spiders_min 3
 buildings num_spiders_max 5
-buildings spider_drawer_prob 0.04
+buildings spider_drawer_prob 0.02
 buildings spider_speed 0.0003
 buildings spider_size_min 0.08 # length relative to floor spacing
 buildings spider_size_max 0.15 # length relative to floor spacing
@@ -97,6 +100,7 @@ city min_park_rows 1
 city min_park_density 0.0
 city max_park_density 0.8
 city max_benches_per_plot 15
+city add_skyways 1
 
 no_subdiv_model 1
 merge_model_objects 1 # optimization for large instance counts
@@ -110,8 +114,8 @@ city enable_car_path_finding 1
 city cars_use_driveways 1 # cars can enter (and eventually leave) driveways
 city convert_model_files 1
 # car_model: filename recalc_normals two_sided centered body_material_id fixed_color_id xy_rot swap_xyz scale lod_mult [shadow_mat_ids]
-# body_material_id: -1=all; fixed_color_id: -1=none, -2=specified RGBA, -3=auto-from-model
-# fixed_color_id  : -1=random, -2=model file custom color, -3=calculate from model file
+# body_material_id: -1=all
+# fixed_color_id  : -1=random, -2=model file custom color {R G B}, -3=calculate from model file
 city car_model ../models/cars/sports_car/sportsCar.model3d        1 0 0  22 -1 90  1 1.0 1.0  20 22
 city car_model ../models/cars/natla_car/natla_car.model3d         1 0 0  -1  2 90  1 1.0 0.5  0 1 # always GRAY (writing to model3d file inverts DDS textures)
 city car_model ../models/cars/speedCar/speedCar.model3d           1 0 0  -1 -2 0.15 0.3 0.35 1.0  0   1 1.0 0.5  4 5 # custom color (writing to model3d file inverts DDS textures)
@@ -124,6 +128,7 @@ city car_model ../models/cars/Soarer/soarer.model3d               1 0 0   2 -1 9
 city car_model ../models/cars/Camaro/camaro2.model3d              1 0 0  24 -1 90  1 1.0 0.5  9 21 24
 city car_model ../models/cars/LowPolyTruck/truck.model3d          1 0 0  -1  2  0  1 1.6 0.5  3 4 5 6 16 17 20 24 # always GRAY
 city car_model ../models/cars/BMW/bmw.model3d                     1 0 0   0 -1 180 1 1.0 2.0  0 9 # Note: has emissive lights
+city car_model ../models/cars/ambulance.glb                       0 0 0  -1 -3 90  1 1.5 1.0  0
 #city car_model ../models/cars/Bentley/Bentley.model3d            1 0 0    1 -1 90  1 1.0 0.5  1
 use_model_lod_blocks 0 # doesn't really work on car model
 model_mat_lod_thresh 0.008
@@ -131,15 +136,22 @@ allow_model3d_quads 1 # 0 is slightly faster for drawing but uses more memory (m
 enable_hcopter_shadows 0
 
 # helicopter_model: filename recalc_normals two_sided centered body_material_id fixed_color_id xy_rot swap_xyz scale lod_mult blade_mat_id [shadow_mat_ids]
-city helicopter_model ../models/cars/Helicopter/md500.3DS         1 0 0   0 0 90  0 2.0 1.0  -1 0  # always white color, no separate blade material, material 0 for shadows
-city helicopter_model ../models/cars/Helicopter_ka27/ka27.model3d 1 0 0   0 0 90  1 2.5 1.0   1 # always white color, materials are {body, prop blade}; prop blade rotates a bit off center
+city helicopter_model ../models/helicopters/Helicopter_ka27/ka27.model3d 1 0 5   0 0  90  1 2.5 1.0   1   # always white, materials are {body, prop blade}; centered
+city helicopter_model ../models/helicopters/helicopter3/helicopter.glb   0 0 5   0 0  90  1 2.0 1.0   2   # looks good; materials are {legs, body, rotor, ?, seats}; centered
+city helicopter_model ../models/helicopters/mh_6_little_bird_japan.glb   0 0 5   0 0  90  1 2.0 60.0  1   # looks good; materials are {interior, rotor, exterior}; centered
+#city helicopter_model ../models/helicopters/Helicopter/md500.3DS         1 0 0   0 0  90  0 2.0 1.0  -1 0 # always white, no separate blade material (not rotated about center), material 0 for shadows
+#city helicopter_model ../models/helicopters/helicopter2/Helecopter.fbx   0 0 0   0 0 270  1 2.0 1.0  -1   # looks good, but doesn't rotate; materials are {interior, exterior}
+#city helicopter_model ../models/helicopters/MD-500/scene.gltf            0 0 0   0 0  90  1 2.0 1.0   0   # doesn't rotate; materials are {exterior, interior}
+#city helicopter_model ../models/helicopters/helicopter.glb               0 0 0   0 0  90  1 2.0 1.0   0   # single material, doesn't rotate
+#city helicopter_model ../models/helicopters/MD-902/scene.gltf            0 0 0   0 0  90  1 2.0 1.0  -1   # doesn't rotate
 
 # pedestrians
 city num_peds 8000 # 10000 for city/6000 for residential
-buildings people_per_office_min 4
-buildings people_per_office_max 6
+buildings people_per_office_min 8
+buildings people_per_office_max 12
 buildings people_per_house_min 2
 buildings people_per_house_max 4
+buildings player_model_ix 0
 city ped_speed 0.001
 city ped_respawn_at_dest 1
 city use_animated_people 1 # requires loading rigged/animated models of people
@@ -154,9 +166,12 @@ buildings people_min_alpha 0.1 # slightly slower framerate, but improves alpha b
 # MakeHuman models
 #city ped_model ../models/people/makehuman/Katie/Katie.model3d 1 0 0  0 -1 90  1 0.7 1.0  1.0 0  0 3
 
-# Animated models loaded by Assimp
+# Animated models loaded by Assimp; default animation is walk
 city ped_model ../models/people/animated/remy_walking.fbx    0 0 0  0 -1 90  1 1.0  1.0  1.0 0
 city ped_model_add_anim ../models/people/animated/remy_idle_anim.fbx idle
+city ped_model_add_anim ../models/people/animated/remy_crouch_anim.fbx crouch
+#city ped_model_add_anim ../models/people/animated/remy_stairs_down_anim.fbx stairs_down
+#city ped_model_add_anim ../models/people/animated/remy_stairs_up_anim.fbx   stairs_up
 city ped_model ../models/people/animated/james_walking.fbx   0 0 0  0 -1 90  1 1.0  1.0  1.0 0
 city ped_model_add_anim ../models/people/animated/james_idle_anim.fbx idle
 city ped_model ../models/people/animated/leonard_walking.fbx 0 0 0  0 -1 90  1 1.0  1.0  1.0 0
@@ -167,7 +182,7 @@ city ped_model ../models/people/animated/kate_walking.fbx    0 0 0  0 -1 90  1 0
 city ped_model_add_anim ../models/people/animated/kate_idle_anim.fbx idle
 
 # Zombies
-city ped_model ../models/people/animated/zombies/zombie_romero.fbx     0 0 0  0 -1 90  1 1.0  1.0  4.8 1 # fast animation speed; large file, slow load time
+city ped_model ../models/people/animated/zombies/zombie_romero.fbx   0 0 0  0 -1 90  1 1.0  1.0  4.8 1 # fast animation speed; large file, slow load time
 city ped_model_add_anim ../models/people/animated/zombies/zombie_romero_idle_anim.fbx idle
 city ped_model ../models/people/animated/zombies/zombie_soldier.fbx  0 0 0  0 -1 90  1 1.0  1.0  5.7 1 # fast animation speed
 city ped_model_add_anim ../models/people/animated/zombies/zombie_soldier_idle_anim.fbx idle
@@ -177,21 +192,21 @@ city ped_model ../models/people/animated/zombies/zombie_prisoner.fbx 0 0 0  0 -1
 city ped_model_add_anim ../models/people/animated/zombies/zombie_prisoner_idle_anim.fbx idle
 city ped_model ../models/people/animated/zombies/zombie_woman.fbx    0 0 0  0 -1 90  1 0.9  1.0  1.0 1
 city ped_model_add_anim ../models/people/animated/zombies/zombie_woman_idle_anim.fbx idle
-city default_anim_name "" # clear to empty string (probably unnecessary)
+city default_anim_name "" # clear to empty string
 
-# filename recalc_normals two_sided centered body_material_id fixed_color_id xy_rot swap_xyz scale lod_mult [shadow_mat_ids]
+# filename recalc_normals two_sided centered body_material_id fixed_color_id xy_rot swap_xyz scale lod_mult [keywords] [shadow_mat_ids]
 city toilet_model ../models/interiors/toilet/toilet.model3d     1 0 0  -1 -1 0  1 1.0 1.0  0
 city urinal_model ../models/interiors/urinal/urinal4.model3d    1 0 0  -1 -1 0  1 1.0 1.0  0
 city sink_model   ../models/interiors/simple_sink.model3d       1 0 0   0  0 90  0 1.0 1.0 # always white
 city tub_model    ../models/interiors/bathtub.model3d           1 0 0  -1 -1 90  1 1.0 1.0  2
 city fridge_model ../models/interiors/fridge/Fridge.model3d     1 0 0  -1 -1 90  1 1.0 1.0  0 1 2 3 4 5
-city stove_model  ../models/interiors/stove/DB_Apps&Tech_04_13.model3d  1 1 0  0 -1 90  1 1.0 4.0 # two sided
-city tv_model    "../models/interiors/SmartTV/Smart TV.model3d" 1 0 0  -1 0 90  1 1.0 1.0
-city couch_model  ../models/interiors/couch/OBJ.model3d         1 0 0  0 -1 90  1 1.0 1.0
-city office_chair_model ../models/interiors/chairs/Free3d_office_chair1/Office_chair.model3d  1 0 0  0 -1 90  1 1.0 1.0
-city lamp_model   ../models/interiors/lamp1.model3d             1 0 0  2 -1 0   1 1.0 1.0  0 # only draw the first material a-wire for the shadow pass
+city stove_model  ../models/interiors/stove/DB_Apps&Tech_04_13.model3d  1 1 0  0 -1 90  1 1.0 4.0  # reverse_winding=1 # two sided, first material is partially reversed winding
+city tv_model    "../models/interiors/SmartTV/Smart TV.model3d" 1 0 0  -1 0 90  1 1.0 1E-5 # materials are {glass screen, plastic body, logo + metal + leg, object, rubber feet}
+city couch_model  ../models/interiors/couch/OBJ.model3d         1 0 0  0 -1 90  1 1.0 5E-6
+city office_chair_model ../models/interiors/chairs/Free3d_office_chair1/Office_chair.model3d  1 0 0  0 -1 90  1 1.0 1.25E-5
+city lamp_model   ../models/interiors/lamp1.model3d             1 0 0  2 -1 0   1 1.0 0.4  0 # only draw the first material a-wire for the shadow pass
 city washer_model ../models/interiors/washer/Washing_machine_MODEL_obj.model3d  0 0 0  0 -1 90  1 1.0 1.0
-city dryer_model  ../models/interiors/dryer/Dryer.model3d       0 1 0  0 -1 0   0 1.0 1.0 # two sided
+city dryer_model  ../models/interiors/dryer/Dryer.model3d       0 1 0  0 -1 0   0 1.0 1.0  # reverse_winding=64 # two sided, but only part of the 6th material is reversed
 city key_model    ../models/interiors/singlkey.model3d          0 0 0  0 -1 0   2 1.0 1.0 # swap X and Z
 city fire_escape_model ../models/fire_escape.model3d            1 0 0  0 -1 0   1 1.0 1.0
 city wall_lamp_model ../models/wall_lamp/wall_lamp.model3d      1 0 0  0 -1 0   1 1.0 5.0
@@ -200,8 +215,22 @@ city toaster_model ../models/interiors/toaster/Toaster.model3d  0 0 0  2  2 0   
 city hood_model   ../models/interiors/decorative_hood.model3d   1 1 0  0 -1 90  1 1.0 1.0 # two sided
 city rocking_chair_model ../models/interiors/rocker/Glider_Rocker.model3d 0 0 0  0 -1 0   1 1.0 1.0
 city silverware_model    ../models/interiors/S3_cutlery_gold_Obj.model3d  1 0 0  0 -1 90  1 1.0 1.0
-city ceiling_fan_model ../models/interiors/ceiling_fan/CeilingFan.model3d 0 1 0  -1 -1 0   1 1.0 1.0 # bad vertex winding order for top and bottom curved shells; missing texture
-#city toy_model    ../models/interiors/toys/Stacking_Toy.model3d 0 1 0  0 -1 90   1 1.0 1.0 # two sided; center white part has wrong winding order
+city ceiling_fan_model ../models/interiors/ceiling_fan/CeilingFan.model3d 0 1 5  -1 -1 0   1 1.0 1.0  reverse_winding=4 # bad vertex winding order for top/bot; missing texture; centered in XZ (xy)
+city fire_ext_model ../models/interiors/fire_extinguisher/fire_extinguisher_co2.fbx 0 0 0  -1 -1 0 1 1.0 1.0
+city folded_shirt_model "../models/interiors/teeshirt/simple folded shirt.model3d"  0 0 0  0 0 90  1 1.0 1.0
+city pool_table_model   ../models/interiors/pool_table/pool_table_002.fbx  0 0 0  0 0 0  1 1.0 1.0
+city pool_ladder_model  ../models/ladder-pool.fbx                 0 0 0  0 0 0  1 1.0 1.0
+city bar_stool_model    ../models/interiors/bar_stool/bar_stool_avorio.glb  0 0 0  1 -1 90  1 1.0 2.0
+#city bar_stool_model   ../models/interiors/bar_stool/Bar_Stool_Bellatier.fbx  0 0 0  0 0 90  1 1.0 1.0
+#city bar_stool_model   ../models/interiors/bar_stool/bar_stool_triangle/scene.gltf  0 0 0  0 0 90  1 1.0 1.0
+#city bar_stool_model   ../models/interiors/bar_stool/pub_stool/scene.gltf  0 0 0  0 0 90  1 1.0 1.0
+city padlock_model      ../models/interiors/padlock/untextured/scene.gltf   0 0 0  0 0 0  1 1.0 20.0  reverse_winding=8 # invert winding order of shackle
+city cash_register_model   ../models/interiors/cash_register/checkout_conv/scene.gltf  0 0 0  0 -1 26  1 1.0 1.0 # rotated at an odd angle
+city water_fountain_model  ../models/interiors/drinking_fountain/scene.gltf 0 0 0  0 0 270  1 1.0 1.0
+city banana_model       ../models/interiors/banana.glb            0 0 0  0 0 0  0 1.0 1.0
+city banana_peel_model  ../models/interiors/banana_peel.glb       0 0 0  0 0 0  1 1.0 1.0 # ../models/interiors/banana_peel2.glb is too brown
+#city toy_model          ../models/interiors/toys/Stacking_Toy.model3d 0 0 0  0 -1 90   1 1.0 1.0  reverse_winding=1 # two sided; center white part has wrong winding order
+#city door_handle_model  ../models/interiors/door_handle.fbx       0 0 0  0 0 270  1 1.0 1.0
 
 # closet objects
 #city hanger_model  ../models/interiors/clothes_hanger.model3d                       0 0 0  0 0 0  1 1.0 1.0
@@ -214,17 +243,47 @@ city clothing_model "../models/interiors/closet_items/Shirt.model3d"            
 city clothing_model "../models/interiors/closet_items/Long Shirt.model3d"           0 0 5  0 0 0  1 1.0 1.0 # XZ centered
 city clothing_model "../models/interiors/closet_items/Pants.model3d"                0 1 0  0 0 0  1 0.79 1.0 # two sided
 
+# plants
+city plant_model ../models/potted_plants/pink_plumeria/Plant3_Flowers.model3d 0 0 0  -1 -1 90  1 1.0 1.0
+city plant_model ../models/potted_plants/mediterranean_broad/scene.gltf       0 0 0  -1 -1 90  1 1.0 1.0
+city plant_model ../models/potted_plants/mediterranean_medium/scene.gltf      0 0 0  -1 -1 90  1 1.0 1.0
+
+# filename recalc_normals two_sided centered body_material_id fixed_color_id xy_rot swap_xyz scale lod_mult [shadow_mat_ids]
 # city objects
-city fire_hydrant_model ../models/fire_hydrant/Fire_Hydrant.model3d  1 0 0   0 -1 0    1 1.0 1.0 # uses custom color
-city substation_model   ../models/substation/SubstationBig.model3d   0 0 0  -1 -1 0    1 1.0 1.0
-city mailbox_model      ../models/us_mailbox/mailbox.model3d         0 0 0  -1 -1 90   1 1.0 1.0
-city umbrella_model     ../models/umbrella/UmbrellaOpen.model3d      0 0 0   0 -1 270  0 1.0 1.0
+city fire_hydrant_model  ../models/fire_hydrant/Fire_Hydrant.model3d  1 0 0   0 -1 0    1 1.0 1.0 # uses custom color
+city substation_model    ../models/substation/SubstationBig.model3d   0 0 0  -1 -1 0    1 1.0 0.01
+city mailbox_model       ../models/us_mailbox/mailbox.model3d         0 0 0  -1 -1 90   1 1.0 1.0
+city umbrella_model      ../models/umbrella/UmbrellaOpen.model3d      0 0 0   0 -1 270  0 1.0 1.0
+city flag_model          ../models/WallFlag.model3d                   0 1 0   1 -1 270  1 1.0 1E-3
+city pigeon_model        ../models/pigeon/pigeon3.model3d             0 0 0   0 -1 90   1 1.0 1.0
+city fountain_model      ../models/Fountains/fountain3/scene.gltf     0 0 0  -1 -1 0    1 1.0 1.0
+city fountain_model      ../models/Fountains/fountain4/scene.gltf     0 0 0  -1 -1 0    1 1.0 1.0
+city fountain_model      ../models/Fountains/fountain5/scene.gltf     0 0 0  -1 -1 0    1 1.0 1.0
+#city bicycle_model       ../models/bicycles/vintage_bicycle.glb       0 0 0  -1 -1 0    1 1.0 1.0 # many stickers
+city bicycle_model       ../models/bicycles/bicycle1/scene.gltf       0 0 0  -1 -1 0    1 1.0 4.0 # clean and simple model
+#city swingset_model      ../models/swingsets/swing.glb                0 0 0  -1 -1 0    1 1.0 1.0 # okay, but dirty
+#city swingset_model      ../models/swingsets/swing1/scene.gltf        0 0 0  -1 -1 0    1 1.0 1.0 # okay, simple model
+city swingset_model      ../models/swingsets/swing2/swings.fbx        0 0 0  -1 -1 90   1 1.0 1.0 # okay
+city trampoline_model    ../models/trampoline/trampoline.model3d      0 0 0   2 -1  0   1 1.0 0.4 # {net, bottom, pad, frame}
+city dumpster_model      ../models/dumpsters/dumpster.glb             0 0 0  -1 -1 90   1 1.0 1.0
+city big_umbrella_model  ../models/umbrella/beach_umbrella_anim.fbx   0 1 0  -1 -1  0   1 1.0 1.0 # two sided; animated, but animations not used
+#city big_umbrella_model  ../models/umbrella/beach_umbrella.fbx        0 1 0  -1 -1  0   1 1.0 1.0 # two sided; tall and thin
+city flower_model        ../models/flowers/rose_flower.glb            0 0 0  -1 -1 0    1 1.0 1.0
+#city flower_model        ../models/flowers/tulip_flower.glb           0 0 0  -1 -1 0    1 1.0 1.0
+
+# animated bird model
+city model_anim_scale 100.0 # model animations are scaled by 100 for some reason
+city default_anim_name standing # required to enable animations
+city bird_animated_model ../models/birds/bird_animated.fbx            0 0 0   0 -1 90   1 1.0 1.0
+city default_anim_name "" # clear to empty
+city model_anim_scale 1.0 # reset
 
 # building animal models
 city rat_model    ../models/interiors/rat/rat.model3d           1 0 0  0 -1 90 1 1.0 1.0
+city roach_model  ../models/interiors/cockroach/cockroach.3ds   1 0 0  0 -1 90 0 1.0 1.0
 
 city max_lights 1024
-city max_shadow_maps 40
+city max_shadow_maps 40 # I recommend not setting this larger than 64
 city smap_size 0 # 0 = default
 city car_shadows 1
 

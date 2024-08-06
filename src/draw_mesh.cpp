@@ -32,6 +32,7 @@ float lt_green_int(1.0), water_xoff(0.0), water_yoff(0.0), wave_time(0.0);
 vector<fp_ratio> uw_mesh_lighting; // for water caustics
 
 extern bool using_lightmap, combined_gu, has_snow, detail_normal_map, use_core_context, underwater, water_is_lava, have_indir_smoke_tex, water_is_lava, fog_enabled;
+extern bool enable_ground_csm;
 extern int num_local_minima, world_mode, xoff, yoff, xoff2, yoff2, ground_effects_level, animate2;
 extern int display_mode, frame_counter, verbose_mode, DISABLE_WATER, read_landscape, disable_inf_terrain, mesh_detail_tex;
 extern float zmax, zmin, ztop, zbottom, light_factor, max_water_height, init_temperature, univ_temp, atmosphere, mesh_scale_z, snow_cov_amt, CAMERA_RADIUS;
@@ -53,6 +54,7 @@ bool use_water_plane_tess();
 bool enable_ocean_waves();
 void set_smap_enable_for_shader(shader_t &s, bool enable_smap, int shader_type);
 void setup_mesh_and_water_shader(shader_t &s, bool use_detail_normal_map, bool is_water);
+colorRGB get_underwater_atten_color(float mud_amt);
 
 
 float camera_min_dist_to_surface() { // min dist of four corners and center
@@ -179,7 +181,7 @@ void set_landscape_texgen(float tex_scale, int xoffset, int yoffset, int xsize, 
 	float const tx(tex_scale*(((float)xoffset)/((float)xsize) + 0.5));
 	float const ty(tex_scale*(((float)yoffset)/((float)ysize) + 0.5));
 	setup_texgen(tex_scale/TWO_XSS, tex_scale/TWO_YSS, tx, ty, 0.0, shader, 0);
-	select_multitex(mesh_detail_tex, detail_tu_id, 1); // detail texture
+	select_texture(mesh_detail_tex, detail_tu_id); // detail texture
 }
 
 void set_landscape_texture_texgen(shader_t &shader) {
@@ -230,6 +232,7 @@ void draw_mesh_vbo(bool shadow_pass) {
 
 	for (int i = 0; i < MESH_Y_SIZE-1; ++i) { // use glMultiDrawArrays()?
 		glDrawArrays(GL_TRIANGLE_STRIP, 2*i*MESH_X_SIZE, 2*MESH_X_SIZE);
+		++num_frame_draw_calls;
 	}
 	mesh_data_vao_mgr.disable_vao();
 	s.end_shader();
@@ -247,10 +250,15 @@ void setup_detail_normal_map_prefix(shader_t &s, bool enable) {
 }
 
 void setup_detail_normal_map(shader_t &s, float tscale) { // also used for tiled terrain mesh
-
-	select_multitex(ROCK_NORMAL_TEX, 11, 1);
+	select_texture(ROCK_NORMAL_TEX, 11);
 	s.add_uniform_int("detail_normal_tex", 11);
 	s.add_uniform_vector2d("detail_normal_tex_scale", vector2d(tscale*X_SCENE_SIZE, tscale*Y_SCENE_SIZE));
+}
+
+void setup_shader_underwater_atten(shader_t &s, float atten_scale, float mud_amt) {
+	s.add_uniform_float("water_atten",    atten_scale);
+	s.add_uniform_color("uw_atten_max",   uw_atten_max);
+	s.add_uniform_color("uw_atten_scale", ((mud_amt > 0.0) ? get_underwater_atten_color(mud_amt) : uw_atten_scale));
 }
 
 
@@ -258,20 +266,21 @@ void setup_detail_normal_map(shader_t &s, float tscale) { // also used for tiled
 void setup_mesh_and_water_shader(shader_t &s, bool use_detail_normal_map, bool is_water) {
 
 	bool const cloud_shadows(!has_snow && atmosphere > 0.0 && ground_effects_level >= 2);
-	bool const indir_lighting(using_lightmap && have_indir_smoke_tex);
+	bool const indir_lighting(using_lightmap && have_indir_smoke_tex), use_smap(shadow_map_enabled());
 	s.setup_enabled_lights(2, 2); // FS
 	set_dlights_booleans(s, 1, 1); // FS
 	s.check_for_fog_disabled();
 	if (cloud_shadows) {s.set_prefix("#define ENABLE_CLOUD_SHADOWS", 1);} // FS
+	if (use_smap && enable_ground_csm) {s.set_prefix("#define ENABLE_CASCADED_SHADOW_MAPS", 1);} // FS
 	s.set_prefix("in vec3 eye_norm;", 1); // FS
 	setup_detail_normal_map_prefix(s, use_detail_normal_map);
 	s.set_prefix(make_shader_bool_prefix("indir_lighting", indir_lighting), 1); // FS
 	s.set_prefix(make_shader_bool_prefix("hemi_lighting",  0), 1); // FS (disabled)
-	s.set_prefix(make_shader_bool_prefix("use_shadow_map", shadow_map_enabled()), 1); // FS
+	s.set_prefix(make_shader_bool_prefix("use_shadow_map", use_smap), 1); // FS
 	s.set_vert_shader("texture_gen.part+draw_mesh");
 	s.set_frag_shader("ads_lighting.part*+shadow_map.part*+dynamic_lighting.part*+indir_lighting.part+linear_fog.part+detail_normal_map.part+cloud_sphere_shadow.part+draw_mesh");
 	s.begin_shader();
-	if (shadow_map_enabled()) {set_smap_shader_for_all_lights(s);}
+	if (use_smap) {set_smap_shader_for_all_lights(s);}
 	set_indir_lighting_block(s, 0, indir_lighting); // calls setup_scene_bounds()
 	s.setup_fog_scale();
 	setup_dlight_textures(s);
@@ -361,7 +370,7 @@ public:
 		vert_norm_color::set_vbo_arrays(1, &data.front());
 	}
 	void emit_strip() {
-		if (c >= 3) {glDrawArrays(GL_TRIANGLE_STRIP, 0, c);} // at least one triangle
+		if (c >= 3) {glDrawArrays(GL_TRIANGLE_STRIP, 0, c); ++num_frame_draw_calls;} // at least one triangle
 		c = 0;
 	}
 };
@@ -388,8 +397,9 @@ public:
 			pre_render(1);
 			upload_vector_to_vbo(data);
 		}
-		for (vector<unsigned>::const_iterator i = strip_ixs.begin(); i+1 != strip_ixs.end(); ++i) {
+		for (vector<unsigned>::const_iterator i = strip_ixs.begin(); i+1 != strip_ixs.end(); ++i) { // skip last element
 			glDrawArrays(GL_TRIANGLE_STRIP, *i, (*(i+1) - *i));
+			++num_frame_draw_calls;
 		}
 		post_render();
 	}
@@ -516,7 +526,6 @@ void display_mesh(bool shadow_pass, bool reflection_pass) { // fast array versio
 		draw_mesh_mvd(reflection_pass);
 	}
 	if (SHOW_MESH_TIME) {PRINT_TIME("Draw");}
-	set_active_texture(0);
 	if (!reflection_pass) {draw_sides_and_bottom(0);} // not generally needed in the reflection pass, since reflective objects should be over the mesh
 
 	if (SHOW_NORMALS) {
@@ -552,7 +561,7 @@ void draw_sides_and_bottom(bool shadow_pass) {
 	shader_t s;
 
 	if (shadow_pass) {
-		s.begin_color_only_shader();
+		s.begin_shadow_map_shader();
 		vert_wrap_t const bverts[4] = {point(x1, y1, botz), point(x1, y2, botz), point(x2, y2, botz), point(x2, y1, botz)};
 		draw_verts(bverts, 4, GL_TRIANGLE_FAN); // bottom
 		vector<vert_wrap_t> verts;
@@ -824,20 +833,20 @@ void setup_water_plane_shader(shader_t &s, bool no_specular, bool reflections, b
 
 	// waves (as normal maps)
 	if (add_waves) {
-		select_multitex(WATER_NORMAL_TEX,       1);
-		select_multitex(OCEAN_WATER_NORMAL_TEX, 4);
+		select_texture(WATER_NORMAL_TEX,       1);
+		select_texture(OCEAN_WATER_NORMAL_TEX, 4);
 		s.add_uniform_int("water_normal_tex",      1);
 		s.add_uniform_int("deep_water_normal_tex", 4);
 	}
 	if (rain_mode) {
-		select_multitex(RAINDROP_TEX, 3);
+		select_texture(RAINDROP_TEX, 3);
 		s.add_uniform_int  ("noise_tex", 3);
 		s.add_uniform_float("noise_time", frame_counter); // rain ripples
-		select_multitex(RIPPLE_MAP_TEX, 7);
+		select_texture(RIPPLE_MAP_TEX, 7);
 		s.add_uniform_int("ripple_tex", 7);
 		s.add_uniform_float("rain_intensity", get_rain_intensity());
 	}
-	select_multitex(FOAM_TEX, 5);
+	select_texture(FOAM_TEX, 5);
 	s.add_uniform_int("foam_tex", 5);
 }
 
@@ -952,24 +961,13 @@ void draw_water_plane(float zval, float terrain_zmin, unsigned reflection_tid) {
 		if (wave_time > 3600.0) {wave_time = 0.0;}
 	}
 	enable_blend();
-	colorRGBA rcolor;
-	set_active_texture(8); // reflection texture tu_id=8
-
-	if (reflection_tid) {
-		bind_2d_texture(reflection_tid);
-		rcolor = WHITE;
-	}
-	else {
-		select_texture(WHITE_TEX);
-		rcolor = cur_fog_color;
-		//blend_color(rcolor, bkg_color, get_cloud_color(), 0.75, 1);
-	}
-	set_active_texture(0); // reset
+	bind_texture_tu_def_white_tex(reflection_tid, 8); // reflection texture tu_id=8
 	point const camera(get_camera_pos());
 	bool const add_waves(enable_ocean_waves());
 	bool const camera_underwater(camera.z < zval);
 	bool const rain_mode(add_waves && !water_is_lava && is_rain_enabled() /*&& !camera_underwater*/);
 	bool const use_tess(use_water_plane_tess());
+	colorRGBA rcolor(reflection_tid ? WHITE : cur_fog_color); // or blend_color(rcolor, bkg_color, get_cloud_color(), 0.75, 1)?
 	rcolor.alpha = 0.5*(0.5 + color.alpha);
 	shader_t s;
 	set_std_depth_func_with_eq(); // helps prevent Z-fighting

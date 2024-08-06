@@ -31,7 +31,6 @@ void setup_sun_moon_light_pos();
 void do_look_at();
 void draw_sun_moon_stars(bool no_update);
 void draw_sun_flare(int ignore_cobj=-1, float intensity=1.0);
-void draw_universe_bkg(bool reflection_mode=0, bool disable_asteroid_dust=0);
 
 
 bool  enable_all_reflections () {return ((display_mode & 0x10) != 0);}
@@ -88,16 +87,13 @@ bool get_reflection_plane_bounds(cube_t &bcube, float &min_camera_dist) {
 
 
 void apply_z_mirror(float zval) {
-
 	fgMatrixMode(FG_MODELVIEW);
 	fgPushMatrix();
 	fgTranslate(0.0, 0.0, 2*zval); // translate to zval and back
 	fgScale(1.0, 1.0, -1.0); // scale in z
 	//mirror_about_plane(plus_z, point(0.0, 0.0, zval));
 }
-
 void apply_dim_mirror(unsigned dim, float val) {
-
 	assert(dim < 3);
 	fgMatrixMode(FG_MODELVIEW);
 	fgPushMatrix();
@@ -108,7 +104,6 @@ void apply_dim_mirror(unsigned dim, float val) {
 }
 
 void setup_viewport_and_proj_matrix(unsigned xsize, unsigned ysize) {
-
 	glViewport(0, 0, xsize, ysize);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 	fgMatrixMode(FG_PROJECTION);
@@ -118,14 +113,11 @@ void setup_viewport_and_proj_matrix(unsigned xsize, unsigned ysize) {
 }
 
 void render_to_texture(unsigned tid, unsigned xsize, unsigned ysize) {
-
 	bind_2d_texture(tid);
 	glReadBuffer(GL_BACK);
 	glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, xsize, ysize); // glCopyTexSubImage2D copies the frame buffer to the bound texture
 }
-
 void render_to_texture_cube_map(unsigned tid, unsigned tex_size, unsigned face_ix) {
-
 	assert(face_ix < 6);
 	bind_cube_map_texture(tid);
 	glReadBuffer(GL_BACK);
@@ -133,14 +125,13 @@ void render_to_texture_cube_map(unsigned tid, unsigned tex_size, unsigned face_i
 }
 
 void restore_matrices_and_clear() {
-
 	restore_prev_mvm_pjm_state();
 	set_standard_viewport();
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 }
 
 
-struct face_draw_params_t {
+struct face_draw_params_t { // used for reflection cube maps
 
 	pos_dir_up pdu;
 	unsigned face_id;
@@ -153,7 +144,6 @@ struct face_draw_params_t {
 		up_vector  = pdu.upv;
 		camera_pdu = pdu;
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-		//if (combined_gu) {draw_universe_bkg(1, 1);} // FIXME: infinite universe as background with no asteroid dust
 		coll_objects.cur_draw_stream_id = face_id;
 		vector3d const eye(pdu.pos - 0.001*cview_dir);
 		fgLookAt(eye.x, eye.y, eye.z, pdu.pos.x, pdu.pos.y, pdu.pos.z, up_vector.x, up_vector.y, up_vector.z);
@@ -294,7 +284,6 @@ void create_gm_reflection_texture(unsigned tid, unsigned xsize, unsigned ysize, 
 	camera_pdu.apply_z_mirror(zval); // setup reflected camera frustum
 	// TODO: use x/y bcube bounds to clip reflected view frustum
 	camera_pdu.near_ = max(camera_pdu.near_, min_camera_dist); // move near clip plane to closest edge of ref plane bcube (optimization)
-	//if (combined_gu) {draw_universe_bkg(1, 1);} // FIXME: infinite universe as background with no asteroid dust
 	pos_dir_up const refl_camera_pdu(camera_pdu);
 	setup_viewport_and_proj_matrix(xsize, ysize);
 	apply_z_mirror(zval); // setup mirror transform
@@ -355,7 +344,7 @@ void setup_reflection_texture(unsigned &tid, unsigned xsize, unsigned ysize) {
 	if (!tid) {
 		bool const wrap = 0; // set to 1 for debugging
 		setup_texture(tid, 0, wrap, wrap);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, xsize, ysize, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, xsize, ysize, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
 	}
 	assert(glIsTexture(tid));
 }
@@ -422,7 +411,7 @@ void setup_shader_cube_map_params(shader_t &shader, cube_t const &bcube, unsigne
 	shader.add_uniform_vector3d("cube_map_center", bcube.get_cube_center()); // world space
 	shader.add_uniform_float("cube_map_near_clip", 0.5f*bcube.max_len());
 	shader.add_uniform_int("cube_map_texture_size", tsize);
-	bind_texture_tu(tid, 14, 1); // tu_id=14, is_cube_map=1
+	bind_texture_tu(tid, 14); // tu_id=14
 }
 
 

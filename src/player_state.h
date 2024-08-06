@@ -19,10 +19,10 @@ int const dodgeball_tids[]  = {SKULL_TEX, RADIATION_TEX, YUCK_TEX};
 unsigned const NUM_DB_TIDS(sizeof(dodgeball_tids)/sizeof(int));
 
 // weapons
-enum {W_UNARMED = 0, W_BBBAT, W_BALL, W_SBALL, W_ROCKET, W_LANDMINE, W_SEEK_D, W_STAR5, W_M16, W_SHOTGUN, W_GRENADE,
+enum {W_UNARMED=0, W_BBBAT, W_BALL, W_SBALL, W_ROCKET, W_LANDMINE, W_SEEK_D, W_STAR5, W_M16, W_SHOTGUN, W_GRENADE,
 	  W_LASER, W_PLASMA, W_BLADE, W_GASSER, W_RAPTOR, W_XLOCATOR, /* non-selectable*/ W_CGRENADE, W_SAWBLADE, W_TELEPORTER, NUM_TOT_WEAPONS};
 
-enum {SF_EYE = 0, SF_NOSE, SF_TONGUE, SF_HEADBAND, NUM_SMILEY_PARTS};
+enum {SF_EYE=0, SF_NOSE, SF_TONGUE, SF_HEADBAND, NUM_SMILEY_PARTS};
 
 
 struct bbox { // size = 20
@@ -56,7 +56,7 @@ struct waypoint_t {
 
 	bool user_placed, placed_item, goal, temp, visited, disabled, next_valid;
 	int came_from, item_group, item_ix, coll_id, connected_to;
-	float g_score, h_score, f_score;
+	float g_score, f_score;
 	point pos;
 	double last_smiley_time;
 	waypt_adj_vect next_wpts, prev_wpts;

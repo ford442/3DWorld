@@ -236,7 +236,7 @@ class universe_shader_t : public shader_t {
 		add_uniform_int(texture_name, 0);
 	}
 	void setup_planet_star_noise_tex() {
-		set_3d_texture_as_current(get_noise_tex_3d(64, 1), noise_tu_id); // grayscale noise
+		bind_texture_tu(get_noise_tex_3d(64, 1), noise_tu_id); // grayscale noise
 	}
 	void set_planet_uniforms(float atmosphere, shadow_vars_t const &svars, bool use_light2) {
 		set_light_scale(*this, use_light2);
@@ -350,8 +350,8 @@ public:
 			add_uniform_int("particles_tex", 2);
 			add_uniform_float("obj_radius", 1.0); // so that vertex scaling within the planet shader does nothing
 		}
-		select_multitex(NOISE_GEN_MIPMAP_TEX, 1, 0);
-		select_multitex(SPARSE_NOISE_TEX,     2, 1);
+		select_texture(NOISE_GEN_MIPMAP_TEX, 1);
+		select_texture(SPARSE_NOISE_TEX,     2);
 		enable();
 		set_specular(0.5, 50.0);
 		shadowed_state.calc_shadowers_for_planet(planet);
@@ -2675,9 +2675,7 @@ void uplanet::ensure_rings_texture() {
 void uplanet::bind_rings_texture(unsigned tu_id) const { // setup ring texture so we can create ring shadows
 
 	if (ring_data.empty() || ring_tid == 0) return;
-	set_active_texture(2);
-	bind_1d_texture(ring_tid);
-	set_active_texture(0);
+	bind_texture_tu(ring_tid, 2);
 }
 
 void uplanet::draw_prings(ushader_group &usg, upos_point_type const &pos_, float size_, float back_face_mult, bool a2c) const {

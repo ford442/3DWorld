@@ -50,7 +50,7 @@ vector<team_info> teaminfo;
 vector<bbox> team_starts;
 
 
-extern bool vsync_enabled, spraypaint_mode, smoke_visible, begin_motion, flashlight_on, disable_fire_delay, disable_recoil, enable_translocator, disable_blood;
+extern bool vsync_enabled, spraypaint_mode, smoke_visible, begin_motion, flashlight_on, disable_fire_delay, disable_recoil, enable_translocator, disable_blood, play_gameplay_alert;
 extern int game_mode, window_width, window_height, world_mode, fire_key, spectate, animate2;
 extern int camera_reset, frame_counter, camera_mode, camera_coll_id, camera_surf_collide, b2down;
 extern int num_groups, num_smileys, left_handed, iticks, DISABLE_WATER, voxel_editing, player_dodgeball_id;
@@ -69,6 +69,7 @@ extern coll_obj_group coll_objects;
 
 bool push_movable_cobj(unsigned index, vector3d &delta, point const &pushed_from);
 void enter_building_gameplay_mode();
+bool flashlight_enabled();
 
 
 point &get_sstate_pos(int id) {
@@ -343,7 +344,7 @@ inline float get_shrapnel_damage(float energy, int index) {
 
 bool player_state::pickup_ball(int index) {
 
-	if (game_mode != 2)    return 0;
+	if (game_mode != GAME_MODE_DODGEBALL) return 0;
 	dwobject &obj(obj_groups[coll_id[BALL]].get_obj(index));
 	if (obj.disabled())    return 0; // already picked up this frame?
 	if (UNLIMITED_WEAPONS) return 0; //obj.disable()?
@@ -465,7 +466,7 @@ bool camera_collision(int index, int obj_index, vector3d const &velocity, point 
 
 	case AMMO:
 		sstate.p_ammo[wa_id] = min(weapons[wa_id].max_ammo, sstate.p_ammo[wa_id]+weapons[wa_id].def_ammo);
-		print_text_onscreen((make_string(weapons[wa_id].def_ammo) + " " + weapons[wa_id].name + " ammo"), GREEN, 0.8, 2*MESSAGE_TIME/3, 1);
+		print_text_onscreen((std::to_string(weapons[wa_id].def_ammo) + " " + weapons[wa_id].name + " ammo"), GREEN, 0.8, 2*MESSAGE_TIME/3, 1);
 		camera_weapon_ammo_pickup(position, cam_filter_color);
 		break;
 
@@ -474,7 +475,7 @@ bool camera_collision(int index, int obj_index, vector3d const &velocity, point 
 			int const pickup_ammo((int)obj_groups[coll_id[type]].get_obj(obj_index).angle);
 			sstate.p_weapons[wa_id] = 1;
 			sstate.p_ammo[wa_id]    = min((int)weapons[wa_id].max_ammo, (sstate.p_ammo[wa_id] + pickup_ammo));
-			print_text_onscreen((weapons[wa_id].name + " pack with ammo " + make_string(pickup_ammo)), GREEN, 0.8, 2*MESSAGE_TIME/3, 1);
+			print_text_onscreen((weapons[wa_id].name + " pack with ammo " + std::to_string(pickup_ammo)), GREEN, 0.8, 2*MESSAGE_TIME/3, 1);
 			camera_weapon_ammo_pickup(position, cam_filter_color);
 		}
 		break;
@@ -751,7 +752,7 @@ bool smiley_collision(int index, int obj_index, vector3d const &velocity, point 
 			int const weapon((type == BLAST_RADIUS ? br_source : ssource.weapon));
 			bool const head_shot(type != BLAST_RADIUS && type != FIRE && type != LANDMINE && type != TELEPORTER && type != TELEFRAG &&
 				type != FELL && type != CRUSHED && type != XLOCATOR_DEATH && !is_area_damage(type));
-			if (game_mode == 2 && type == CAMERA) type2 = BALL; // dodgeball
+			if (game_mode == GAME_MODE_DODGEBALL && type == CAMERA) {type2 = BALL;} // dodgeball
 			string const str(string("You fragged ") + sstates[index].name + " with " + get_weapon_qualifier(type, weapon, source) +
 				get_kill_str(type2) + (head_shot ? "\nHead Shot" : ""));
 
@@ -804,8 +805,8 @@ bool smiley_collision(int index, int obj_index, vector3d const &velocity, point 
 	sstate.drop_pack(obj_pos);
 	remove_reset_coll_obj(obji.coll_id);
 	sstate.register_death(source);
-	obji.status   = 0;
-	if (game_mode != 2) {gen_smoke(position);}
+	obji.status = 0;
+	if (game_mode != GAME_MODE_DODGEBALL) {gen_smoke(position);}
 	return 1;
 }
 
@@ -846,7 +847,7 @@ int damage_done(int type, int index) {
 
 	if (cid >= 0 && index >= 0 && !is_pickup_item(type) && obj_groups[cid].is_enabled()) { // skip pickup items because they're not object-dependent
 		dwobject &obj(obj_groups[cid].get_obj(index));
-		if ((obj.flags & (WAS_PUSHED | FLOATING)) && (type != BALL || game_mode != 2)) return 0; // floating on the water or pushed after stopping, can no longer do damage
+		if ((obj.flags & (WAS_PUSHED | FLOATING)) && (type != BALL || game_mode != GAME_MODE_DODGEBALL)) return 0; // floating on water or pushed after stopping, can no longer damage
 
 		if (type == LANDMINE) {
 			if (obj.status == 1 || obj.lm_coll_invalid()) return 0; // not activated
@@ -880,7 +881,11 @@ void gen_rocket_smoke(point const &pos, vector3d const &orient, float radius, bo
 	
 	if (distance_to_camera_sq(pos) > 0.04 && iticks > rand()%3) {
 		if (freeze) {gen_arb_smoke(pos, FREEZE_COLOR, vector3d(0,0,0.05), rand_uniform(0.01, 0.025), 0.5, 0.0, 0.0, NO_SOURCE, SMOKE, 0, 0.5, 1);} // blue smoke, no lighting
-		else {gen_smoke(dpos, 0.2, 1.0);}
+		else {
+			gen_smoke(dpos, 0.2, 1.0);
+			gen_arb_smoke(dpos, WHITE, vector3d(0.0, 0.0, 0.02), rand_uniform(0.01, 0.025), rand_uniform(0.7, 0.9),
+				rand_uniform(0.0, 0.2), 0.0, NO_SOURCE, SMOKE, 0, 1.0, 0, 0.1); // contrail, tsfact=0.1
+		}
 	}
 	//if (freeze) {add_blastr(dpos, orient, 4.0*radius, 0.0, 4, NO_SOURCE, FREEZE_COLOR, colorRGBA(0,0,0.5,0), ETYPE_FUSION);}
 	if (freeze) {add_blastr(dpos, orient, 3.5*radius, 0.0, 4, NO_SOURCE, WHITE, colorRGBA(0,0,0.2,0), ETYPE_PC_ICE);}
@@ -973,7 +978,7 @@ bool dodgeball_collision(int index, int obj_index, vector3d const &velocity, poi
 
 	if (type == CAMERA || type == SMILEY) {
 		if (pushable_collision(index, position, 100.0, type, BALL)) {
-			if (game_mode != 2) return 1; // doesn't seem to help
+			if (game_mode != GAME_MODE_DODGEBALL) return 1; // doesn't seem to help
 			energy = 0.0;
 		}
 		return smiley_collision(((type == CAMERA) ? CAMERA_ID : obj_index), index, velocity, position, energy, BALL);
@@ -1567,7 +1572,7 @@ bool try_use_translocator(int player_id) {
 
 void switch_player_weapon(int val, bool mouse_wheel) {
 
-	if (game_mode && (game_mode == 1 || world_mode == WMODE_GROUND)) {
+	if (game_mode && (game_mode == GAME_MODE_FPS || world_mode == WMODE_GROUND)) {
 		if (sstates != NULL) {
 			sstates[CAMERA_ID].switch_weapon(val, 1);
 			last_inventory_frame = frame_counter;
@@ -1583,7 +1588,7 @@ void switch_player_weapon(int val, bool mouse_wheel) {
 
 void player_state::switch_weapon(int val, int verbose) {
 
-	if (game_mode == 2) {
+	if (game_mode == GAME_MODE_DODGEBALL) {
 		weapon = ((UNLIMITED_WEAPONS || p_ammo[W_BALL] > 0) ? (int)W_BALL : (int)W_UNARMED);
 		return;
 	}
@@ -1620,11 +1625,13 @@ void player_state::gamemode_fire_weapon() { // camera/player fire
 	if (frame_counter == fire_frame) return; // to prevent two fires in the same frame
 	fire_frame = frame_counter;
 
-	if (!game_mode || (game_mode == 2 && world_mode == WMODE_INF_TERRAIN)) { // flashlight/candlelight/spraypaint mode only
+	if (game_mode == GAME_MODE_NONE || (game_mode == GAME_MODE_BUILDINGS && world_mode == WMODE_INF_TERRAIN)) { // flashlight/candlelight/spraypaint mode only
 		if (voxel_editing) {modify_voxels();}
 		else if (spraypaint_mode) {spray_paint ((wmode & 1) != 0);}
 		else if (spheres_mode   ) {throw_sphere((wmode & 1) != 0);}
-		else if (wmode & 1) {add_camera_candlelight();}
+		// flashlight can be disabled in building gameplay mode; the mouse button will use the current item instead of the flashlight
+		else if (!flashlight_enabled()) {/*print_text_onscreen("No Flashlight", RED, 1.0, 1.0*TICKS_PER_SECOND, 0);*/}
+		else if (world_mode == WMODE_GROUND && (wmode & 1)) {add_camera_candlelight();}
 		else {add_camera_flashlight();}
 		return;
 	}
@@ -1642,9 +1649,9 @@ void player_state::gamemode_fire_weapon() { // camera/player fire
 		if (weapon == W_XLOCATOR) {use_translocator(CAMERA_ID);}
 		else if (weapon != W_ROCKET && weapon != W_SEEK_D && weapon != W_PLASMA && weapon != W_GRENADE && weapon != W_RAPTOR) { // this test is questionable
 			switch_weapon(1, 1); // auto-switch to a weapon that can be fired
-			if (weapon == W_BBBAT)   switch_weapon( 1, 1);
-			if (weapon == W_UNARMED) switch_weapon(-1, 1);
-			if (game_mode == 2 && weapon == W_BBBAT) switch_weapon(1, 1);
+			if (weapon == W_BBBAT)   {switch_weapon( 1, 1);}
+			if (weapon == W_UNARMED) {switch_weapon(-1, 1);}
+			if (game_mode == GAME_MODE_DODGEBALL && weapon == W_BBBAT) {switch_weapon(1, 1);}
 			return; // no weapon/out of ammo
 		}
 	}
@@ -1683,13 +1690,11 @@ void player_state::gamemode_fire_weapon() { // camera/player fire
 	//if (frame_counter == fire_frame) return;
 	int const dtime(get_prev_fire_time_in_ticks());
 
-	if ((game_mode == 2 && weapon == W_BBBAT) || (!UNLIMITED_WEAPONS && no_ammo() &&
-		(weapon == W_LASER || dtime >= int(weapons[weapon].fire_delay))))
-	{
+	if ((game_mode == GAME_MODE_DODGEBALL && weapon == W_BBBAT) || (!UNLIMITED_WEAPONS && no_ammo() && (weapon == W_LASER || dtime >= int(weapons[weapon].fire_delay)))) {
 		switch_weapon(1, 1);
-		if (weapon == W_UNARMED) switch_weapon(1, 1);
-		if (weapon == W_BBBAT)   switch_weapon(1, 1);
-		if (weapon == W_UNARMED) switch_weapon(1, 1);
+		if (weapon == W_UNARMED) {switch_weapon(1, 1);}
+		if (weapon == W_BBBAT)   {switch_weapon(1, 1);}
+		if (weapon == W_UNARMED) {switch_weapon(1, 1);}
 	}
 	player_dodgeball_id = -1; // reset
 }
@@ -1791,10 +1796,10 @@ int player_state::fire_projectile(point fpos, vector3d dir, int shooter, int &ch
 	assert(can_fire_weapon());
 	int weapon_id(weapon);
 
-	if (wmode&1) { // secondary fire projectiles
+	if (wmode & 1) { // secondary fire projectiles
 		if (weapon == W_GRENADE) {weapon_id = W_CGRENADE;}
 		if (weapon == W_BLADE  ) {weapon_id = W_SAWBLADE;}
-		if (weapon == W_BALL && game_mode == 1) {weapon_id = W_TELEPORTER;} // not in dodgeball mode
+		if (weapon == W_BALL && game_mode == GAME_MODE_FPS) {weapon_id = W_TELEPORTER;} // not in dodgeball mode
 	}
 	int const dtime(get_prev_fire_time_in_ticks());
 	bool const rapid_fire(weapon_id == W_ROCKET && (wmode&1)), is_player(shooter == CAMERA_ID);
@@ -1981,7 +1986,7 @@ int player_state::fire_projectile(point fpos, vector3d dir, int shooter, int &ch
 	float const rdist(0.75 + ((weapon_id == W_PLASMA) ? 0.5*(plasma_size - 1.0) : 0.0)); // change?
 	float const radius_sum(radius + object_types[type].radius);
 	assert(nshots <= objg.max_objs);
-	bool const dodgeball(game_mode == 2 && weapon_id == W_BALL && !UNLIMITED_WEAPONS);
+	bool const dodgeball(game_mode == GAME_MODE_DODGEBALL && weapon_id == W_BALL && !UNLIMITED_WEAPONS);
 	if (dodgeball) {assert(nshots <= balls.size());}
 	float shot_offset(0.0);
 
@@ -2139,7 +2144,7 @@ point projectile_test(point const &pos, vector3d const &vcf_, float firing_error
 		intersect = line_intersect_tiled_mesh(pos, pos2, coll_pos, 1); // check terrain; inc_trees=1
 		point p_int;
 		
-		if (line_intersect_city(pos, pos2, p_int)) { // check city (buildings and cars)
+		if (line_intersect_city(pos, pos2, p_int)) { // check city (buildings, cars, bridges, tunnels, city objects, etc.)
 			if (!intersect || p2p_dist_sq(pos, p_int) < p2p_dist_sq(pos, coll_pos)) { // keep closest intersection point
 				if (damage > 0.0) {destroy_city_in_radius((p_int + vcf*object_types[PROJC].radius), 0.0);} // destroy whatever is at this location
 				coll_pos = p_int;
@@ -2325,7 +2330,7 @@ point projectile_test(point const &pos, vector3d const &vcf_, float firing_error
 	else if ((intersect || coll) && dist_less_than(coll_pos, pos, (X_SCENE_SIZE + Y_SCENE_SIZE))) { // spark
 		if (!no_spark && !is_underwater(coll_pos)) {
 			colorRGBA scolor(is_laser ? laser_color : colorRGBA(1.0, 0.7, 0.0, 1.0));
-			//if (is_laser && coll && cindex >= 0 && closest < 0) {scolor = get_cobj_color_at_point(cindex, coll_pos, coll_norm, 0);} // testing
+			//if (is_laser && coll && cindex >= 0 && closest < 0) {scolor = get_cobj_color_at_point(cindex, coll_pos, coll_norm, 0);} // TESTING
 			float const ssize((is_laser ? ((wmode&1) ? 0.015 : 0.020)*intensity : 0.025)*((closest_t == CAMERA) ? 0.5 : 1.0));
 			sparks.push_back(spark_t(coll_pos, scolor, ssize));
 			point const light_pos(coll_pos - vcf*(0.1*ssize));
@@ -2609,9 +2614,7 @@ void init_game_state() {
 			avail_smiley_names.erase(avail_smiley_names.begin() + nid);
 		}
 		else {
-			std::ostringstream oss;
-			oss << "Smiley " << i;
-			sstates[i].name = oss.str();
+			sstates[i].name = "Smiley " + std::to_string(i);
 		}
 	}
 	for (int i = 0; i < teams; ++i) {
@@ -2626,7 +2629,7 @@ void init_game_state() {
 		if (team_starts[i].y1 > team_starts[i].y2) swap(team_starts[i].y1, team_starts[i].y2);
 		teaminfo[team_starts[i].index].bb = team_starts[i];
 	}
-	if (game_mode != 0) {change_game_mode();} // handle init_game_mode
+	if (game_mode != GAME_MODE_NONE) {change_game_mode();} // handle init_game_mode
 }
 
 
@@ -2715,24 +2718,24 @@ void update_camera_velocity(vector3d const &v) {
 
 void init_game_mode() {
 
-	if (world_mode == WMODE_INF_TERRAIN && game_mode == 2) {
+	if (world_mode == WMODE_INF_TERRAIN && game_mode == GAME_MODE_BUILDINGS) {
 		print_text_onscreen("Building Gameplay Mode", WHITE, 2.0, MESSAGE_TIME, 4);
 		enter_building_gameplay_mode();
 	}
 	else {
-		string const str(string("Playing ") + ((game_mode == 1) ? "Deathmatch" : "Dodgeball") + " as " + player_name);
+		string const str(string("Playing ") + ((game_mode == GAME_MODE_FPS) ? "Deathmatch" : "Dodgeball") + " as " + player_name);
 		print_text_onscreen(str, WHITE, 2.0, MESSAGE_TIME, 4);
 		if (!free_for_all) {teams = 0;}
 		free_dodgeballs(1, 1);
-		init_sstate(CAMERA_ID, (game_mode == 1));
-		if (game_mode == 2) {init_smileys();}
+		init_sstate(CAMERA_ID, (game_mode == GAME_MODE_FPS));
+		if (game_mode == GAME_MODE_DODGEBALL) {init_smileys();}
 	
 		for (int i = CAMERA_ID; i < num_smileys; ++i) {
 			sstates[i].killer = NO_SOURCE; // no one
-			if (game_mode == 1) {init_sstate(i, 1);} // ???
+			if (game_mode == GAME_MODE_FPS) {init_sstate(i, 1);} // ???
 		}
 	}
-	if (frame_counter > 0) {gen_sound(SOUND_ALERT, get_camera_pos(), 0.5);} // not on first frame
+	if (play_gameplay_alert && frame_counter > 0) {gen_sound(SOUND_ALERT, get_camera_pos(), 0.5);} // not on first frame
 }
 
 
@@ -2801,7 +2804,7 @@ void player_state::update_sstate_game_frame(int i) {
 	}
 	if (powerup != PU_NONE && powerup_time > 0 && obj_enabled) {add_dynamic_light(1.3, pos, get_powerup_color(powerup));}
 
-	if (SMILEY_GAS && game_mode == 1 && obj_enabled && powerup == PU_SHIELD && powerup_time > (int)INIT_PU_SH_TIME && !(rand()&31)) {
+	if (SMILEY_GAS && game_mode == GAME_MODE_FPS && obj_enabled && powerup == PU_SHIELD && powerup_time > (int)INIT_PU_SH_TIME && !(rand()&31)) {
 		vector3d const dir(get_sstate_dir(i)), vel(velocity*0.5 - dir*1.2);
 		point const spos(pos - dir*get_sstate_radius(i)); // generate gas
 		gen_arb_smoke(spos, GREEN, vel, rand_uniform(0.01, 0.05), rand_uniform(0.3, 0.7), rand_uniform(0.2, 0.6), 10.0, i, GASSED, 0);
@@ -2841,7 +2844,7 @@ void gamemode_rand_appear() {
 	gen_smiley_or_player_pos(surface_pos, CAMERA_ID);
 	camera_last_pos = surface_pos;
 	free_dodgeballs(1, 0);
-	init_sstate(CAMERA_ID, (game_mode == 1), 1); // show_appear_effect=1
+	init_sstate(CAMERA_ID, (game_mode == GAME_MODE_FPS), 1); // show_appear_effect=1
 }
 
 
@@ -2850,10 +2853,10 @@ void change_game_mode() {
 	int types[] = {HEALTH, SHIELD, POWERUP, WEAPON, AMMO};
 	unsigned const ntypes(UNLIMITED_WEAPONS ? 3 : 5);
 	game_mode = game_mode % 3; // 0/1/2
-	for (unsigned i = 0; i < ntypes; ++i) {obj_groups[coll_id[types[i]]].set_enable(game_mode == 1);}
-	obj_groups[coll_id[BALL]].set_enable(game_mode == 2);
+	for (unsigned i = 0; i < ntypes; ++i) {obj_groups[coll_id[types[i]]].set_enable(game_mode == GAME_MODE_FPS);}
+	obj_groups[coll_id[BALL]].set_enable(game_mode == GAME_MODE_DODGEBALL);
 
-	if (game_mode == 2) {
+	if (game_mode == GAME_MODE_DODGEBALL) { // dodgeball mode
 		assert(sstates != NULL);
 		sstates[CAMERA_ID].switch_weapon(1, 1); // player switch to dodgeball
 
@@ -2863,7 +2866,7 @@ void change_game_mode() {
 			obj_groups[group].free_objects();
 		}
 	}
-	else if (game_mode == 0) {
+	else if (game_mode == GAME_MODE_NONE) { // non gameplay mode
 		assert(coll_id[BALL] >= 0 && coll_id[BALL] < NUM_TOT_OBJS);
 		obj_groups[coll_id[BALL]].free_objects();
 	}

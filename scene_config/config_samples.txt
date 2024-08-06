@@ -34,6 +34,7 @@ include config_gameplay.txt
 unlimited_weapons 1
 
 group_back_face_cull 0
+invert_model3d_faces 0
 enable_model3d_tex_comp 0
 disable_shader_effects 0
 two_sided_lighting 1
@@ -45,6 +46,7 @@ no_store_model_textures_in_memory 0
 use_model3d_tex_mipmaps 1
 enable_model3d_custom_mipmaps 1
 enable_model_animations 1
+default_anim_id -1
 
 mesh_height 0.05
 mesh_size  128 128 0
@@ -59,7 +61,7 @@ mesh_file mesh.txt 1.0 1.0 0
 coll_obj_file coll_objs/coll_objs_samples.txt
 #coll_obj_file coll_objs/coll_objs_transformed.txt
 
-num_threads 8
+num_threads 0 # auto
 #num_light_rays 1000 1000 0 0
 #lighting_file_sky    lighting.sample.data 1 1.0
 vertex_optimize_flags 0 1 1 # enable full_opt verbose

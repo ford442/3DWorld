@@ -15,6 +15,7 @@ bool grass_enabled(1), use_grass_tess(0);
 unsigned grass_density(0), num_rnd_grass_blocks(16);
 float grass_length(0.02), grass_width(0.002), flower_density(0.0);
 
+extern bool enable_ground_csm;
 extern int default_ground_tex, read_landscape, display_mode, animate2, frame_counter, draw_model;
 extern unsigned create_voxel_landscape;
 extern float vegetation, zmin, zmax, fticks, h_dirt[], leaf_color_coherence, tree_deadness, relh_adj_tex, zmax_est, snow_cov_amt, tt_grass_scale_factor;
@@ -34,6 +35,7 @@ void detail_scenery_t::setup_shaders_pre(shader_t &s) { // used for grass and fl
 	if (set_dlights_booleans(s, 1, 1)) {s.set_prefix("#define NO_DL_SPECULAR", 1);} // FS
 	s.check_for_fog_disabled();
 	s.set_prefix(make_shader_bool_prefix("use_shadow_map", shadow_map_enabled()), 1); // FS
+	if (shadow_map_enabled() && enable_ground_csm) {s.set_prefix("#define ENABLE_CASCADED_SHADOW_MAPS", 1);} // FS
 }
 
 void detail_scenery_t::setup_shaders_post(shader_t &s) { // used for grass and flowers
@@ -260,6 +262,7 @@ unsigned grass_tile_manager_t::render_block(unsigned block_ix, unsigned lod, flo
 	if (num_tris == 0) return 0;
 	bind_vbo(vbo); // needed because incoming vbo is 0 (so that instance attrib array isn't bound to a vbo)
 	glDrawArraysInstanced((use_tess ? GL_PATCHES : GL_TRIANGLES), 3*start_ix, 3*num_tris, num_instances);
+	++num_frame_draw_calls;
 	return num_instances*num_tris;
 }
 
@@ -650,7 +653,7 @@ public:
 
 	void draw_range(unsigned beg_ix, unsigned end_ix) const {
 		assert(beg_ix <= end_ix && end_ix <= grass.size());
-		if (beg_ix < end_ix) {glDrawArrays((use_grass_tess ? GL_PATCHES : GL_TRIANGLES), 3*beg_ix, 3*(end_ix - beg_ix));} // nonempty segment
+		if (beg_ix < end_ix) {glDrawArrays((use_grass_tess ? GL_PATCHES : GL_TRIANGLES), 3*beg_ix, 3*(end_ix - beg_ix)); ++num_frame_draw_calls;} // nonempty segment
 	}
 
 	static void setup_shaders(shader_t &s, bool distant) { // per-pixel dynamic lighting
@@ -740,10 +743,7 @@ public:
 		if (!nearby_ixs.empty()) {
 			setup_shaders(s, 0);
 			begin_draw();
-
-			for (vector<unsigned>::const_iterator i = nearby_ixs.begin(); i != nearby_ixs.end(); ++i) {
-				draw_range(mesh_to_grass_map[*i], mesh_to_grass_map[(*i)+1]);
-			}
+			for (unsigned ix : nearby_ixs) {draw_range(mesh_to_grass_map[ix], mesh_to_grass_map[ix+1]);}
 			end_draw();
 			s.end_shader();
 		}
@@ -828,6 +828,7 @@ void flower_manager_t::draw_triangles(shader_t &shader) const {
 	if (0 && world_mode == WMODE_INF_TERRAIN) {
 		sized_vert_t<vert_norm_color>::set_vbo_arrays();
 		glDrawArrays(GL_POINTS, 0, flowers.size());
+		++num_frame_draw_calls;
 	}
 	else {
 		vert_norm_comp_color::set_vbo_arrays();
@@ -1058,7 +1059,7 @@ void setup_wind_for_shader(shader_t &s, unsigned tu_id) {
 	s.add_uniform_float("wind_x", wind.x);
 	s.add_uniform_float("wind_y", wind.y);
 	s.add_uniform_int("wind_noise_tex", tu_id);
-	select_multitex(WIND_TEX, tu_id);
+	select_texture(WIND_TEX, tu_id);
 }
 
 

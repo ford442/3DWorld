@@ -50,9 +50,9 @@ point bind_point_t::get_updated_bind_pos() const {
 
 
 // radius == 0.0 is really radius == infinity (no attenuation)
-light_source::light_source(float sz, point const &p, point const &p2, colorRGBA const &c, bool id, vector3d const &d, float bw, float ri, bool icf, float nc) :
-	dynamic(id), enabled(1), user_placed(0), is_cube_face(icf), is_cube_light(0), no_shadows(0), smap_index(0), user_smap_id(0), smap_mgr_id(0), cube_eflags(0),
-	num_dlight_rays(0), radius(sz), radius_inv((radius == 0.0) ? 0.0 : 1.0/radius), r_inner(ri), bwidth(bw), near_clip(nc), pos(p), pos2(p2), dir(d.get_norm()), color(c)
+light_source::light_source(float sz, point const &p, point const &p2, colorRGBA const &c, bool id, vector3d const &d, float bw, float ri, bool icf, float nc, float fc) :
+	dynamic(id), enabled(1), is_cube_face(icf), radius(sz), radius_inv((radius == 0.0) ? 0.0 : 1.0/radius),
+	r_inner(ri), bwidth(bw), near_clip(nc), far_clip(fc), pos(p), pos2(p2), dir(d.get_norm()), color(c)
 {
 	assert(bw > 0.0 && bw <= 1.0);
 	assert(r_inner <= radius);
@@ -94,7 +94,7 @@ float light_source::get_dir_intensity(vector3d const &obj_dir) const {
 }
 
 
-cube_t light_source::calc_bcube(bool add_pad, float sqrt_thresh, bool clip_to_scene_bcube) const {
+cube_t light_source::calc_bcube(bool add_pad, float sqrt_thresh, bool clip_to_scene_bcube, float falloff) const {
 
 	assert(radius > 0.0);
 	assert(sqrt_thresh < 1.0);
@@ -103,11 +103,11 @@ cube_t light_source::calc_bcube(bool add_pad, float sqrt_thresh, bool clip_to_sc
 
 	if (is_very_directional()) {
 		cube_t bcube2;
-		calc_bounding_cylin(sqrt_thresh, clip_to_scene_bcube).calc_bcube(bcube2);
+		calc_bounding_cylin(sqrt_thresh, clip_to_scene_bcube, falloff).calc_bcube(bcube2);
 		if (add_pad) {bcube2.expand_by(vector3d(DX_VAL, DY_VAL, DZ_VAL));} // add one grid unit
 		bcube.intersect_with_cube(bcube2);
 	}
-	if (!custom_bcube.is_all_zeros()) {
+	if (has_custom_bcube()) {
 		//assert(bcube.contains_cube(custom_bcube)); // too strong?
 		assert(bcube.intersects(custom_bcube));
 		bcube.intersect_with_cube(custom_bcube);
@@ -134,17 +134,18 @@ void light_source::get_bounds(cube_t &bcube, int bnds[3][2], float sqrt_thresh, 
 	}
 }
 
-float light_source::calc_cylin_end_radius() const {
-	float const d(1.0f - 2.0f*(bwidth + LT_DIR_FALLOFF));
+float light_source::calc_cylin_end_radius(float falloff) const {
+	float const d(1.0f - 2.0f*(bwidth + ((falloff > 0.0) ? falloff : LT_DIR_FALLOFF))); // use default falloff if zero
 	return radius*sqrt(1.0f/(d*d) - 1.0f);
 }
-cylinder_3dw light_source::calc_bounding_cylin(float sqrt_thresh, bool clip_to_scene_bcube) const {
+cylinder_3dw light_source::calc_bounding_cylin(float sqrt_thresh, bool clip_to_scene_bcube, float falloff) const {
 
 	float const rad(radius*(1.0 - sqrt_thresh));
 	if (is_line_light()) {return cylinder_3dw(pos, pos2, rad, rad);}
 	assert(is_very_directional()); // not for use with point lights or spotlights larger than a hemisphere
+	assert(dir != zero_vector);
 	point pos2(pos + dir*rad);
-	float end_radius((1.0 - sqrt_thresh)*calc_cylin_end_radius());
+	float end_radius((1.0 - sqrt_thresh)*calc_cylin_end_radius(falloff));
 
 	if (clip_to_scene_bcube) { // Note: not correct in general, but okay for bcube calculation for large light sources
 		point pos1(pos);
@@ -314,6 +315,7 @@ void light_source::pack_to_floatv(float *data) const {
 		// the int contains 7 index bits for up to 127 shadow maps + the 8th bit stores is_cube_face
 		*(data++) = float(smap_index + (is_cube_face ? 128 : 0))/255.0f;
 	}
+	else {*(data++) = 0.0f;} // shadow map disabled
 }
 
 void light_source_trig::advance_timestep() {
@@ -389,9 +391,12 @@ void light_source_trig::register_activate(bool player_triggered) {
 
 // ************ SHADOW MAPS ***********
 
-// FIXME: doesn't work because shader wants to index texture layer and shadow matrix by the same index, and we may not have enough uniforms for caching
-unsigned const MAX_EXTRA_CACHED_SMAPS = 0;
-
+// local shadow maps are for point/spot lights used for cases such as buildings and streetlights and are capped at 64 max to agree with the shader;
+// this cap can be increased, but some GPUs may not have enough uniform slots for more, and it would take more GPU memory;
+// when the player rotates, different light sources may enter the view frustum as lights with cached shadows leave it, which can thrash the cache;
+// it may make sense to reserve some extra slots to help with this, though only if the max_shadow_maps config option is set less than the max;
+// however, this doesn't work because the shader wants to index texture layer and shadow matrix by the same index,
+// and we may not have enough uniforms for caching
 class local_smap_manager_t {
 
 	bool use_tex_array;
@@ -434,18 +439,19 @@ public:
 			free_list.pop_back();
 		}
 		local_smap_data_t &smd(get_smap(index));
-		//cout << TXT(free_list.size()) << TXT(index) << TXT(user_smap_id) << TXT(smd.user_smap_id) << endl; // TESTING
 		assert(!smd.used);
 		matched_smap_id      = (user_smap_id > 0 && smd.user_smap_id == user_smap_id);
 		smd.used             = 1; // mark as used (for error checking)
 		smd.last_has_dynamic = 1; // force recreation
 		smd.outdoor_shadows  = 0; // reset to default
 		smd.user_smap_id     = user_smap_id; // tag this shadow map with the caller's ID (if provided); if nonzero, this should be a unique value
+		smd.last_lpos        = zero_vector;
 
 		if (size > 0 && smd.smap_sz != size) { // size change - free and reallocate
 			smd.free_gl_state();
 			smd.smap_sz = size;
 		}
+		if (use_tex_array) {assert(*smd.get_layer() == index);}
 		return index + 1; // offset by 1
 	}
 	void free_smap(unsigned index) {
@@ -475,6 +481,11 @@ public:
 		smap_data.clear();
 		free_list.clear();
 	}
+	unsigned get_gpu_mem() const {
+		unsigned mem(0);
+		for (auto &i : smap_data) {mem += i.get_gpu_mem();}
+		return mem + smap_tex_arr.gpu_mem;
+	}
 };
 
 unsigned const NUM_SMAP_MGRS = 2;
@@ -483,7 +494,11 @@ local_smap_manager_t local_smap_manager[NUM_SMAP_MGRS]; // {normal/city, buildin
 void free_light_source_gl_state() { // free shadow maps
 	for (unsigned i = 0; i < NUM_SMAP_MGRS; ++i) {local_smap_manager[i].free_gl_state();}
 }
-
+unsigned get_dlights_smap_gpu_mem() {
+	unsigned mem(0);
+	for (unsigned i = 0; i < NUM_SMAP_MGRS; ++i) {mem += local_smap_manager[i].get_gpu_mem();}
+	return mem;
+}
 
 local_smap_manager_t &light_source::get_smap_mgr() const {
 	assert(smap_mgr_id < NUM_SMAP_MGRS);
@@ -507,16 +522,15 @@ pos_dir_up light_source::calc_pdu(bool dynamic_cobj, bool is_cube_face, float fa
 	vector3d cnorm; // unused
 	float nclip(0.001*radius); // min value
 
-	if (near_clip > 0.0) {
-		nclip = max(nclip, near_clip);
-	}
+	if (near_clip > 0.0) {nclip = max(nclip, near_clip);}
 	else if (world_mode == WMODE_GROUND && check_point_contained_tree(pos, cindex, dynamic_cobj)) {
 		// if light is inside a light fixture, move the near clip plane so that the light fixture cobj is outside the view frustum
 		assert(cindex >= 0);
 		point const start_pos(pos + dir*radius);
 		if (coll_objects[cindex].line_int_exact(start_pos, pos, t, cnorm)) {nclip += (1.0 - t)*radius;}
 	}
-	return pos_dir_up(pos, dir, up_dir, angle, nclip, max(radius, nclip+0.01f*radius), 1.0, 1); // force near_clip < far_clip
+	float const fclip((far_clip == 0.0) ? radius : far_clip);
+	return pos_dir_up(pos, dir, up_dir, angle, nclip, max(fclip, nclip+0.01f*radius), 1.0, 1); // force near_clip < far_clip; AR=1.0
 }
 
 void light_source::draw_light_cone(shader_t &shader, float alpha) const {
@@ -551,7 +565,6 @@ void light_source::draw_light_cone(shader_t &shader, float alpha) const {
 
 
 bool light_source_trig::is_shadow_map_enabled() const {
-
 	if (!use_smap || no_shadows || shadow_map_sz == 0 || !enable_dlight_shadows) return 0;
 	if (is_line_light())    return 0; // line lights don't support shadow maps
 	if (dir == zero_vector) return 0; // point light: need cube map, skip for now
@@ -561,21 +574,20 @@ bool light_source_trig::is_shadow_map_enabled() const {
 }
 
 bool light_source_trig::check_shadow_map() {
-
 	if (!is_shadow_map_enabled()) return 0;
 	if (!is_enabled())            return 0; // disabled or destroyed
 	bool const force_update(rot_rate != 0.0); // force shadow map update if rotating
 	return setup_shadow_map(LT_DIR_FALLOFF, dynamic_cobj, outdoor_shadows, force_update, sm_size);
 }
 
-bool light_source::setup_shadow_map(float falloff, bool dynamic_cobj, bool outdoor_shadows, bool force_update, unsigned sm_size) {
-
-	bool matched_smap_id(0);
-
+bool light_source::alloc_shadow_map(bool &matched_smap_id, unsigned sm_size) {
 	if (smap_index == 0) {
 		smap_index = get_smap_mgr().new_smap(sm_size, user_smap_id, matched_smap_id);
 		if (smap_index == 0) return 0; // allocation failed (at max)
 	}
+	return 1;
+}
+void light_source::update_shadow_map(bool matched_smap_id, float falloff, bool dynamic_cobj, bool outdoor_shadows, bool force_update) {
 	local_smap_data_t &smap(get_smap_mgr().get(smap_index));
 	smap.pdu = calc_pdu(dynamic_cobj, is_cube_face, falloff); // Note: could cache this in the light source for static lights
 	smap.outdoor_shadows = outdoor_shadows;
@@ -590,6 +602,11 @@ bool light_source::setup_shadow_map(float falloff, bool dynamic_cobj, bool outdo
 	// if matched_smap_id==1, we can skip the shadow map update
 	smap.create_shadow_map_for_light(pos, nullptr, 1, matched_smap_id, force_update); // no bcube, in world space, no texture array (layer=nullptr)
 	smap_light_clip_cube.set_to_zeros();
+}
+bool light_source::setup_shadow_map(float falloff, bool dynamic_cobj, bool outdoor_shadows, bool force_update, unsigned sm_size) {
+	bool matched_smap_id(0);
+	if (!alloc_shadow_map(matched_smap_id, sm_size)) return 0;
+	update_shadow_map(matched_smap_id, falloff, dynamic_cobj, outdoor_shadows, force_update);
 	return 1;
 }
 

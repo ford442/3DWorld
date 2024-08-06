@@ -1,7 +1,6 @@
 // 3D World - 3D Studio Max File Reader
 // by Frank Gennari
 // 11/1/2014
-// Reference: http://www.spacesimulator.net/wiki/index.php?title=Tutorials:3ds_Loader
 
 #include "3DWorld.h"
 #include "model3d.h"
@@ -304,7 +303,7 @@ class file_reader_3ds_model : public file_reader_3ds, public model_from_file_t {
 
 	virtual int proc_other_chunks(unsigned short chunk_id, unsigned chunk_len) {
 
-		// TODO: smoothing groups and shininess
+		// smoothing groups and shininess?
 		switch (chunk_id) {
 			// OBJ_TRIMESH: Triangular mesh, contains chunks for 3d mesh info; length: 0 + sub chunks
 		case 0x4100:
@@ -423,7 +422,7 @@ class file_reader_3ds_model : public file_reader_3ds, public model_from_file_t {
 					assert(face_id < sgroups.size());
 					sgroup = sgroups[face_id];
 				}
-				if (sgroup > 0) {} // TODO: use sgroup
+				if (sgroup > 0) {} // future work
 				point pts[3];
 				get_triangle_pts(*i, verts, pts);
 				vector3d normal(get_poly_norm(pts));

@@ -26,11 +26,11 @@ coll_obj_group coll_objects;
 cobj_groups_t cobj_groups;
 cobj_draw_groups cdraw_groups;
 
-extern bool lm_alloc, has_snow;
+extern bool lm_alloc, has_snow, player_wait_respawn, camera_in_building, player_on_house_stairs, player_in_walkway, player_in_skyway, player_on_moving_ww;
 extern int camera_coll_smooth, game_mode, world_mode, xoff, yoff, camera_change, display_mode, scrolling, animate2;
-extern int camera_in_air, mesh_scale_change, camera_invincible, camera_flight, num_smileys, iticks;
+extern int camera_in_air, mesh_scale_change, camera_invincible, camera_flight, num_smileys, iticks, frame_counter, player_in_water, player_in_basement;
 extern unsigned snow_coverage_resolution;
-extern float TIMESTEP, temperature, zmin, base_gravity, ftick, tstep, zbottom, ztop, fticks, jump_height, NEAR_CLIP;
+extern float TIMESTEP, temperature, zmin, base_gravity, ftick, tstep, zbottom, ztop, water_plane_z, fticks, jump_height, NEAR_CLIP;
 extern double camera_zh, tfticks;
 extern dwobject def_objects[];
 extern obj_type object_types[];
@@ -44,6 +44,7 @@ extern model3ds all_models;
 void add_coll_point(int i, int j, int index, float zminv, float zmaxv, int add_to_hcm, int is_dynamic, int dhcm);
 void free_all_coll_objects();
 bool proc_movable_cobj(point const &orig_pos, point &player_pos, unsigned index, int type);
+void register_building_water_splash(point const &pos, float size, bool alert_zombies);
 
 
 bool decal_obj::is_on_cobj(int cobj, vector3d *delta) const {
@@ -1162,7 +1163,7 @@ void gen_explosion_decal(point const &pos, float radius, vector3d const &coll_no
 bool get_sphere_poly_int_val(point const &sc, float sr, point const *const points, unsigned npoints, vector3d const &normal, float thickness, float &val, vector3d &cnorm) {
 
 	// compute normal based on extruded sides
-	vector<tquad_t> pts;
+	vector<tquad_t> pts; // {top, bottom, <sides>}
 	thick_poly_to_sides(points, npoints, normal, thickness, pts);
 	if (!sphere_intersect_poly_sides(pts, sc, sr, val, cnorm, 1)) return 0; // no collision
 	bool intersects(0), inside(1);
@@ -1610,7 +1611,7 @@ int dwobject::check_vert_collision(int obj_index, int do_coll_funcs, int iter, v
 		vector3d cnorm(plus_z);
 		bool const check_interior(PLAYER_CAN_ENTER_BUILDINGS && type == CAMERA);
 		
-		if (proc_city_sphere_coll(pos, p_last, o_radius, p_last.z, 0, 1, &cnorm, check_interior)) { // xy_only=0, inc_cars=1
+		if (proc_city_sphere_coll(pos, p_last, o_radius, p_last.z, 1, &cnorm, check_interior)) { // inc_cars=1; for ground mode only
 			obj_type const &otype(object_types[type]);
 			float const friction(otype.friction_factor*((flags & FROZEN_FLAG) ? 0.5 : 1.0)); // frozen objects have half friction
 			if (animate2 && health <= 0.1) {disable();}
@@ -1677,7 +1678,7 @@ int dwobject::multistep_coll(point const &last_pos, int obj_index, unsigned nste
 }
 
 
-void create_footsteps(point const &pos, float sz, vector3d const &view_dir, point &prev_foot_pos, unsigned &step_num, bool &foot_down, bool is_camera) {
+void create_footsteps(point const &pos, float sz, vector3d const &view_dir, point &prev_foot_pos, unsigned &step_num, bool &foot_down, bool is_camera) { // ground mode
 
 	if (!has_snow /*&& !is_camera*/) return; // only camera has footsteps, all players have snow footprints; non-snow footsteps disabled for now
 	bool const prev_foot_down(foot_down);
@@ -1687,23 +1688,36 @@ void create_footsteps(point const &pos, float sz, vector3d const &view_dir, poin
 	vector3d const right_dir(cross_product(view_dir, plus_z).get_norm());
 	point const step_pos(pos + ((step_num&1) ? foot_spacing : -foot_spacing)*right_dir - vector3d(0.0, 0.0, 0.5*sz)); // alternate left and right feet
 	if (!foot_down) return;
-	bool const crushed(has_snow ? crush_snow_at_pt(step_pos, crush_depth) : 0);
-	if (is_camera && !prev_foot_down) {gen_sound((crushed ? (int)SOUND_SNOW_STEP : (int)SOUND_FOOTSTEP), pos, 0.025, (crushed ? 1.5 : 1.2));} // on down step
+	
+	if (is_camera && !prev_foot_down) { // on down step
+		if (has_snow && crush_snow_at_pt(step_pos, crush_depth)) {gen_sound_random_var(SOUND_SNOW_STEP, pos, 0.1, 1.5);} // snow sound
+		else {gen_sound_random_var(SOUND_FOOTSTEP, pos, 0.025, 1.2);} // normal footstep
+	}
 }
 
-void play_camera_footstep_sound() {
+void play_camera_footstep_sound() { // tiled terrain mode
 
 	if (!(display_mode & 0x0100)) return;
+	if (player_in_water == 2)     return; // no footsteps when underwater
+	if (player_on_moving_ww )     return; // player is moving, but may not be walking - no footsteps
 	static double fs_time(0.0);
 	static point last_pos(all_zeros), prev_frame_pos(all_zeros);
 	point const pos(get_camera_pos());
+	if (pos.z < water_plane_z) return; // underwater, no sound
 	if (dist_less_than(pos, prev_frame_pos, 0.001*CAMERA_RADIUS)) {fs_time = tfticks;} // reset timer if camera hasn't moved
 	prev_frame_pos = pos;
-	if (tfticks - fs_time < 0.36*TICKS_PER_SECOND) return; // too soon
+	float const step_period(player_in_water ? 0.24 : 0.36); // in seconds
+	if (tfticks - fs_time < step_period*TICKS_PER_SECOND)    return; // too soon
 	if (dist_xy_less_than(pos, last_pos, 0.5*CAMERA_RADIUS)) return;
 	last_pos = pos;
 	fs_time  = tfticks;
-	gen_sound(SOUND_SNOW_STEP, pos, 0.05, 1.25);
+	bool const not_in_building(!camera_in_building && !player_in_walkway && !player_in_skyway);
+	if (player_in_water) {register_building_water_splash(pos, 1.0, 1);} // water splash; alert_zombies=1
+	//else if (player_in_water       ) {gen_sound_random_var(get_sound_id_for_file("footsteps/footstep_splash.wav"), pos, 0.2);}
+	else if (not_in_building       ) {gen_sound_random_var(get_sound_id_for_file("footsteps/footstep_grass.wav" ), pos, 0.2);}
+	else if (player_in_basement > 1) {gen_sound_random_var(get_sound_id_for_file("footsteps/footstep_knock2.wav"), pos, 0.2);}
+	else if (player_on_house_stairs) {gen_sound_random_var(get_sound_id_for_file("footsteps/footstep_hollow.wav"), pos, 0.2);}
+	else {gen_sound_random_var(get_sound_id_for_file("footsteps/footstep_knock.wav"), pos, 0.2);} // was SOUND_SNOW_STEP with pitch=1.25
 }
 
 
@@ -1728,7 +1742,7 @@ float get_max_mesh_height_within_radius(point const &pos, float radius, bool is_
 
 void proc_player_city_sphere_coll(point &pos) {
 	bool const check_interior(PLAYER_CAN_ENTER_BUILDINGS);
-	proc_city_sphere_coll(pos, camera_last_pos, CAMERA_RADIUS, camera_last_pos.z, 0, 0, nullptr, check_interior); // use prev pos for building collisions; z dir
+	proc_city_sphere_coll(pos, camera_last_pos, CAMERA_RADIUS, camera_last_pos.z, 0, nullptr, check_interior); // use prev pos for building collisions; z dir
 }
 
 void force_onto_surface_mesh(point &pos) { // for camera
@@ -1767,11 +1781,28 @@ void force_onto_surface_mesh(point &pos) { // for camera
 		pos.z -= radius; // bottom of camera sphere
 		adjust_zval_for_model_coll(pos, radius, get_max_mesh_height_within_radius(pos, radius, 1), C_STEP_HEIGHT*radius);
 		pos.z += radius;
+		float const prev_zval(pos.z);
 		proc_player_city_sphere_coll(pos);
+		float const delta_z(pos.z - camera_last_pos.z), delta_rate((delta_z/CAMERA_RADIUS)/fticks);
+
+		// handle player falling off/in a building or snapping to a different floor due to collision enabling or a collision bug
+		if (frame_counter > 100 && !player_wait_respawn) { // skip for first N frames from player spawn and when dead
+			if (delta_z < 0.0) { // falling
+				float const MAX_FALL_RATE = 2.0; // distance per tick in units of camera radius
+				float const fall_rate_mod(MAX_FALL_RATE*((player_in_water == 2) ? 0.05 : ((player_in_water == 1) ? 0.1 : 1.0))); // fall slower in water
+				float const fall_rate(-delta_rate);
+				if (fall_rate > fall_rate_mod) {pos.z -= delta_z*(fall_rate - fall_rate_mod)/fall_rate;}
+			}
+			else if (delta_z > 0.0 && pos.z != prev_zval) { // rising; only update when building coll changed zval
+				float const MAX_RISE_RATE = 2.0; // distance per tick in units of camera radius
+				if (delta_rate > MAX_RISE_RATE) {pos.z -= delta_z*(delta_rate - MAX_RISE_RATE)/delta_rate;}
+			}
+		}
 		camera_last_pos = pos;
 		camera_change   = 0;
 		return; // that's it
 	}
+	// everything after this point is either ground mode or flight mode
 	if (cflight) {
 		if (jump_time) {pos.z += 0.5*JUMP_ACCEL*fticks*radius; jump_time = 0;}
 		if (coll) {pos.z = camera_obj.pos.z;}
@@ -1890,12 +1921,6 @@ int set_true_obj_height(point &pos, point const &lpos, float step_height, float 
 
 	if (is_player && !test_only) {
 		if (display_mode & 0x0100) {create_footsteps(pos, radius, sstate->velocity.get_norm(), sstate->prev_foot_pos, sstate->step_num, sstate->foot_down, is_camera);}
-
-		/*if (display_mode & 0x10) { // walk on snow (smiley and camera, though doesn't actually set smiley z value correctly)
-			float zval;
-			vector3d norm;
-			if (get_snow_height(pos, radius, zval, norm)) {pos.z = zval + radius;}
-		}*/
 	}
 	if (jump_time > 0) {
 		float const jump_val((float(jump_time)/TICKS_PER_SECOND - (JUMP_COOL - JUMP_TIME))/JUMP_TIME); // jt == JC => 1.0; jt == JC-JT => 0.0

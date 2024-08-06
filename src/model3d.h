@@ -82,12 +82,12 @@ struct geom_xform_t { // should be packed, can read/write as POD
 struct model3d_xform_t : public geom_xform_t, public rotation_t { // should be packed, can read/write as POD
 
 	base_mat_t material;
-	int group_cobjs_level;
-	float voxel_spacing;
+	int group_cobjs_level=0;
+	float voxel_spacing=0.0;
 	cube_t bcube_xf;
 
-	model3d_xform_t(vector3d const &tv_=zero_vector, float scale_=1.0) : geom_xform_t(tv_, scale_), group_cobjs_level(0.0), voxel_spacing(0.0), bcube_xf(all_zeros) {}
-	model3d_xform_t(geom_xform_t const &xf) : geom_xform_t(xf), group_cobjs_level(0.0), voxel_spacing(0.0), bcube_xf(all_zeros) {}
+	model3d_xform_t(vector3d const &tv_=zero_vector, float scale_=1.0) : geom_xform_t(tv_, scale_) {}
+	model3d_xform_t(geom_xform_t const &xf) : geom_xform_t(xf) {}
 	cube_t get_xformed_cube(cube_t const &cube) const;
 	cube_t const &get_xformed_bcube(cube_t const &bcube);
 	void clear_bcube() {bcube_xf.set_to_zeros();}
@@ -129,7 +129,7 @@ struct poly_header_t {
 	int mat_id;
 	vector3d n;
 
-	poly_header_t(int mat_id_=-1, unsigned obj_id_=0) : npts(0), obj_id(obj_id_), mat_id(mat_id_), n(zero_vector) {}
+	poly_header_t(int mat_id_=-1, unsigned obj_id_=0) : npts(0), obj_id(obj_id_), mat_id(mat_id_) {}
 };
 
 struct poly_data_block {
@@ -138,17 +138,15 @@ struct poly_data_block {
 };
 
 struct model3d_stats_t {
-	unsigned verts, quads, tris, blocks, mats, transforms;
-	model3d_stats_t() : verts(0), quads(0), tris(0), blocks(0), mats(0), transforms(0) {}
+	unsigned verts=0, quads=0, tris=0, blocks=0, mats=0, transforms=0;
 	void print() const;
 };
 
 // for computing vertex normals from face normals
 struct counted_normal : public vector3d { // size = 16
+	unsigned count=0;
 
-	unsigned count;
-
-	counted_normal() : vector3d(zero_vector), count(0) {}
+	counted_normal() {}
 	counted_normal(vector3d const &n) : vector3d(n), count(1) {}
 	void add_normal(vector3d const &n) {*this += n; ++count;}
 	bool is_valid() const {return (count > 0);}
@@ -156,10 +154,9 @@ struct counted_normal : public vector3d { // size = 16
 
 // unused
 struct weighted_normal : public vector3d { // size = 16
+	float weight=0.0;
 
-	float weight;
-
-	weighted_normal() : vector3d(zero_vector), weight(0.0) {}
+	weighted_normal() {}
 	weighted_normal(vector3d const &n, float w=1.0) : vector3d(w*n), weight(w) {}
 	void add_normal(vector3d const &n, float w=1.0) {*this += w*n; weight += w;}
 	void add_normal(vector3d const &n, point const *const poly_pts, unsigned npts) {add_normal(n, polygon_area(poly_pts, npts));}
@@ -168,13 +165,12 @@ struct weighted_normal : public vector3d { // size = 16
 
 //template<typename T> class vertex_map_t : public unordered_map<T, unsigned, hash_by_bytes<T>> {
 template<typename T> class vertex_map_t : public map<T, unsigned> {
-
-	int last_mat_id;
-	unsigned last_obj_id;
-	bool average_normals;
+	int last_mat_id=-1;
+	unsigned last_obj_id=0;
+	bool average_normals=0;
 
 public:
-	vertex_map_t(bool average_normals_=0) : last_mat_id(-1), last_obj_id(0), average_normals(average_normals_) {}
+	vertex_map_t(bool average_normals_=0) : average_normals(average_normals_) {}
 	bool get_average_normals() const {return average_normals;}
 	
 	void check_for_clear(int mat_id) {
@@ -191,12 +187,11 @@ typedef vertex_map_t<vert_norm_tc_tan> vntct_map_t;
 
 struct get_polygon_args_t {
 	vector<coll_tquad> &polygons;
-	colorRGBA color;
-	bool quads_only;
-	unsigned lod_level;
+	bool quads_only=0;
+	unsigned lod_level=0;
 
-	get_polygon_args_t(vector<coll_tquad> &polygons_, colorRGBA const &color_, bool quads_only_=0, unsigned lod_level_=0)
-		: polygons(polygons_), color(color_), quads_only(quads_only_), lod_level(lod_level_) {}
+	get_polygon_args_t(vector<coll_tquad> &polygons_, bool quads_only_=0, unsigned lod_level_=0)
+		: polygons(polygons_), quads_only(quads_only_), lod_level(lod_level_) {}
 };
 
 
@@ -225,6 +220,7 @@ struct model_anim_t {
 
 	struct anim_node_t {
 		int bone_index; // cached to avoid bone_name_to_index_map lookup; -1 is no bone
+		mutable bool no_anim_data=0;
 		string name;
 		xform_matrix transform;
 		vector<unsigned> children; // indexes into anim_nodes
@@ -232,26 +228,26 @@ struct model_anim_t {
 	};
 	vector<anim_node_t> anim_nodes;
 
-	struct anim_base_val_t {
-		float time;
-		anim_base_val_t(float time_=0.0) : time(time_) {}
+	template<typename T> struct anim_val_t {
+		float time=0.0;
+		T v;
+		anim_val_t() {} // for merged resize()
+		anim_val_t(float time_, T const &v_) : time(time_), v(v_) {}
 	};
-	struct anim_vec3_val_t : public anim_base_val_t {
-		vector3d v;
-		anim_vec3_val_t(float time_, vector3d const &v_) : anim_base_val_t(time_), v(v_) {}
-	};
-	struct anim_quat_val_t : public anim_base_val_t {
+	struct merged_anim_data_t {
+		vector3d pos, scale;
 		glm::quat q;
-		anim_quat_val_t(float time_, glm::quat const &q_) : anim_base_val_t(time_), q(q_) {}
+		void set(vector3d const &pos_, vector3d const &scale_, glm::quat const &q_) {pos = pos_; scale = scale_; q = q_;}
 	};
 	struct anim_data_t {
 		bool uses_scale=0;
-		vector<anim_vec3_val_t> pos, scale;
-		vector<anim_quat_val_t> rot;
+		vector<anim_val_t<vector3d>> pos, scale;
+		vector<anim_val_t<glm::quat>> rot;
+		vector<anim_val_t<merged_anim_data_t>> merged;
 		void init(unsigned np, unsigned nr, unsigned ns);
 	};
 	struct animation_t {
-		float ticks_per_sec=25.0, duration=1.0;
+		float ticks_per_sec=25.0, duration=1.0; // duration is in ticks
 		string name;
 		unordered_map<string, anim_data_t> anim_data; // per bone
 		animation_t(string const &name_="") : name(name_) {}
@@ -264,6 +260,8 @@ struct model_anim_t {
 	vector3d  calc_interpolated_scale   (float anim_time, anim_data_t const &A) const;
 	void transform_node_hierarchy_recur(float anim_time, animation_t const &animation, unsigned node_ix, xform_matrix const &parent_transform);
 	void get_bone_transforms(unsigned anim_id, float cur_time);
+	bool check_anim_wrapped(unsigned anim_id, float old_time, float new_time) const;
+	float get_anim_duration(unsigned anim_id) const;
 private:
 	xform_matrix apply_anim_transform(float anim_time, animation_t const &animation, anim_node_t const &node) const;
 public:
@@ -271,6 +269,7 @@ public:
 	void blend_animations(unsigned anim_id1, unsigned anim_id2, float blend_factor, float delta_time, float &cur_time1, float &cur_time2);
 	void get_blended_bone_transforms(float anim_time1, float anim_time2, animation_t const &animation1, animation_t const &animation2,
 		unsigned node_ix, xform_matrix const &parent_transform, float blend_factor);
+	void merge_anim_transforms();
 	void merge_from(model_anim_t const &anim);
 	int get_animation_id_by_name(string const &anim_name) const;
 };
@@ -279,7 +278,7 @@ public:
 template<typename T> class vntc_vect_t : public vector<T>, public indexed_vao_manager_with_shadow_t {
 
 protected:
-	bool has_tangents, finalized;
+	bool has_tangents=0, finalized=0;
 	sphere_t bsphere;
 	cube_t bcube;
 public:
@@ -287,7 +286,7 @@ public:
 	using vector<T>::size;
 	unsigned obj_id;
 
-	vntc_vect_t(unsigned obj_id_=0) : has_tangents(0), finalized(0), obj_id(obj_id_) {bcube.set_to_zeros();}
+	vntc_vect_t(unsigned obj_id_=0) : obj_id(obj_id_) {bcube.set_to_zeros();}
 	void clear();
 	void make_private_copy() {vbo = ivbo = 0;} // Note: to be called *only* after a deep copy
 	void calc_bounding_volumes();
@@ -304,7 +303,6 @@ public:
 
 
 template<typename T> class indexed_vntc_vect_t : public vntc_vect_t<T> {
-
 public:
 	typedef unsigned index_type_t;
 	vector<unsigned> indices; // needs to be public for merging operation
@@ -315,17 +313,17 @@ private:
 	float avg_area_per_tri, amin, amax;
 
 	struct geom_block_t {
-		unsigned start_ix, num;
+		unsigned start_ix=0, num=0;
 		cube_t bcube;
-		geom_block_t() : start_ix(0), num(0) {}
+		geom_block_t() {}
 		geom_block_t(unsigned s, unsigned n, cube_t const &bc) : start_ix(s), num(n), bcube(bc) {}
 	};
 	vector<geom_block_t> blocks;
 
 	struct lod_block_t {
-		unsigned start_ix, num;
-		float tri_area;
-		lod_block_t() : start_ix(0), num(0), tri_area(0.0) {}
+		unsigned start_ix=0, num=0;
+		float tri_area=0.0;
+		lod_block_t() {}
 		lod_block_t(unsigned s, unsigned n, float a) : start_ix(s), num(n), tri_area(a) {}
 		unsigned get_end_ix() const {return (start_ix + num);}
 	};
@@ -361,6 +359,7 @@ public:
 	void simplify(vector<unsigned> &out, float target) const;
 	void simplify_meshoptimizer(vector<unsigned> &out, float target) const;
 	void simplify_indices(float reduce_target);
+	void reverse_winding_order(unsigned npts);
 	void clear();
 	void clear_blocks() {blocks.clear(); lod_blocks.clear();}
 	unsigned num_verts() const {return unsigned(indices.empty() ? size() : indices.size());}
@@ -398,6 +397,7 @@ template<typename T> struct vntc_vect_block_t : public deque<indexed_vntc_vect_t
 	void get_polygons(get_polygon_args_t &args, unsigned npts) const;
 	void invert_tcy();
 	void simplify_indices(float reduce_target);
+	void reverse_winding_order(unsigned npts);
 	void merge_into_single_vector();
 	bool write(ostream &out) const;
 	bool read(istream &in, unsigned npts);
@@ -427,6 +427,7 @@ template<typename T> struct geometry_t {
 	void get_stats(model3d_stats_t &stats) const;
 	void calc_area(float &area, unsigned &ntris);
 	void simplify_indices(float reduce_target);
+	void reverse_winding_order();
 	bool write(ostream &out) const {return (triangles.write(out)  && quads.write(out)) ;}
 	bool read(istream &in)         {return (triangles.read(in, 3) && quads.read(in, 4));}
 	bool write_to_obj_file(ostream &out, unsigned &cur_vert_ix) const {return (triangles.write_to_obj_file(out, cur_vert_ix, 3) && quads.write_to_obj_file(out, cur_vert_ix, 4));}
@@ -462,6 +463,7 @@ public:
 	void add_work_item(int tid, bool is_nm);
 	void load_work_items_mt();
 	void bind_texture(int tid) const {get_texture(tid).bind_gl();}
+	void bind_texture_tu_or_white_tex(int tid, unsigned tu_id) const;
 	colorRGBA get_tex_avg_color(int tid) const {return get_texture(tid).get_avg_color();}
 	bool has_binary_alpha(int tid) const {return get_texture(tid).has_binary_alpha;}
 	bool might_have_alpha_comp(int tid) const {return (tid >= 0 && get_texture(tid).ncolors == 4);}
@@ -474,30 +476,25 @@ public:
 
 struct material_params_t { // Warning: changing this struct will invalidate the model3d file format
 
-	colorRGB ka, kd, ks, ke, tf;
-	float ns, ni, alpha, tr;
-	unsigned illum;
-	bool skip, is_used, no_blend, unused_field; // unused bool to pad the struct
-
-	material_params_t() : ka(WHITE), kd(WHITE), ks(BLACK), ke(BLACK), tf(WHITE), ns(1.0), ni(1.0),
-		alpha(1.0), tr(0.0), illum(2), skip(0), is_used(0), no_blend(0), unused_field(0) {}
+	colorRGB ka=WHITE, kd=WHITE, ks=BLACK, ke=BLACK, tf=WHITE;
+	float ns=1.0, ni=1.0, alpha=1.0, tr=0.0;
+	unsigned illum=2;
+	bool skip=0, is_used=0, no_blend=0, unused_field=0; // unused bool to pad the struct
 }; // must be padded
 
 
 struct material_t : public material_params_t {
 
-	bool might_have_alpha_comp, tcs_checked;
-	int a_tid, d_tid, s_tid, ns_tid, alpha_tid, bump_tid, refl_tid; // ambient, diffuse, specular, shininess, transparency, normal, reflection (unused)
-	float draw_order_score, avg_area_per_tri, tot_tri_area;
-	float metalness; // < 0 disables; should go into material_params_t, but that would invalidate the model3d file format
+	bool might_have_alpha_comp=0, tcs_checked=0, no_lod_cull=0;
+	int a_tid=-1, d_tid=-1, s_tid=-1, ns_tid=-1, alpha_tid=-1, bump_tid=-1, refl_tid=-1; // ambient, diffuse, specular, shininess, transparency, normal, reflection (unused)
+	float draw_order_score=0.0, avg_area_per_tri=0.0, tot_tri_area=0.0;
+	float metalness=-1.0; // < 0 disables; should go into material_params_t, but that would invalidate the model3d file format
 	string name, filename;
 
 	geometry_t<vert_norm_tc> geom;
 	geometry_t<vert_norm_tc_tan> geom_tan;
 
-	material_t(string const &name_=string(), string const &fn=string())
-		: might_have_alpha_comp(0), tcs_checked(0), a_tid(-1), d_tid(-1), s_tid(-1), ns_tid(-1), alpha_tid(-1), bump_tid(-1), refl_tid(-1),
-		draw_order_score(0.0), avg_area_per_tri(0.0), tot_tri_area(0.0), metalness(-1.0), name(name_), filename(fn) {}
+	material_t(string const &name_="", string const &fn="") : name(name_), filename(fn) {}
 	bool empty() const {return (geom.empty() && geom_tan.empty());}
 	mesh_bone_data_t &get_bone_data_for_last_added_tri_mesh();
 	unsigned add_triangles(vector<vert_norm_tc> const &verts, vector<unsigned> const &indices, bool add_new_block); // Note: no quads or tangents
@@ -511,8 +508,10 @@ struct material_t : public material_params_t {
 	int get_render_texture() const {return ((d_tid >= 0 || a_tid < 0) ? d_tid : a_tid);} // return diffuse texture unless ambient texture is specified but diffuse texture is not
 	bool get_needs_alpha_test  () const {return (alpha_tid >= 0 || might_have_alpha_comp);}
 	bool is_partial_transparent() const {return ((alpha < 1.0 || get_needs_alpha_test()) && !no_blend);}
+	bool has_alpha_mask        () const {return (alpha_tid >= 0 && get_render_texture() >= 0);}
 	void compute_area_per_tri();
 	void simplify_indices(float reduce_target);
+	void reverse_winding_order();
 	void ensure_textures_loaded(texture_manager &tmgr);
 	void init_textures(texture_manager &tmgr);
 	void queue_textures_to_load(texture_manager &tmgr);
@@ -532,21 +531,21 @@ struct voxel_params_t; // forward declaration
 class voxel_manager; // forward declaration
 
 class model3d {
-
 	// read/write options
 	string filename;
-	int recalc_normals, group_cobjs_level;
+	int recalc_normals=0, group_cobjs_level=0;
 
 	// geometry
 	geometry_t<vert_norm_tc> unbound_geom;
 	base_mat_t unbound_mat;
 	vector<polygon_t> split_polygons_buffer;
 	cube_t bcube, bcube_all_xf, occlusion_cube;
-	unsigned model_refl_tid, model_refl_tsize, model_refl_last_tsize, model_indir_tid;
-	int reflective; // reflective: 0=none, 1=planar, 2=cube map
-	int indoors; // 0=no/outdoors, 1=yes/indoors, 2=unknown
-	bool from_model3d_file, has_cobjs, needs_alpha_test, needs_bump_maps, has_spec_maps, has_gloss_maps, xform_zvals_set, needs_trans_pass;
-	float metalness; // should be per-material, but not part of the material file and specified per-object instead
+	unsigned model_refl_tid=0, model_refl_tsize=0, model_refl_last_tsize=0, model_indir_tid=0;
+	int reflective=0; // reflective: 0=none, 1=planar, 2=cube map
+	int indoors=2; // 0=no/outdoors, 1=yes/indoors, 2=unknown
+	bool from_model3d_file=0, has_cobjs=0, needs_alpha_test=0, needs_bump_maps=0, has_spec_maps=0, has_gloss_maps=0, xform_zvals_set=0, needs_trans_pass=0, has_alpha_mask=0;
+	float metalness=0.0; // should be per-material, but not part of the material file and specified per-object instead
+	float lod_scale=1.0;
 
 	// materials
 	deque<material_t> materials;
@@ -554,7 +553,7 @@ class model3d {
 	set<string> undef_materials; // to reduce warning messages
 	cobj_tree_tquads_t coll_tree;
 	colorRGBA cached_avg_color=ALPHA0; // used by get_and_cache_avg_color()
-	bool textures_loaded;
+	bool textures_loaded=0;
 
 	// transforms
 	vector<model3d_xform_t> transforms;
@@ -573,7 +572,7 @@ class model3d {
 	// lighting
 	string sky_lighting_fn;
 	unsigned sky_lighting_sz[3];
-	float sky_lighting_weight;
+	float sky_lighting_weight=0.0;
 	//lmap_manager_t local_lmap_manager;
 
 	// temporaries to be reused
@@ -585,11 +584,10 @@ public:
 	texture_manager &tmgr; // stores all textures
 	model_anim_t model_anim_data;
 
-	model3d(string const &filename_, texture_manager &tmgr_, int def_tid=-1, colorRGBA const &def_c=WHITE, int reflective_=0, float metalness_=0.0, int recalc_normals_=0, int group_cobjs_level_=0)
+	model3d(string const &filename_, texture_manager &tmgr_, int def_tid=-1, colorRGBA const &def_c=WHITE, int reflective_=0,
+		float metalness_=0.0, float lod_scale_=1.0, int recalc_normals_=0, int group_cobjs_level_=0)
 		: filename(filename_), recalc_normals(recalc_normals_), group_cobjs_level(group_cobjs_level_), unbound_mat(((def_tid >= 0) ? def_tid : WHITE_TEX), def_c),
-		bcube(all_zeros_cube), bcube_all_xf(all_zeros), occlusion_cube(all_zeros), model_refl_tid(0), model_refl_tsize(0), model_refl_last_tsize(0), model_indir_tid(0),
-		reflective(reflective_), indoors(2), from_model3d_file(0), has_cobjs(0), needs_alpha_test(0), needs_bump_maps(0), has_spec_maps(0), has_gloss_maps(0),
-		xform_zvals_set(0), needs_trans_pass(0), metalness(metalness_), textures_loaded(0), sky_lighting_weight(0.0), tmgr(tmgr_)
+		reflective(reflective_), metalness(metalness_), lod_scale(lod_scale_), tmgr(tmgr_)
 	{UNROLL_3X(sky_lighting_sz[i_] = 0;)}
 	~model3d() {clear();}
 	size_t num_materials() const {return materials.size();}
@@ -599,9 +597,9 @@ public:
 	// creation and query
 	bool empty              () const {return (materials.empty() && unbound_geom.empty());}
 	bool are_textures_loaded() const {return textures_loaded;}
+	string const &get_filename() const {return filename;}
 	void set_has_cobjs() {has_cobjs = 1;}
 	void add_transform(model3d_xform_t const &xf) {transforms.push_back(xf);}
-	unsigned add_triangles(vector<triangle> const &triangles, colorRGBA const &color, int mat_id=-1, unsigned obj_id=0);
 	unsigned add_polygon(polygon_t const &poly, vntc_map_t vmap[2], vntct_map_t vmap_tan[2], int mat_id=-1, unsigned obj_id=0);
 	void add_triangle(polygon_t const &tri, vntc_map_t &vmap, int mat_id=-1, unsigned obj_id=0);
 	void get_polygons(vector<coll_tquad> &polygons, bool quads_only=0, bool apply_transforms=0, unsigned lod_level=0) const;
@@ -623,9 +621,10 @@ public:
 	void bind_all_used_tids();
 	void calc_tangent_vectors();
 	void simplify_indices(float reduce_target);
-	static void bind_default_flat_normal_map() {select_multitex(FLAT_NMAP_TEX, 5);}
+	void reverse_winding_order(uint64_t mats_mask=~uint64_t(0));
 	void set_sky_lighting_file(string const &fn, float weight, unsigned sz[3]);
 	void set_occlusion_cube(cube_t const &cube) {occlusion_cube = cube;}
+	void fit_to_scene();
 	void set_target_translate_scale(point const &target_pos, float target_radius, geom_xform_t &xf) const;
 	void render_materials_def(shader_t &shader, bool is_shadow_pass, int reflection_pass, bool is_z_prepass, int enable_alpha_mask,
 		unsigned bmap_pass_mask, int trans_op_mask, point const *const xlate, xform_matrix const *const mvm=nullptr)
@@ -634,7 +633,7 @@ public:
 	}
 	void render_materials(shader_t &shader, bool is_shadow_pass, int reflection_pass, bool is_z_prepass, int enable_alpha_mask, unsigned bmap_pass_mask,
 		int trans_op_mask, base_mat_t const &unbound_mat, rotation_t const &rot, point const *const xlate=nullptr, xform_matrix const *const mvm=nullptr,
-		bool force_lod=0, float model_lod_mult=1.0, float fixed_lod_dist=0.0, bool skip_cull_face=0, bool is_scaled=0, bool no_set_min_alpha=0);
+		bool force_lod=0, float model_lod_mult=1.0, float fixed_lod_dist=0.0, bool skip_cull_face=0, bool is_scaled=0, bool no_set_min_alpha=0, unsigned skip_mat_mask=0);
 	void render_material(shader_t &shader, unsigned mat_id, bool is_shadow_pass, bool is_z_prepass=0, int enable_alpha_mask=0, bool is_bmap_pass=0,
 		point const *const xlate=nullptr, bool no_set_min_alpha=0);
 	void render_with_xform(shader_t &shader, model3d_xform_t &xf, xform_matrix const &mvm, bool is_shadow_pass,
@@ -658,6 +657,7 @@ public:
 	bool check_coll_line(point const &p1, point const &p2, point &cpos, vector3d &cnorm, colorRGBA &color, bool exact, bool build_bvh_if_needed=0);
 	bool get_needs_alpha_test() const {return needs_alpha_test;}
 	bool get_needs_trans_pass() const {return needs_trans_pass;}
+	bool get_has_alpha_mask  () const {return has_alpha_mask;}
 	bool get_needs_bump_maps () const {return needs_bump_maps;}
 	bool uses_spec_map()        const {return has_spec_maps;}
 	bool uses_gloss_map()       const {return has_gloss_maps;}
@@ -679,16 +679,19 @@ public:
 	unsigned num_animations() const {return model_anim_data.animations.size();}
 	bool has_animations    () const {return (num_animations() > 0);}
 	void setup_bone_transforms(shader_t &shader, float anim_time, int anim_id=-1);
+	void setup_bone_transforms_cached(bone_transform_data_t &cached, shader_t &shader, float anim_time, int anim_id=-1);
 	void setup_bone_transforms_blended(shader_t &shader, float anim_time1, float anim_time2, float blend_factor, int anim_id1=-1, int anim_id2=-1);
+	bool check_anim_wrapped(unsigned anim_id, float old_time, float new_time) const;
+	float get_anim_duration(unsigned anim_id) const;
 	void merge_animation_from(model3d const &anim_model) {model_anim_data.merge_from(anim_model.model_anim_data);}
 protected:
 	unsigned get_anim_id(shader_t &shader, string const &prop_name, int anim_id=-1) const;
-	void add_bone_transforms_to_shader(shader_t &shader) const;
+	void add_bone_transforms_to_shader(shader_t &shader, vector<xform_matrix> const &bone_transforms) const;
+	void add_bone_transforms_to_shader(shader_t &shader) const {add_bone_transforms_to_shader(shader, model_anim_data.bone_transforms);}
 };
 
 
 struct model3ds : public deque<model3d> {
-
 	texture_manager tmgr;
 
 	void clear();
@@ -708,7 +711,6 @@ struct model3ds : public deque<model3d> {
 
 
 class model_from_file_t {
-
 	string rel_path;
 protected:
 	model3d &model;
@@ -720,7 +722,6 @@ public:
 	int get_texture(string const &fn, bool is_alpha_mask, bool verbose, bool invert_alpha=0, bool wrap=1, bool mirror=0, bool force_grayscale=0);
 	void check_and_bind(int &tid, string const &tfn, bool is_alpha_mask, bool verbose, bool invert_alpha=0, bool wrap=1, bool mirror=0);
 };
-
 
 template<typename T> bool split_polygon(polygon_t const &poly, vector<T> &ppts, float coplanar_thresh, bool allow_quads=1);
 
@@ -737,6 +738,7 @@ void get_cur_model_as_cubes(vector<cube_t> &cubes, model3d_xform_t const &xf);
 bool add_transform_for_cur_model(model3d_xform_t const &xf);
 void set_sky_lighting_file_for_cur_model(string const &fn, float weight, unsigned sz[3]);
 void set_occlusion_cube_for_cur_model(cube_t const &cube);
+void fit_cur_model_to_scene();
 bool have_cur_model();
 cube_t calc_and_return_all_models_bcube(bool only_reflective=0);
 void get_all_model_bcubes(vector<cube_t> &bcubes);
@@ -744,8 +746,8 @@ void write_models_to_cobj_file(std::ostream &out);
 void adjust_zval_for_model_coll(point &pos, float radius, float mesh_zval, float step_height=0.0);
 void check_legal_movement_using_model_coll(point const &prev, point &cur, float radius=0.0);
 
-bool load_model_file(string const &filename, model3ds &models, geom_xform_t const &xf, string const &anim_name, int def_tid,
-	colorRGBA const &def_c, int reflective, float metalness, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose);
+bool load_model_file(string const &filename, model3ds &models, geom_xform_t const &xf, string const &anim_name, int def_tid, colorRGBA const &def_c,
+	int reflective, float metalness, float lod_scale, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose, uint64_t rev_winding_mask=0);
 bool read_model_file(string const &filename, vector<coll_tquad> *ppts, geom_xform_t const &xf, int def_tid, colorRGBA const &def_c,
-	int reflective, float metalness, bool load_model_file, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose);
+	int reflective, float metalness, float lod_scale, bool load_model_file, int recalc_normals, int group_cobjs_level, bool write_file, bool verbose);
 

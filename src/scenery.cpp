@@ -413,33 +413,19 @@ void surface_rock::draw(float sscale, bool shadow_only, bool reflection_pass,
 		tree_scenery_pld.add_textured_pt(pos+xlate, color, ROCK_SPHERE_TEX);
 		return;
 	}
+	// Note: rock size scales with distance so that it shrinks to zero area rather than popping in and out;
+	// this means that we can't store the final points in the VBO vertex data and must apply a transform here
 	color.set_for_cur_shader();
 	fgPushMatrix();
 	translate_to(pos);
 	uniform_scale(scale*get_size_scale(dist, scale_val));
 	rotate_into_plus_z(dir);
 	assert(vbo_mgr_ix >= 0);
-	vbo_manager.render_range(vbo_mgr_ix, vbo_mgr_ix+1);
+	vbo_manager.render_single(vbo_mgr_ix);
 	fgPopMatrix();
 }
 
-void surface_rock::update_points_vbo(vbo_vnt_block_manager_t &vbo_manager) {
-
-	assert(vbo_mgr_ix >= 0);
-	vector<vert_norm_tc> points;
-	surface->sd.get_quad_points(points);
-	vbo_manager.update_range(points, WHITE, vbo_mgr_ix, vbo_mgr_ix+1); // color is unused
-}
-
-bool surface_rock::update_zvals(int x1, int y1, int x2, int y2, vbo_vnt_block_manager_t &vbo_manager) {
-
-	if (!scenery_obj::update_zvals(x1, y1, x2, y2)) return 0;
-	if (vbo_mgr_ix >= 0) {update_points_vbo(vbo_manager);}
-	return 1;
-}
-
 void surface_rock::destroy() {
-
 	if (surface) {surface->dec_ref();}
 	vbo_mgr_ix = -1;
 	surface    = NULL;
@@ -645,14 +631,16 @@ void s_log::draw(float sscale, bool shadow_only, bool reflection_pass, vector3d 
 	}
 	color.set_for_cur_shader();
 	int const ndiv(max(3, min(N_CYL_SIDES, (shadow_only ? get_def_smap_ndiv(2.0*radius) : int(2.0*sscale*radius/dist)))));
+	if (!shadow_only) {select_texture(get_tid());}
+	draw_fast_cylinder(pos, pt2, radius, radius2, ndiv, 1);
+	if (!shadow_only && dist > 0.75*get_pt_line_thresh()*radius) return; // skip end drawing
+	// draw the end visible to the camera
 	fgPushMatrix();
 	translate_to(pos);
 	rotate_by_vector(dir);
 	if (!shadow_only) {select_texture(TREE_END_TEX);}
 	if (dot_product_ptv(dir, get_camera_pos(), center) > 0.0) {draw_circle_normal(0.0, radius,  ndiv, 1, 0.0);}
 	else                                                      {draw_circle_normal(0.0, radius2, ndiv, 0, length);}
-	if (!shadow_only) {select_texture(get_tid());}
-	draw_cylin_fast(radius, radius2, length, ndiv, 1);
 	fgPopMatrix();
 }
 
@@ -708,8 +696,9 @@ void s_stump::draw(float sscale, bool shadow_only, bool reflection_pass, vector3
 	}
 	color.set_for_cur_shader();
 	int const ndiv(max(3, min(N_CYL_SIDES, (shadow_only ? get_def_smap_ndiv(2.2*radius) : int(2.2*sscale*radius/dist)))));
+	vector3d const camera_delta(get_camera_pos() - pos);
 
-	if (get_camera_pos().z > pos.z + height) { // only draw top if visible
+	if (camera_delta.z > height && camera_delta.z > 0.1*(abs(camera_delta.x) + abs(camera_delta.y))) { // only draw top if visible and not too shallow of an angle
 		if (!shadow_only) {select_texture(TREE_END_TEX);}
 		draw_circle_normal(0.0, radius2, ndiv, 0, pos+vector3d(0.0, 0.0, height));
 	}
@@ -742,7 +731,7 @@ colorRGBA plant_base::get_plant_color(vector3d const &xlate) const {
 }
 
 
-int s_plant::create(int x, int y, int use_xy, float minz, vbo_vnc_block_manager_t &vbo_manager, vector<vert_norm_comp> &pts) {
+int s_plant::create(int x, int y, int use_xy, float minz) {
 
 	vbo_mgr_ix = -1;
 	int const ret(plant_base::create(x, y, use_xy, minz));
@@ -751,13 +740,11 @@ int s_plant::create(int x, int y, int use_xy, float minz, vbo_vnc_block_manager_
 	else          {type = rand2() % NUM_LAND_PLANT_TYPES;} // land plant
 	radius = rand_uniform2(0.0025, 0.0045)/tree_scale;
 	height = rand_uniform2(0.2, 0.4)/tree_scale + 0.025;
-	gen_points(vbo_manager, pts);
 	return 1;
 }
 
-void s_plant::create2(point const &pos_, float height_, float radius_, int type_, int calc_z, vbo_vnc_block_manager_t &vbo_manager, vector<vert_norm_comp> &pts) {
+void s_plant::create2(point const &pos_, float height_, float radius_, int type_, int calc_z) {
 	create_no_verts(pos_, height_, radius_, type_, calc_z);
-	gen_points(vbo_manager, pts);
 }
 
 void s_plant::create_no_verts(point const &pos_, float height_, float radius_, int type_, int calc_z, bool land_plants_only) {
@@ -908,6 +895,12 @@ void s_plant::shader_state_t::set_wind_add(shader_t &s, float w_add) {
 	s.set_uniform_float(wind_add_loc, w_add);
 }
 
+void texture_binder_t::do_bind(int tid) {
+	if (tid == cur_tid) return; // already bound
+	select_texture(tid);
+	cur_tid = tid;
+}
+
 void s_plant::draw_leaves(shader_t &s, vbo_vnc_block_manager_t &vbo_manager, bool shadow_only, bool reflection_pass, vector3d const &xlate, shader_state_t &state) const {
 
 	if (burn_amt == 1.0) return;
@@ -918,16 +911,16 @@ void s_plant::draw_leaves(shader_t &s, vbo_vnc_block_manager_t &vbo_manager, boo
 	float const wind_scale(berries.empty() ? (is_water_plant() ? 5.0 : 1.0) : 0.0); // no wind if this plant type has berries
 	bool const set_color(!shadow_only && (is_water_plant() || burn_amt > 0.0));
 	if (set_color) {state.set_color_scale(s, get_plant_color(xlate));}
-	if (shadowed) {state.set_normal_scale(s, 0.0);}
+	if (shadowed ) {state.set_normal_scale(s, 0.0);}
 	state.set_wind_scale(s, wind_scale);
-	select_texture((draw_model == 0) ? get_leaf_tid() : WHITE_TEX); // could pre-bind textures and select using shader int, but probably won't improve performance
+	state.texture_binder.do_bind((draw_model == 0) ? get_leaf_tid() : WHITE_TEX);
 	assert(vbo_mgr_ix >= 0);
-	vbo_manager.render_range(vbo_mgr_ix, vbo_mgr_ix+1);
+	vbo_manager.render_single(vbo_mgr_ix);
 	if (set_color) {state.set_color_scale(s, WHITE);}
-	if (shadowed) {state.set_normal_scale(s, 1.0);}
+	if (shadowed ) {state.set_normal_scale(s, 1.0);}
 }
 
-void s_plant::draw_berries(shader_t &s, vector3d const &xlate) const {
+void s_plant::draw_berries(shader_t &s, vector3d const &xlate) const { // drawn using instancing
 
 	if (berries.empty() || burn_amt > 0.5) return;
 	point const pos2(pos + xlate + point(0.0, 0.0, 0.5*height));
@@ -1046,19 +1039,19 @@ int leafy_plant::get_tid() const {
 	return tids[type];
 }
 
-void leafy_plant::draw_leaves(shader_t &s, bool shadow_only, bool reflection_pass, vector3d const &xlate, s_plant::shader_state_t &state, vbo_vnt_block_manager_t &vbo_manager) const {
+void leafy_plant::draw_leaves(shader_t &s, bool shadow_only, bool reflection_pass, vector3d const &xlate, shader_state_t &state, vbo_vnt_block_manager_t &vbo_manager) const {
 	
 	if (burn_amt == 1.0) return;
 	if (!is_visible(shadow_only, radius, xlate))  return;
 	if (reflection_pass && pos.z < water_plane_z) return;
 	(shadow_only ? WHITE : get_plant_color(xlate)).set_for_cur_shader(); // no underwater case yet
 	bool const is_underwater(pos.z < water_plane_z);
-	select_texture(get_tid());
+	state.texture_binder.do_bind(get_tid());
 	assert(vbo_mgr_ix >= 0);
 	if (delta_z != 0.0) {fgPushMatrix(); fgTranslate(0, 0, delta_z);} // not the cleanest or most efficient solution, but much simpler than updating the VBO data
 	if (motion_amt > 0.0) {state.set_wind_add(s, 0.005*motion_amt);}
 	if (is_underwater) {state.set_wind_scale(s, 5.0*LEAFY_PLANT_WIND);}
-	vbo_manager.render_range(vbo_mgr_ix, vbo_mgr_ix+1);
+	vbo_manager.render_single(vbo_mgr_ix);
 	if (motion_amt > 0.0) {state.set_wind_add(s, 0.0);} // restore orig value
 	if (is_underwater) {state.set_wind_scale(s, LEAFY_PLANT_WIND);}
 	if (delta_z != 0.0) {fgPopMatrix();}
@@ -1226,7 +1219,7 @@ bool scenery_group::update_zvals(int x1, int y1, int x2, int y2) { // inefficien
 	update_scenery_zvals_vector(stumps,        x1, y1, x2, y2, updated);
 	update_scenery_zvals_vector(plants,        x1, y1, x2, y2, updated, plant_vbo_manager);
 	update_scenery_zvals_vector(leafy_plants,  x1, y1, x2, y2, updated, leafy_vbo_manager);
-	update_scenery_zvals_vector(surface_rocks, x1, y1, x2, y2, updated, rock_vbo_manager);
+	update_scenery_zvals_vector(surface_rocks, x1, y1, x2, y2, updated); // rock_vbo_manager not updated (pos is applied to the MVM), so not passed into the call
 	return updated;
 }
 
@@ -1240,7 +1233,7 @@ void scenery_group::do_rock_damage(point const &pos, float radius, float damage)
 void scenery_group::add_plant(point const &pos, float height, float radius, int type, int calc_z) {
 	assert(height > 0.0 && radius > 0.0);
 	plants.push_back(s_plant());
-	plants.back().create2(pos, height, radius, type, calc_z, plant_vbo_manager, temp_pts);
+	plants.back().create2(pos, height, radius, type, calc_z);
 }
 void scenery_group::add_leafy_plant(point const &pos, float radius, int type, int calc_z) {
 	assert(radius > 0.0);
@@ -1278,7 +1271,7 @@ void scenery_group::gen(int x1, int y1, int x2, int y2, float vegetation_, bool 
 			}
 			else if (veg && rand2()%100 < 35) { // Note: numbers below were based on 30% plants but we now have 35% plants
 				s_plant plant; // 35%
-				if (plant.create(j, i, 1, min_plant_z, plant_vbo_manager, temp_pts)) {
+				if (plant.create(j, i, 1, min_plant_z)) {
 					if (!check_valid_scenery_pos(plant)) continue;
 					plants.push_back(plant);
 					plant.add_bounds_to_bcube(all_bcube);
@@ -1337,6 +1330,7 @@ void scenery_group::post_gen_setup(tree_cont_t const &trees) {
 		leafy_vbo_manager.clear();
 		add_sphere_quads(sphere_verts, nullptr, all_zeros, 1.0, 16, use_tri_strip,  0.5, 1.0, 0.125, 1.0); // only emit the textured top part of the sphere + the 'stem'
 		if (use_tri_strip) {leafy_vbo_manager.set_prim_type(GL_TRIANGLE_STRIP);}
+		sort(plants.begin(), plants.end()); // sort by type, before creating VBO data
 		unsigned num_lp_leaves(0);
 		for (auto const &p : leafy_plants) {num_lp_leaves += p.num_leaves();}
 		leafy_vbo_manager.reserve_pts(num_lp_leaves*sphere_verts.size());
@@ -1348,7 +1342,8 @@ void scenery_group::post_gen_setup(tree_cont_t const &trees) {
 		rock_vbo_manager.reserve_pts(tot_num_verts);
 		for (auto &r : surface_rocks) {r.gen_points(rock_vbo_manager);}
 	}
-	sort(plants.begin(), plants.end()); // sort by type
+	sort(plants.begin(), plants.end()); // sort by type, before creating VBO data
+	for (s_plant &plant : plants) {plant.gen_points(plant_vbo_manager, temp_pts);}
 	if (!voxel_rocks.empty()) {voxel_rock_manager.build_models(VOX_ROCK_NUM_LOD);}
 		
 	for (auto &r : voxel_rocks) {
@@ -1366,7 +1361,7 @@ void scenery_group::draw_plant_leaves(shader_t &s, bool shadow_only, vector3d co
 	bool const do_update(!shadow_only && !reflection_pass && world_mode == WMODE_GROUND);
 	s.set_specular(0.25, 20.0); // a small amount of specular
 	s.add_uniform_float("wind_zscale", 2.0);
-	s_plant::shader_state_t state;
+	plant_base::shader_state_t state;
 
 	if (!plants.empty()) {
 		plant_vbo_manager.upload();
@@ -1412,7 +1407,12 @@ void scenery_group::draw_opaque_objects(shader_t &s, shader_t &vrs, bool shadow_
 		surface_rocks[i].draw(sscale, shadow_only, reflection_pass, xlate, scale_val, rock_vbo_manager);
 	}
 	rock_vbo_manager.end_render();
-	draw_scenery_vector(rocks, sscale, shadow_only, reflection_pass, xlate, scale_val);
+
+	if (!rocks.empty()) {
+		begin_sphere_draw(1); // textured=1
+		draw_scenery_vector(rocks, sscale, shadow_only, reflection_pass, xlate, scale_val);
+		end_sphere_draw();
+	}
 	draw_scenery_vector(logs,   sscale, shadow_only, reflection_pass, xlate, scale_val);
 	draw_scenery_vector(stumps, sscale, shadow_only, reflection_pass, xlate, scale_val);
 	if (!shadow_only) {select_texture(WOOD_TEX);} // plant stems use wood texture
@@ -1421,7 +1421,9 @@ void scenery_group::draw_opaque_objects(shader_t &s, shader_t &vrs, bool shadow_
 	if (!shadow_only && !plants.empty()) { // no berry shadows
 		select_texture(WHITE_TEX); // berries are untextured
 		s.set_specular(0.9, 80.0);
+		begin_sphere_draw(0); // textured=0
 		for (unsigned i = 0; i < plants.size(); ++i) {plants[i].draw_berries(s, xlate);}
+		end_sphere_draw();
 		s.clear_specular();
 	}
 	if (draw_pld) {tree_scenery_pld.draw_and_clear();}
@@ -1438,9 +1440,10 @@ void scenery_group::draw_opaque_objects(shader_t &s, shader_t &vrs, bool shadow_
 
 bool scenery_group::setup_voxel_rocks_shader(shader_t &vrs, bool shadow_only) const {
 
-	if (voxel_rocks.empty() || shadow_only)  return 0; // setup not needed
+	if (voxel_rocks.empty() || shadow_only) {return 0;} // setup not needed
 	if (vrs.is_setup()) {vrs.make_current(); return 1;} // already setup
-	bool const v(world_mode == WMODE_GROUND), use_noise_tex(0), use_bmap(0), use_smap(v); // FIXME: no TT shadow maps, fog not setup (not needed?)
+	// Note: no TT shadow maps (probably too slow for TT anyway), fog not setup (not needed?)
+	bool const v(world_mode == WMODE_GROUND), use_noise_tex(0), use_bmap(0), use_smap(v);
 	setup_procedural_shaders(vrs, 0.0, v, v, use_smap, use_bmap, use_noise_tex,
 		global_voxel_params.top_tex_used, global_voxel_params.tex_scale, global_voxel_params.noise_scale, global_voxel_params.tex_mix_saturate);
 	vrs.set_cur_color(WHITE);

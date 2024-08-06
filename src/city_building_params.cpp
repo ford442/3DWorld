@@ -13,8 +13,12 @@ bool parse_buildings_option(FILE *fp) {return global_building_params.parse_build
 string const model_opt_names[NUM_OBJ_MODELS] =
 {"toilet_model", "sink_model", "tub_model", "fridge_model", "stove_model", "tv_model", ""/*monitor*/, "couch_model", "office_chair_model", "urinal_model",
 "lamp_model", "washer_model", "dryer_model", "key_model", "hanger_model", "clothing_model", "fire_escape_model", "wall_lamp_model", "cup_model", "toaster_model",
-"hood_model", "rocking_chair_model", "silverware_model", "toy_model", "ceiling_fan_model", "rat_model",
-/*city models*/ "fire_hydrant_model", "substation_model", "mailbox_model", "umbrella_model"};
+"hood_model", "rocking_chair_model", "silverware_model", "toy_model", "ceiling_fan_model", "fire_ext_model", "folded_shirt_model", "plant_model", "pool_table_model",
+"pool_ladder_model", "bar_stool_model", "padlock_model", "cash_register_model", "water_fountain_model", "banana_model", "banana_peel_model",
+/*animal models*/ "rat_model", "roach_model",
+/*building non-room objects*/ "door_handle_model",
+/*city models*/ "fire_hydrant_model", "substation_model", "mailbox_model", "umbrella_model", "pigeon_model", "fountain_model", "bird_animated_model", "flag_model",
+"bicycle_model", "swingset_model", "trampoline_model", "dumpster_model", "big_umbrella_model", "flower_model"};
 
 void city_params_t::init_kw_maps() {
 	kwmu.add("num_cities",     num_cities);
@@ -33,9 +37,11 @@ void city_params_t::init_kw_maps() {
 	kwmr.add("road_spacing_rand",   road_spacing_rand,   FP_CHECK_NONNEG);
 	kwmr.add("road_spacing_xy_add", road_spacing_xy_add, FP_CHECK_NONNEG);
 	kwmr.add("conn_road_seg_len",   conn_road_seg_len,   FP_CHECK_POS);
-	kwmr.add("max_road_slope",  max_road_slope,  FP_CHECK_POS);
-	kwmr.add("max_track_slope", max_track_slope, FP_CHECK_POS);
+	kwmr.add("max_road_slope",   max_road_slope,   FP_CHECK_POS);
+	kwmr.add("max_track_slope",  max_track_slope,  FP_CHECK_POS);
+	kwmr.add("model_anim_scale", model_anim_scale, FP_CHECK_POS);
 	kwmr.add("residential_probability", residential_probability, FP_CHECK_01);
+	kwmb.add("add_skyways", add_skyways);
 	// cars
 	kwmu.add("num_cars", num_cars);
 	kwmb.add("enable_car_path_finding", enable_car_path_finding);
@@ -135,7 +141,7 @@ void buildings_file_err(string const &str, int &error) {
 	error = 1;
 }
 
-int building_params_t::read_building_texture(FILE *fp, string const &str, bool is_normal_map, int &error, bool check_filename) {
+int building_params_t::read_building_texture(FILE *fp, string const &str, bool is_normal_map, int &error, bool check_filename, bool *no_cracks) {
 	char strc[MAX_CHARS] = {0};
 	if (!read_str(fp, strc)) {buildings_file_err(str, error);}
 
@@ -143,7 +149,9 @@ int building_params_t::read_building_texture(FILE *fp, string const &str, bool i
 		std::cerr << "Warning: Skipping texture '" << strc << "' that can't be loaded" << endl;
 		return -1; // texture filename doesn't exist
 	}
-	int const ret(get_texture_by_name(std::string(strc), is_normal_map, tex_inv_y, get_wrap_mir()));
+	string const name(strc);
+	int const ret(get_texture_by_name(name, is_normal_map, tex_inv_y, get_wrap_mir()));
+	if (no_cracks != nullptr) {*no_cracks = (ret >= 0 && name.find("carpet") != string::npos);} // carpet floor textures have no cracks
 	//cout << "texture filename: " << str << ", ID: " << ret << endl;
 	return ret;
 }
@@ -169,7 +177,9 @@ void building_params_t::init_kw_maps() {
 	kwmu.add("rand_seed", buildings_rand_seed);
 	kwmu.add("max_shadow_maps", max_shadow_maps);
 	kwmu.add("max_ext_basement_hall_branches", max_ext_basement_hall_branches);
-	kwmu.add("max_ext_basement_room_depth", max_ext_basement_room_depth);
+	kwmu.add("max_ext_basement_room_depth",    max_ext_basement_room_depth);
+	kwmu.add("max_room_geom_gen_per_frame",    max_room_geom_gen_per_frame);
+	kwmb.add("add_office_backroom_basements",  add_office_br_basements);
 	kwmf.add("ao_factor", ao_factor);
 	kwmf.add("sec_extra_spacing", sec_extra_spacing);
 	kwmf.add("player_coll_radius_scale", player_coll_radius_scale);
@@ -179,7 +189,11 @@ void building_params_t::init_kw_maps() {
 	kwmb.add("tt_only", tt_only);
 	kwmb.add("infinite_buildings", infinite_buildings);
 	kwmb.add("add_secondary_buildings", add_secondary_buildings);
-	kwmb.add("add_office_basements", add_office_basements);
+	kwmb.add("cities_all_bldg_mats",    cities_all_bldg_mats);
+	kwmb.add("small_city_buildings",    small_city_buildings);
+	kwmb.add("add_office_basements",    add_office_basements);
+	kwmb.add("put_doors_in_corners",    put_doors_in_corners);
+	kwmr.add("two_floor_retail_prob",   two_floor_retail_prob, FP_CHECK_01);
 	kwmr.add("split_prob", cur_mat.split_prob, FP_CHECK_01);
 	kwmr.add("cube_prob",  cur_mat.cube_prob,  FP_CHECK_01);
 	kwmr.add("round_prob", cur_mat.round_prob, FP_CHECK_01);
@@ -206,10 +220,12 @@ void building_params_t::init_kw_maps() {
 	kwmf.add("min_altitude",  cur_mat.min_alt);
 	kwmf.add("max_altitude",  cur_mat.max_alt);
 	kwmf.add("max_rot_angle", cur_mat.max_rot_angle);
-	kwmb.add("dome_roof",  dome_roof);
-	kwmb.add("onion_roof", onion_roof);
-	kwmb.add("no_city",    cur_mat.no_city);
-	kwmr.add("house_prob", cur_mat.house_prob, FP_CHECK_01);
+	kwmb.add("dome_roof",   dome_roof);
+	kwmb.add("onion_roof",  onion_roof);
+	kwmb.add("no_city",     cur_mat.no_city);
+	kwmb.add("no_walkways", cur_mat.no_walkways);
+	kwmr.add("house_prob",  cur_mat.house_prob, FP_CHECK_01);
+	kwmr.add("apartment_prob", cur_mat.apartment_prob, FP_CHECK_01);
 	// material textures / colors
 	kwmb.add("texture_mirror", tex_mirror);
 	kwmb.add("texture_inv_y",  tex_inv_y);
@@ -252,6 +268,8 @@ void building_params_t::init_kw_maps() {
 	kwmu.add("people_per_house_max",  people_per_house_max);
 	kwmf.add("ai_retreat_time",       ai_retreat_time);
 	kwmr.add("people_min_alpha",      people_min_alpha, FP_CHECK_01);
+	kwmu.add("player_model_ix",       player_model_ix);
+	kwmb.add("show_player_model",     show_player_model);
 	// AI elevators
 	kwmb.add("allow_elevator_line",         allow_elevator_line);
 	kwmb.add("no_coll_enter_exit_elevator", no_coll_enter_exit_elevator);
@@ -291,13 +309,19 @@ void building_params_t::init_kw_maps() {
 	kwmr.add("basement_prob_house",  basement_prob_house,  FP_CHECK_01);
 	kwmr.add("basement_prob_office", basement_prob_office, FP_CHECK_01);
 	kwmr.add("ball_prob",            ball_prob,            FP_CHECK_01);
+	kwmr.add("split_stack_floorplan_prob", split_stack_floorplan_prob, FP_CHECK_01);
+	kwmr.add("retail_floorplan_prob",      retail_floorplan_prob,      FP_CHECK_01);
 	kwmf.add("player_weight_limit",  player_weight_limit);
+	// building water
+	kwmr.add("basement_water_level_min", basement_water_level_min); // negative is allowed for no water
+	kwmr.add("basement_water_level_max", basement_water_level_max, FP_CHECK_NONNEG); // > 1.0 is allowed for more than one floor of water
 	// special commands
 	kwmu.add("probability",              cur_prob); // for building materials
 	kwmb.add("add_city_interiors",       add_city_interiors);
 	kwmb.add("gen_building_interiors",   gen_building_interiors);
 	kwmb.add("enable_rotated_room_geom", enable_rotated_room_geom);
 }
+
 bool building_params_t::parse_buildings_option(FILE *fp) {
 
 	char strc[MAX_CHARS] = {0};
@@ -356,15 +380,15 @@ bool building_params_t::parse_buildings_option(FILE *fp) {
 	// interiors
 	else if (str == "wall_tid"    ) {cur_mat.wall_tex.tid     = read_building_texture(fp, str, 0, read_error);}
 	else if (str == "wall_nm_tid" ) {cur_mat.wall_tex.nm_tid  = read_building_texture(fp, str, 1, read_error);}
-	else if (str == "floor_tid"   ) {cur_mat.floor_tex.tid    = read_building_texture(fp, str, 0, read_error);}
+	else if (str == "floor_tid"   ) {cur_mat.floor_tex.tid    = read_building_texture(fp, str, 0, read_error, 0, &cur_mat.floor_tex.no_cracks);}
 	else if (str == "floor_nm_tid") {cur_mat.floor_tex.nm_tid = read_building_texture(fp, str, 1, read_error);}
 	else if (str == "ceil_tid"    ) {cur_mat.ceil_tex.tid     = read_building_texture(fp, str, 0, read_error);}
 	else if (str == "ceil_nm_tid" ) {cur_mat.ceil_tex.nm_tid  = read_building_texture(fp, str, 1, read_error);}
-	else if (str == "house_floor_tid"   ) {cur_mat.house_floor_tex.tid    = read_building_texture(fp, str, 0, read_error);}
+	else if (str == "house_floor_tid"   ) {cur_mat.house_floor_tex.tid    = read_building_texture(fp, str, 0, read_error, 0, &cur_mat.house_floor_tex.no_cracks);}
 	else if (str == "house_floor_nm_tid") {cur_mat.house_floor_tex.nm_tid = read_building_texture(fp, str, 1, read_error);}
 	else if (str == "house_ceil_tid"    ) {cur_mat.house_ceil_tex.tid     = read_building_texture(fp, str, 0, read_error);}
 	else if (str == "house_ceil_nm_tid" ) {cur_mat.house_ceil_tex.nm_tid  = read_building_texture(fp, str, 1, read_error);}
-	else if (str == "basement_floor_tid"   ) {cur_mat.basement_floor_tex.tid    = read_building_texture(fp, str, 0, read_error);}
+	else if (str == "basement_floor_tid") {cur_mat.basement_floor_tex.tid = read_building_texture(fp, str, 0, read_error, 0, &cur_mat.basement_floor_tex.no_cracks);}
 	else if (str == "basement_floor_nm_tid") {cur_mat.basement_floor_tex.nm_tid = read_building_texture(fp, str, 1, read_error);}
 	// specular
 	else if (str == "side_specular" ) {read_building_mat_specular(fp, str, cur_mat.side_tex,  read_error);}
@@ -380,6 +404,13 @@ bool building_params_t::parse_buildings_option(FILE *fp) {
 	else if (str == "add_desktop_texture") {read_texture_and_add_if_valid(fp, str, read_error, desktop_tids);}
 	else if (str == "add_sheet_texture"  ) {read_texture_and_add_if_valid(fp, str, read_error, sheet_tids  );}
 	else if (str == "add_paper_texture"  ) {read_texture_and_add_if_valid(fp, str, read_error, paper_tids  );}
+	else if (str == "add_flag_texture"   ) {read_texture_and_add_if_valid(fp, str, read_error, flag_tids   );} // not a room object, but fits with this loading system
+	else if (str == "add_food_box_texture") {
+		read_texture_and_add_if_valid(fp, str, read_error, food_box_tids);
+		string const food_name(read_quoted_string(fp));
+		if (food_name.empty()) {buildings_file_err(str, read_error);}
+		food_box_names.push_back(food_name);
+	}
 	// special commands
 	else if (str == "add_material") {add_cur_mat();}
 	else {
@@ -389,19 +420,25 @@ bool building_params_t::parse_buildings_option(FILE *fp) {
 	return !read_error;
 }
 
-
 void building_params_t::add_cur_mat() {
 	unsigned const mat_ix(materials.size());
 
 	for (unsigned n = 0; n < cur_prob; ++n) { // add more references to this mat for higher probability
 		mat_gen_ix.push_back(mat_ix);
-		(cur_mat.no_city ? mat_gen_ix_nocity : mat_gen_ix_city).push_back(mat_ix);
+		if (cities_all_bldg_mats || ((!cur_mat.no_city) ^ small_city_buildings)) {mat_gen_ix_city.push_back(mat_ix);}
+		if (cur_mat.no_city) {mat_gen_ix_nocity.push_back(mat_ix);}
 		if (cur_mat.house_prob > 0.0) {mat_gen_ix_res.push_back(mat_ix);}
 	}
 	materials.push_back(cur_mat);
 	materials.back().finalize();
 	materials.back().update_range(range_translate);
 	has_normal_map |= cur_mat.has_normal_map();
+}
+vector<unsigned> const &building_params_t::get_mat_list(bool city_only, bool non_city_only, bool residential) const {
+	if (residential  ) return mat_gen_ix_res;
+	if (city_only    ) return mat_gen_ix_city;
+	if (non_city_only) return mat_gen_ix_nocity;
+	return mat_gen_ix; // all materials
 }
 unsigned building_params_t::choose_rand_mat(rand_gen_t &rgen, bool city_only, bool non_city_only, bool residential) const {
 	vector<unsigned> const &mat_ix_list(get_mat_list(city_only, non_city_only, residential));
@@ -461,7 +498,7 @@ void building_mat_t::finalize() { // compute and cache spacing values
 	float tx(get_window_tx()), ty(get_window_ty());
 	if (global_building_params.max_fp_wind_yscale > 0.0) {min_eq(ty, global_building_params.max_fp_wind_yscale*global_building_params.get_window_ty());}
 	if (global_building_params.max_fp_wind_xscale > 0.0) {min_eq(tx, global_building_params.max_fp_wind_xscale*global_building_params.get_window_tx());}
-	floor_spacing = 1.0/(2.0*ty);
-	floorplan_wind_xscale = 2.0f*tx;
+	floor_spacing         = 1.0/(2.0*ty);
+	floorplan_wind_xscale = 2.0*tx;
 }
 

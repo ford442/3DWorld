@@ -13,19 +13,31 @@
 #include <glm/gtc/matrix_inverse.hpp>
 
 
+unsigned const NUM_CSM_CASCADES = 4; // must agree with the values in csm_layers.geom
+unsigned const MAT4x4_SIZE      = sizeof(glm::mat4);
+
 // texture storage datatypes for local shadow maps
+#if 1 // integer
 //int const SHADOW_MAP_DATATYPE = GL_UNSIGNED_BYTE; // 8-bit shadow maps
 int const SHADOW_MAP_DATATYPE = GL_UNSIGNED_SHORT; // 16-bit shadow maps
 //int const SHADOW_MAP_DATATYPE = GL_UNSIGNED_INT; // 32-bit shadow maps (overkill)
+int const SMAP_INTERNAL_FORMAT  = GL_DEPTH_COMPONENT;
+unsigned const smap_bytes_per_pixel = sizeof(unsigned short);
+#else // floating-point
+int const SHADOW_MAP_DATATYPE  = GL_FLOAT; // floating-point shadow maps
+int const SMAP_INTERNAL_FORMAT = GL_DEPTH_COMPONENT32F;
+unsigned const smap_bytes_per_pixel = sizeof(float);
+#endif
 
 bool voxel_shadows_updated(0);
 unsigned shadow_map_sz(0), scene_smap_vbo_invalid(0), empty_smap_tid(0);
 pos_dir_up orig_camera_pdu;
+ubo_wrap_t shadow_matrix_ubo; // reused for dlights shadow map matrices
 
-extern bool snow_shadows, enable_depth_clamp, flashlight_on, interior_shadow_maps;
+extern bool snow_shadows, enable_depth_clamp, flashlight_on, interior_shadow_maps, enable_ground_csm;
 extern int window_width, window_height, animate2, display_mode, tree_mode, ground_effects_level, num_trees, camera_coll_id;
 extern unsigned enabled_lights;
-extern float NEAR_CLIP, tree_deadness, vegetation, shadow_map_pcf_offset;
+extern float NEAR_CLIP, tree_deadness, vegetation;
 extern vector<shadow_sphere> shadow_objs;
 extern set<unsigned> moving_cobjs;
 extern coll_obj_group coll_objects;
@@ -34,7 +46,7 @@ extern platform_cont platforms;
 
 void draw_trees(bool shadow_only=0, bool reflection_pass=0);
 void free_light_source_gl_state();
-void set_shadow_tex_params(unsigned &tid, bool is_array);
+void set_shadow_tex_params(unsigned &tid, bool is_array, bool is_csm, bool use_white_border=0);
 
 
 cube_t get_scene_bounds() {
@@ -51,7 +63,7 @@ int get_smap_ndiv(float radius, unsigned smap_sz) {
 int get_def_smap_ndiv(float radius) {return get_smap_ndiv(radius, shadow_map_sz);}
 
 
-struct ground_mode_smap_data_t : public cached_dynamic_smap_data_t {
+struct ground_mode_smap_data_t : public cached_dynamic_smap_data_t { // used for ground mode sun and moon directional lights
 
 	ground_mode_smap_data_t(unsigned tu_id_) : cached_dynamic_smap_data_t(tu_id_, shadow_map_sz) {}
 	virtual void render_scene_shadow_pass(point const &lpos);
@@ -60,16 +72,20 @@ struct ground_mode_smap_data_t : public cached_dynamic_smap_data_t {
 
 vector<ground_mode_smap_data_t> smap_data;
 
-void ensure_smap_data() {
+void ensure_smap_data() { // sun/moon
 
 	if (smap_data.empty()) {
-		for (unsigned l = 0; l < NUM_LIGHT_SRC; ++l) {smap_data.push_back(ground_mode_smap_data_t(GLOBAL_SMAP_START_TU_ID+l));} // tu_ids 6 and 7
+		for (unsigned l = 0; l < NUM_LIGHT_SRC; ++l) {
+			ground_mode_smap_data_t smd(GLOBAL_SMAP_START_TU_ID+l); // tu_ids 6 and 7
+			smd.is_csm = enable_ground_csm;
+			smap_data.push_back(smd);
+		}
 	}
 	assert(smap_data.size() == NUM_LIGHT_SRC);
 }
 
 
-class smap_vertex_cache_t : public vbo_wrap_t {
+class smap_vertex_cache_t : public vbo_wrap_t { // used for sun and moon shadows of dynamic objects in ground mode
 
 	unsigned num_verts1, num_verts2;
 	vector<vert_wrap_t> dverts;
@@ -94,7 +110,7 @@ public:
 	void render() const {
 		if (num_verts2 == 0) return; // empty
 		shader_t s;
-		s.begin_color_only_shader(WHITE); // Note: color is likely unused
+		s.begin_shadow_map_shader();
 		assert(num_verts1 <= num_verts2);
 		pre_render();
 		if (num_verts1 > 0) {draw_verts<vert_wrap_t>(NULL, num_verts1, GL_TRIANGLES);}
@@ -182,9 +198,7 @@ public:
 		if (shadow_objs.empty() && movable_cids.empty()) return; // no dynamic objects
 		//timer_t timer("Add Draw Dynamic");
 		shader_t shader;
-		shader.set_vert_shader("vertex_xlate_scale");
-		shader.set_frag_shader("color_only");
-		shader.begin_shader();
+		shader.begin_shadow_map_shader(0, 1); // use_alpha_mask=0, enable_xlate_scale=1
 		int const shader_loc(shader.get_uniform_loc("xlate_scale"));
 		assert(shader_loc >= 0);
 		bind_draw_sphere_vbo(0, 0); // no tex coords or normals
@@ -231,7 +245,7 @@ public:
 		coll_obj const &c(coll_objects.get_cobj(cid));
 		if (!c.no_shadow_map() && c.is_movable()) {movable_cids.push_back(cid);}
 	}
-};
+}; // smap_vertex_cache_t
 
 smap_vertex_cache_t smap_vertex_cache;
 
@@ -267,7 +281,7 @@ unsigned smap_texture_array_t::new_layer() {
 	return num_layers_used++;
 }
 
-void smap_texture_array_t::free_gl_state() {free_texture(tid);}
+void smap_texture_array_t::free_gl_state() {free_texture(tid); gpu_mem = 0;}
 
 void smap_data_state_t::free_gl_state() {
 	if (is_arrayed()) {gen_id = 0;} else {free_texture(local_tid);}
@@ -280,26 +294,62 @@ void smap_data_state_t::bind_tex_array(smap_texture_array_t *tex_arr_) { // must
 	layer_id = tex_arr->new_layer();
 }
 
+float const cascade_plane_dscales[NUM_CSM_CASCADES] = {0.03, 0.1, 0.3, 1.0};
+
+float get_cascade_plane_dscale(unsigned cascade_ix) {
+	assert(cascade_ix < NUM_CSM_CASCADES);
+	float dscale(cascade_plane_dscales[cascade_ix]);
+	if (world_mode == WMODE_GROUND) {dscale *= min(1.0f, (X_SCENE_SIZE + Y_SCENE_SIZE)/camera_pdu.far_);}
+	return dscale;
+}
+float get_cascade_plane_dscale_last_at_1(unsigned cascade_ix) {
+	return ((cascade_ix == NUM_CSM_CASCADES-1) ? 1.0 : get_cascade_plane_dscale(cascade_ix));
+}
+void set_csm_near_far(pos_dir_up &frustum, unsigned cascade_ix) {
+	if (cascade_ix > 0) {frustum.near_ = frustum.far_*get_cascade_plane_dscale_last_at_1(cascade_ix-1);}
+	frustum.far_ *= get_cascade_plane_dscale_last_at_1(cascade_ix);
+}
+
 bool smap_data_t::set_smap_shader_for_light(shader_t &s, int light, xform_matrix const *const mvm) const {
 
 	if (!shadow_map_enabled() || !is_light_enabled(light)) return 0;
 	point lpos; // unused
 	bool const light_is_valid(light_valid(0xFF, light, lpos));
-	string sm_tex_str("sm_tex"), sm_scale_str("sm_scale"), smap_matrix_str("smap_matrix");
+	string sm_tex_str("sm_tex"), sm_scale_str("sm_scale");
 	s.add_uniform_int  (append_ix(sm_tex_str,   light, 0), tu_id);
 	s.add_uniform_float(append_ix(sm_scale_str, light, 0), (light_is_valid ? 1.0 : 0.0));
-	xform_matrix tm(texture_matrix);
-	if (mvm) {tm *= (*mvm) * glm::affineInverse((glm::mat4)fgGetMVM());} // Note: works for translate, but not scale?
-	s.add_uniform_matrix_4x4(append_ix(smap_matrix_str, light, 0), tm.get_ptr(), 0);
+
+	if (is_csm) {
+		// cascade_plane_distances only needs to be done only once per light, but we have at most two lights, so it should be okay
+		assert(cascade_matrices.size() == NUM_CSM_CASCADES);
+
+		for (unsigned i = 0; i < NUM_CSM_CASCADES; ++i) {
+			string cpd_str("cascade_plane_distances"), smap_matrix_str("smap_matrix"), matrix_str(append_ix(smap_matrix_str, light, 0));
+			s.add_uniform_float(append_ix(cpd_str, i, 1), camera_pdu.far_*get_cascade_plane_dscale(i));
+			s.add_uniform_matrix_4x4(append_ix(matrix_str, i, 1), cascade_matrices[i].get_ptr(), 0);
+		}
+	}
+	else {
+		xform_matrix tm(texture_matrix);
+		if (mvm) {tm *= (*mvm) * glm::affineInverse((glm::mat4)fgGetMVM());} // Note: works for translate, but not scale?
+		string smap_matrix_str("smap_matrix");
+		s.add_uniform_matrix_4x4(append_ix(smap_matrix_str, light, 0), tm.get_ptr(), 0);
+	}
 	bind_smap_texture(light_is_valid);
 	return 1;
 }
 
-bool local_smap_data_t::set_smap_shader_for_light(shader_t &s, bool &arr_tex_set) const {
+void setup_and_bind_shadow_matrix_ubo() {
+	shadow_matrix_ubo.allocate_with_size(MAX_DLIGHT_SMAPS*MAT4x4_SIZE, 0); // static draw?
+	shadow_matrix_ubo.bind_base(0); // U_smap_matrix_dl is at binding point 0
+	shadow_matrix_ubo.pre_render();
+}
 
+bool local_smap_data_t::set_smap_shader_for_light(shader_t &s, bool &arr_tex_set) const { // point/spot lights
 	if (!shadow_map_enabled()) return 0;
 	assert(tu_id >= LOCAL_SMAP_START_TU_ID);
 	assert(is_arrayed());
+	assert(!is_csm); // not supported for point/spot lights
 
 	if (!arr_tex_set) { // Note: assumes all lights use the same texture array
 		arr_tex_set = bind_smap_texture(); // not setup until we bind a valid texture
@@ -307,42 +357,23 @@ bool local_smap_data_t::set_smap_shader_for_light(shader_t &s, bool &arr_tex_set
 		if (!tex_ret) {cerr << "Error: unable to set shader uniform 'smap_tex_arr_dl'." << endl;}
 		assert(tex_ret); // Note: we can assert this returns true, though it makes shader debugging harder
 	}
-	float const *const m(texture_matrix.get_ptr());
-	
-	if (layer_id <= 9) { // most common values
-		char str[18] = "smap_matrix_dl[?]";
-		str[15] = char('0' + layer_id);
-		bool const mat_ret(s.add_uniform_matrix_4x4(str, m, 0));
-		assert(mat_ret);
-	}
-	else if (layer_id <= 99) {
-		char str[19] = "smap_matrix_dl[??]";
-		str[15] = char('0' + (layer_id / 10));
-		str[16] = char('0' + (layer_id % 10));
-		bool const mat_ret(s.add_uniform_matrix_4x4(str, m, 0));
-		assert(mat_ret);
-	}
-	else {
-		assert(layer_id < 999);
-		char str[20] = {0};
-		sprintf(str, "smap_matrix_dl[%u]", layer_id); // use texture array layer id
-		bool const mat_ret(s.add_uniform_matrix_4x4(str, m, 0));
-		assert(mat_ret);
-	}
-	
+	assert(layer_id < MAX_DLIGHT_SMAPS);
+	upload_ubo_sub_data(texture_matrix.get_ptr(), layer_id*MAT4x4_SIZE, MAT4x4_SIZE); // shadow_matrix_ubo should be bound
 	return 1;
 }
 
-unsigned get_empty_smap_tid() {
+// default empty shadow map for use in shaders when the shadow map hasn't been generated yet; for tiled terrain and disabled sun/moon
+unsigned get_empty_smap_tid(bool is_csm) {
 	if (empty_smap_tid == 0) {
-		set_shadow_tex_params(empty_smap_tid, 0);
-		char const zero_data[16] = {0};
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, 1, 1, 0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, zero_data);
+		set_shadow_tex_params(empty_smap_tid, 0, is_csm); // is_array=0
+		char const zero_data[16] = {0}; // large enough for any type
+		if (is_csm) {glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, SMAP_INTERNAL_FORMAT, 1, 1, NUM_CSM_CASCADES, 0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, zero_data);} // 1x1 texel
+		else        {glTexImage2D(GL_TEXTURE_2D,       0, SMAP_INTERNAL_FORMAT, 1, 1,                   0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, zero_data);} // 1x1 texel
 	}
 	return empty_smap_tid;
 }
 
-void bind_default_sun_moon_smap_textures() { // Note: uses different TUs compared to tiled terrain disable_shadow_maps()
+void bind_default_sun_moon_smap_textures() { // for tiled terrain and building exteriors; uses different TUs compared to tiled terrain disable_shadow_maps()
 	// ensure shadow map TU_IDs are valid in case we try to use them without binding to a tile;
 	// maybe this fixes the occasional shader undefined behavior warning we get with the debug callback?
 	for (unsigned l = 0; l < NUM_LIGHT_SRC; ++l) {
@@ -352,19 +383,11 @@ void bind_default_sun_moon_smap_textures() { // Note: uses different TUs compare
 }
 
 bool smap_data_t::bind_smap_texture(bool light_valid) const {
-
-	set_active_texture(tu_id);
-
 	// Note: the is_allocated() check shouldn't be required, but can happen in tiled terrain mode when switching between combined_gu mode (safe and conservative)
 	// due to some disagreement between the update pass and draw pass during reflection drawing
-	if (light_valid && is_allocated()) { // otherwise, we know that sm_scale will be 0.0 and we won't do the lookup
-		bind_2d_texture(get_tid(), is_arrayed());
-		set_active_texture(0);
-		return 1;
-	}
-	bind_2d_texture(get_empty_smap_tid());
-	set_active_texture(0);
-	return 0;
+	bool const use_tid(light_valid && is_allocated()); // otherwise, we know that sm_scale will be 0.0 and we won't do the lookup
+	bind_texture_tu((use_tid ? get_tid() : get_empty_smap_tid(is_csm)), tu_id);
+	return use_tid;
 }
 
 
@@ -374,7 +397,6 @@ void upload_shadow_data_to_shader(shader_t &s) {
 
 void set_smap_shader_for_all_lights(shader_t &s, float z_bias) {
 	s.add_uniform_float("z_bias", z_bias);
-	s.add_uniform_float("pcf_offset", shadow_map_pcf_offset);
 	upload_shadow_data_to_shader(s);
 }
 
@@ -397,6 +419,7 @@ void set_smap_mvm_pjm(point const &eye, point const &center, vector3d const &up_
 
 pos_dir_up get_pt_cube_frustum_pdu(point const &pos_, cube_t const &bounds) {
 
+	assert(bounds.is_strictly_normalized());
 	point const center(bounds.get_cube_center());
 	point pos(pos_);
 	
@@ -433,35 +456,56 @@ pos_dir_up get_pt_cube_frustum_pdu(point const &pos_, cube_t const &bounds) {
 
 void draw_scene_bounds_and_light_frustum(point const &lpos) {
 
-	// draw scene bounds
 	shader_t s;
-	enable_blend();
-	s.begin_color_only_shader(colorRGBA(1.0, 1.0, 1.0, 0.25)); // white
-	draw_simple_cube(get_scene_bounds(), 0);
+	s.begin_color_only_shader();
 
-	// draw light frustum
-	s.begin_color_only_shader(colorRGBA(1.0, 1.0, 0.0, 0.25)); // yellow
-	get_pt_cube_frustum_pdu(lpos, get_scene_bounds()).draw_frustum();
-	disable_blend();
+	if (enable_ground_csm) {
+		static pos_dir_up capture_pdu;
+		if (display_mode & 0x10) {capture_pdu = camera_pdu;} // capture key = '5'
+
+		if (capture_pdu.valid) {
+			ensure_outlined_polygons();
+			colorRGBA const frustum_colors[NUM_CSM_CASCADES] = {RED, GREEN, BLUE, YELLOW};
+
+			for (unsigned i = 0; i < NUM_CSM_CASCADES; ++i) {
+				s.set_cur_color(frustum_colors[i]);
+				pos_dir_up frustum(capture_pdu);
+				set_csm_near_far(frustum, i);
+				frustum.draw_frustum();
+			}
+			set_fill_mode();
+		}
+	}
+	else {
+		enable_blend();
+		// draw scene bounds
+		s.set_cur_color(colorRGBA(1.0, 1.0, 1.0, 0.25)); // white
+		draw_simple_cube(get_scene_bounds(), 0);
+		// draw light frustum
+		s.set_cur_color(colorRGBA(1.0, 1.0, 0.0, 0.25)); // yellow
+		get_pt_cube_frustum_pdu(lpos, get_scene_bounds()).draw_frustum();
+		disable_blend();
+	}
 	s.end_shader();
 }
 
 
-void set_shadow_tex_params(unsigned &tid, bool is_array) {
+void set_shadow_tex_params(unsigned &tid, bool is_array, bool is_csm, bool use_white_border) {
 
 	bool const nearest(0); // nearest filter: sharper shadow edges, but needs more biasing
 	setup_texture(tid, 0, 0, 0, 0, 0, nearest, 1.0, is_array);
 	// This is to allow usage of textureProj function in the shader
 	int const target(get_2d_texture_target(is_array));
-	glTexParameteri(target, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_R_TO_TEXTURE);
+	glTexParameteri(target, GL_TEXTURE_COMPARE_MODE, (is_csm ? GL_NONE : GL_COMPARE_R_TO_TEXTURE));
 	glTexParameteri(target, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
-#if 0
-	// clamps area outside the shadow volume to unshadowed rather than extending the value at the border;
-	// for buildings, this removes the incorrect shadow that extends above the player's head when near a wall, but causes some light leaking above walls
-	glTexParameteri (target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
-	glTexParameteri (target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-	glTexParameterfv(target, GL_TEXTURE_BORDER_COLOR, &WHITE.R);
-#endif
+
+	if (use_white_border) {
+		// clamps area outside the shadow volume to unshadowed rather than extending the value at the border;
+		// for buildings, this removes the incorrect shadow that extends above the player's head when near a wall, but causes some light leaking above walls
+		glTexParameteri (target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+		glTexParameteri (target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+		glTexParameterfv(target, GL_TEXTURE_BORDER_COLOR, &WHITE.R);
+	}
 }
 
 
@@ -495,20 +539,71 @@ bool ground_mode_smap_data_t::needs_update(point const &lpos) {
 void smap_texture_array_t::ensure_tid(unsigned xsize, unsigned ysize) {
 
 	assert(xsize > 0 && ysize > 0 && num_layers > 0);
-	if (tid) {return;}
+	if (tid) return; // already allocated
 	++gen_id;
-	set_shadow_tex_params(tid, 1);
-	glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT, xsize, ysize, num_layers, 0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, NULL);
+	set_shadow_tex_params(tid, 1, 0); // is_array=1, is_csm=0
+	glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, SMAP_INTERNAL_FORMAT, xsize, ysize, num_layers, 0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, NULL);
 	check_gl_error(630);
+	gpu_mem += xsize*ysize*num_layers*smap_bytes_per_pixel;
 }
 
 
-// if bounds is passed in, calculate pdu from it; otherwise, assume the user has alreay caclulated pdu
+glm::mat4 perspective_from_frustum(pos_dir_up const &pdu) {
+	return glm::perspective(glm::radians(pdu.angle), (float)pdu.A, pdu.near_, pdu.far_);
+}
+glm::mat4 setup_csm_matrix(pos_dir_up const &frustum, point const &lpos) {
+	point pts[9];
+	frustum.get_frustum_corners(pts);
+
+	if (world_mode == WMODE_GROUND) { // clamp to scene bounds for a tighter fit
+		cube_t scene_bounds(get_scene_bounds());
+		scene_bounds.expand_by(DX_VAL + DY_VAL); // expand slightly so that shadow map covers the edges
+		for (unsigned i = 0; i < 8; ++i) {scene_bounds.clamp_pt(pts[i]);}
+	}
+	point const center(get_center_arb(pts, 8));
+	vector3d const light_dir(lpos.get_norm()); // pointing toward the light
+	unsigned npts(8);
+	
+	if (world_mode == WMODE_GROUND) { // project center in the light direction to zmax plane to make sure we capture all geometry
+		float const plane_z(max(ztop, czmax)), dz(plane_z - center.z);
+		if (dz > 0.0 && light_dir.z > 0.0) {pts[npts++] = center + (dz/light_dir.z)*light_dir;}
+	}
+	auto const light_view(glm::lookAt(vec3_from_vector3d(center + 0.1*light_dir), vec3_from_vector3d(center), vec3_from_vector3d(plus_y)));
+	for (unsigned i = 0; i < npts; ++i) {pts[i] = vector3d_from_vec3(light_view * glm::vec4(vec3_from_vector3d(pts[i]), 1.0));}
+	cube_t bcube(pts, npts);
+	float const z_mult = 10.0f; // tune this parameter according to the scene
+	if (bcube.z1() < 0.0) {bcube.z1() *= z_mult;} else {bcube.z1() /= z_mult;}
+	if (bcube.z2() < 0.0) {bcube.z2() /= z_mult;} else {bcube.z2() *= z_mult;}
+	glm::mat4 const light_projection(glm::ortho(bcube.x1(), bcube.x2(), bcube.y1(), bcube.y2(), bcube.z1(), bcube.z2()));
+	return light_projection * light_view;
+}
+
+// hack to send a vector of matrices from CSM setup to rendering without passing it down the entire call tree
+smap_data_t const *active_smap_data = nullptr;
+
+bool is_csm_active() {return (active_smap_data != nullptr && active_smap_data->is_csm);}
+
+void shader_csm_render_setup(shader_t &s) {
+	assert(active_smap_data != nullptr);
+	active_smap_data->set_csm_matrices(s);
+}
+void smap_data_t::set_csm_matrices(shader_t &s) const { // send matrices to the geometry shader
+	assert(is_csm);
+	assert(cascade_matrices.size() == NUM_CSM_CASCADES);
+
+	for (unsigned i = 0; i < NUM_CSM_CASCADES; ++i) {
+		string matrix_str("light_space_matrices");
+		s.add_uniform_matrix_4x4(append_ix(matrix_str, i, 1), cascade_matrices[i].get_ptr(), 0);
+	}
+}
+
+// if bounds is passed in, calculate pdu from it; otherwise, assume the user has alreay caclulated pdu;
+// note that we store the light pos and other light-specific data in the shadow map, which means we can't reuse it across lights, but we can reuse the texture
 void smap_data_t::create_shadow_map_for_light(point const &lpos, cube_t const *const bounds, bool use_world_space, bool no_update, bool force_update) {
 
-	// setup render state
+	// setup render state; must update if re-allocated due to texture array resize
 	assert(smap_sz > 0);
-	bool do_update(!no_update && (force_update || needs_update(lpos))); // must be called first, because this may indirectly update bounds
+	bool do_update(!is_allocated() || (!no_update && (is_csm || force_update || needs_update(lpos)))); // must be called first, because this may indirectly update bounds
 	xform_matrix camera_mv_matrix; // starts as identity matrix
 	if (!use_world_space) {camera_mv_matrix = fgGetMVM();} // cache the camera modelview matrix before we change it
 	fgPushMatrix();
@@ -516,8 +611,20 @@ void smap_data_t::create_shadow_map_for_light(point const &lpos, cube_t const *c
 	fgPushMatrix();
 	fgMatrixMode(FG_MODELVIEW);
 	if (bounds && (do_update || !pdu.valid)) {pdu = get_pt_cube_frustum_pdu(lpos, *bounds);} // else pdu should have been set by the caller
-	set_smap_mvm_pjm(pdu.pos, (pdu.pos + pdu.dir), pdu.upv, pdu.angle, pdu.A, pdu.near_, pdu.far_);
-	texture_matrix = get_texture_matrix(camera_mv_matrix);
+
+	if (is_csm) {
+		cascade_matrices.resize(NUM_CSM_CASCADES);
+		
+		for (unsigned i = 0; i < NUM_CSM_CASCADES; ++i) {
+			pos_dir_up frustum(camera_pdu);
+			set_csm_near_far(frustum, i);
+			cascade_matrices[i] = setup_csm_matrix(frustum, lpos);
+		}
+	}
+	else { // treat as perspective projection, even for directional lights
+		set_smap_mvm_pjm(pdu.pos, (pdu.pos + pdu.dir), pdu.upv, pdu.angle, pdu.A, pdu.near_, pdu.far_);
+		texture_matrix = get_texture_matrix(camera_mv_matrix);
+	}
 	check_gl_error(201);
 
 	if (do_update) {
@@ -529,14 +636,19 @@ void smap_data_t::create_shadow_map_for_light(point const &lpos, cube_t const *c
 				tex_arr->ensure_tid(smap_sz, smap_sz); // create texture array if needed; point local to array texture so that we know it's bound
 				gen_id = tex_arr->gen_id; // tag with current generation
 			}
+			else if (is_csm) {
+				set_shadow_tex_params(local_tid, 1, 1, 1); // is_array=1, is_csm=1, use_white_border=1
+				glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, SMAP_INTERNAL_FORMAT, smap_sz, smap_sz, NUM_CSM_CASCADES, 0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, nullptr);
+				check_gl_error(631);
+			}
 			else { // non-arrayed
-				set_shadow_tex_params(local_tid, 0);
-				glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, smap_sz, smap_sz, 0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, NULL);
+				set_shadow_tex_params(local_tid, 0, 0); // is_array=0, is_csm=0
+				glTexImage2D(GL_TEXTURE_2D, 0, SMAP_INTERNAL_FORMAT, smap_sz, smap_sz, 0, GL_DEPTH_COMPONENT, SHADOW_MAP_DATATYPE, nullptr);
 			}
 		}
 		assert(is_allocated());
 		// render from the light POV to a FBO, store depth values only
-		enable_fbo(fbo_id, get_tid(), 1, 0, get_layer());
+		enable_fbo(fbo_id, get_tid(), 1, 0, is_csm, get_layer()); // is_depth_fbo=1, multisample=0
 		glViewport(0, 0, smap_sz, smap_sz);
 		glClear(GL_DEPTH_BUFFER_BIT);
 		glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); // Disable color rendering, we only want to write to the Z-Buffer
@@ -548,7 +660,9 @@ void smap_data_t::create_shadow_map_for_light(point const &lpos, cube_t const *c
 		ensure_filled_polygons();
 		// render the scene
 		check_gl_error(202);
+		active_smap_data = this;
 		render_scene_shadow_pass(lpos);
+		active_smap_data = nullptr;
 		// restore state variables
 		camera_pdu     = camera_pdu_;
 		enabled_lights = orig_enabled_lights;
@@ -562,6 +676,13 @@ void smap_data_t::create_shadow_map_for_light(point const &lpos, cube_t const *c
 	check_gl_error(203);
 }
 
+unsigned get_smap_bytes_per_pixel() {return smap_bytes_per_pixel;}
+
+unsigned smap_data_t::get_gpu_mem() const {
+	if (!is_allocated()) return 0;
+	if (tex_arr)         return 0; // not tex_arr->gpu_mem, as this is shared across shadow maps and added once in local_smap_manager_t::get_gpu_mem()
+	return smap_bytes_per_pixel*smap_sz*smap_sz*(is_csm ? NUM_CSM_CASCADES : 1);
+}
 
 void draw_mesh_shadow_pass(point const &lpos, unsigned smap_sz) {
 
@@ -587,7 +708,6 @@ void ground_mode_smap_data_t::render_scene_shadow_pass(point const &lpos) {
 	point const camera_pos_(camera_pos);
 	camera_pos = lpos;
 	vector3d const light_dir(-pdu.pos.get_norm()); // approximate as directional light; should be close enough for culling cube faces
-
 	// add static objects
 	smap_vertex_cache.add_cobjs(smap_sz, 0, 0); // no VFC for static cobjs
 	smap_vertex_cache.render();
@@ -706,7 +826,6 @@ void create_shadow_map() {
 }
 
 void update_shadow_matrices() {
-
 	if (!shadow_map_enabled() || smap_data.empty()) return; // disabled
 	assert(scene_smap_vbo_invalid != 2);
 	create_shadow_map_inner(1); // no_update=1
@@ -714,7 +833,6 @@ void update_shadow_matrices() {
 
 
 void free_shadow_map_textures() {
-
 	for (unsigned l = 0; l < smap_data.size(); ++l) {smap_data[l].free_gl_state();}
 	free_smap_vbo();
 	free_light_source_gl_state(); // free any shadow maps within light sources

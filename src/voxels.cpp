@@ -29,8 +29,8 @@ voxel_model_ground terrain_voxel_model(GROUND_NUM_LOD);
 voxel_brush_params_t voxel_brush_params;
 bool voxel_ppb_enable_falling(0);
 
-extern bool group_back_face_cull, voxel_shadows_updated;
-extern int dynamic_mesh_scroll, rand_gen_index, scrolling, display_mode, display_framerate, voxel_editing, mesh_gen_mode, mesh_freq_filter;
+extern bool group_back_face_cull, voxel_shadows_updated, voxel_add_remove;
+extern int dynamic_mesh_scroll, rand_gen_index, scrolling, display_mode, voxel_editing, mesh_gen_mode, mesh_freq_filter;
 extern float FAR_CLIP;
 extern double tfticks;
 extern coll_obj_group coll_objects;
@@ -63,7 +63,7 @@ void noise_texture_manager_t::ensure_tid() {
 }
 
 void noise_texture_manager_t::bind_texture(unsigned tu_id) const {
-	set_3d_texture_as_current(noise_tid, tu_id);
+	bind_texture_tu(noise_tid, tu_id);
 }
 
 void noise_texture_manager_t::clear() {
@@ -1609,11 +1609,10 @@ void voxel_model::setup_tex_gen_for_rendering(shader_t &s) {
 	unsigned const tu_ids[2] = {0,8};
 
 	for (unsigned i = 0; i < 2; ++i) {
-		set_active_texture(tu_ids[i]);
-		select_texture(params.tids[i]);
+		select_texture(params.tids[i], tu_ids[i]);
 		s.add_uniform_color(cnames[i], params.colors[i]);
 	}
-	select_multitex(params.tids[2], 15); // top texture
+	select_texture(params.tids[2], 15); // top texture
 }
 
 
@@ -1677,7 +1676,7 @@ void voxel_model_space::setup_tex_gen_for_rendering(shader_t &s) {
 	
 	if (!ao_lighting.empty()) {
 		if (ao_tid == 0) {ao_tid = create_3d_texture(nx, ny, nz, 1, ao_lighting, GL_LINEAR, GL_CLAMP_TO_EDGE);}
-		set_3d_texture_as_current(ao_tid, 9);
+		bind_texture_tu(ao_tid, 9);
 	}
 	if (shadow_tid == 0) {
 		voxel_grid<unsigned char> shadow_data; // 0 == no light/in shadow, 255 = full light/no shadow
@@ -1685,7 +1684,7 @@ void voxel_model_space::setup_tex_gen_for_rendering(shader_t &s) {
 		extract_shadow_edges(shadow_data);
 		shadow_tid = create_3d_texture(nx, ny, nz, 1, shadow_data, GL_LINEAR, GL_CLAMP_TO_EDGE);
 	}
-	set_3d_texture_as_current(shadow_tid, 10);
+	bind_texture_tu(shadow_tid, 10);
 }
 
 
@@ -1716,7 +1715,7 @@ void voxel_model::render(unsigned lod_level, bool is_shadow_pass) { // not const
 	set_fill_mode();
 	
 	if (is_shadow_pass) {
-		s.begin_color_only_shader();
+		s.begin_shadow_map_shader();
 	}
 	else {
 		float const min_alpha(0.0); // not needed (yet)
@@ -2121,7 +2120,7 @@ bool update_voxel_sphere_region(point const &center, float radius, float val_at_
 
 	// optimization/hack to skip the update if the player didn't cause it and the camera can't see it
 	if (shooter != CAMERA_ID && !camera_pdu.sphere_visible_test(center, radius)) return 0;
-	return terrain_voxel_model.update_voxel_sphere_region(center, radius, val_at_center*(display_framerate ? 1.0 : -1.0), 1, 1, NULL, shooter, num_fragments);
+	return terrain_voxel_model.update_voxel_sphere_region(center, radius, val_at_center*(voxel_add_remove ? 1.0 : -1.0), 1, 1, NULL, shooter, num_fragments);
 }
 
 void proc_voxel_updates() {

@@ -19,9 +19,8 @@ inline GLenum get_texture_format(int ncolors) {
 void init_glew();
 
 // multitexture prototypes
-void set_active_texture(unsigned tu_id);
-void select_multitex(int id, unsigned tu_id, bool reset=1);
-void bind_texture_tu(unsigned tid, unsigned tu_id, bool is_cube_map=0);
+void bind_texture_tu(unsigned tid, unsigned tu_id);
+void bind_texture_tu_def_white_tex(unsigned tid, unsigned tu_id);
 
 // 3D texture prototypes
 void bind_3d_texture(unsigned tid);
@@ -29,7 +28,6 @@ void setup_3d_texture(unsigned &tid, int filter, int wrap);
 unsigned create_3d_texture(unsigned xsz, unsigned ysz, unsigned zsz, unsigned ncomp, vector<unsigned char> const &data, int filter, int wrap, bool compress=0, unsigned bytes_per_pixel=1);
 void update_3d_texture(unsigned tid, unsigned xoff, unsigned yoff, unsigned zoff, unsigned xsz, unsigned ysz, unsigned zsz,
 					   unsigned ncomp, unsigned char const *const data);
-void set_3d_texture_as_current(unsigned tid, unsigned tu_id);
 
 // gl_ext_arb
 unsigned create_vbo();
@@ -45,8 +43,8 @@ void upload_ubo_sub_data(void const *const data, int offset, size_t size);
 unsigned create_vao();
 void bind_vao(unsigned vao);
 void delete_vao(unsigned vao);
-void create_fbo(unsigned &fbo_id, unsigned depth_tid, bool is_depth_fbo=0, bool multisample=0, unsigned *layer=nullptr);
-void enable_fbo(unsigned &fbo_id, unsigned tid, bool is_depth_fbo=0, bool multisample=0, unsigned *layer=nullptr);
+void create_fbo(unsigned &fbo_id, unsigned depth_tid, bool is_depth_fbo=0, bool multisample=0, bool is_array=0, unsigned *layer=nullptr);
+void enable_fbo(unsigned &fbo_id, unsigned tid,       bool is_depth_fbo=0, bool multisample=0, bool is_array=0, unsigned *layer=nullptr);
 void bind_fbo(unsigned fbo_id);
 void disable_fbo();
 void free_fbo(unsigned &fbo_id);
@@ -140,6 +138,7 @@ struct ubo_wrap_t { // uniform buffer object
 	ubo_wrap_t() : ubo(0) {}
 	bool ubo_valid() const {return (ubo > 0);}
 	void clear() {delete_and_zero_vbo(ubo);} // same as VBO
+	void allocate_with_size(unsigned size, int dynamic_level=0);
 	template<typename vert_type_t>
 	void create_and_upload(vector<vert_type_t> const &data, int dynamic_level=0, bool end_with_bind0=0) {
 		if (!ubo) {create_ubo_and_upload(ubo, data, end_with_bind0, dynamic_level);}
@@ -314,6 +313,7 @@ class vbo_ring_buffer_t : public vbo_wrap_t {
 public:
 	vbo_ring_buffer_t(unsigned init_size_, bool is_index_=0) : init_size(init_size_), size(init_size), pos(0), is_index(is_index_) {}
 	void clear() {vbo_wrap_t::clear(); size = init_size; pos = 0;}
+	unsigned get_alloced_size() const {return (vbo_valid() ? size : 0);}
 
 	template<typename T> void *add_verts_bind_vbo(vector<T> const &v) {
 		assert(!v.empty());
@@ -336,10 +336,10 @@ void build_texture_mipmaps(unsigned tid, unsigned dim);
 
 struct texture_pair_t {
 
-	unsigned tids[2]; // color, normal
+	unsigned tids[2]={}; // color, normal
 	bool multisample;
 
-	texture_pair_t(bool multisample_=0) : multisample(multisample_) {tids[0] = tids[1] = 0;}
+	texture_pair_t(bool multisample_=0) : multisample(multisample_) {}
 	bool is_valid() const {return (tids[0] > 0 && tids[1] > 0);}
 	void free_context();
 	void bind_texture() const;
@@ -349,14 +349,13 @@ struct texture_pair_t {
 	bool operator< (texture_pair_t const &tp) const {return ((tids[0] == tp.tids[0]) ? (tids[1] < tp.tids[1]) : (tids[0] < tp.tids[0]));}
 };
 
+struct texture_atlas_t { // unused
 
-struct texture_atlas_t {
-
-	unsigned tid, nx, ny;
+	unsigned tid=0, nx=1, ny=1;
 	bool multisample;
 
-	texture_atlas_t(bool multisample_=0) : tid(0), nx(1), ny(1), multisample(multisample_) {}
-	texture_atlas_t(unsigned nx_, unsigned ny_, bool multisample_=0) : tid(0), nx(nx_), ny(ny_), multisample(multisample_) {}
+	texture_atlas_t(bool multisample_=0) : multisample(multisample_) {}
+	texture_atlas_t(unsigned nx_, unsigned ny_, bool multisample_=0) : nx(nx_), ny(ny_), multisample(multisample_) {}
 	bool is_valid() const {return (tid > 0);}
 	void free_context();
 	void bind_texture() const;
@@ -373,18 +372,15 @@ class render_to_texture_t {
 
 	void pre_render(float xsize, float ysize, unsigned nx, unsigned ny, point const &center, vector3d const &view_dir) const;
 	static void post_render();
-
 public:
 	render_to_texture_t(unsigned tsize_) : tsize(tsize_) {}
 	virtual ~render_to_texture_t() {}
 	void render(texture_pair_t &tpair, float xsize, float ysize, point const &center, vector3d const &view_dir,
 		colorRGBA const &bkg_color, bool use_depth_buffer, bool mipmap);
-	void render(texture_atlas_t &atlas, float xsize, float ysize, point const &center, vector3d const &view_dir,
-		colorRGBA const &bkg_color, bool use_depth_buffer, bool mipmap);
 	virtual void draw_geom(bool is_normal_pass) = 0;
 };
 
-void set_temp_clear_color(colorRGBA const &clear_color);
+void set_temp_clear_color(colorRGBA const &clear_color, bool clear_depth=0, bool clear_stencil=0);
 
 template< typename T > void upload_to_dynamic_vbo(vector<T> const &v) {
 	T::set_vbo_arrays(1, get_dynamic_vbo_ptr(&v.front(), v.size()*sizeof(T)));
@@ -417,6 +413,14 @@ public:
 };
 
 GLint64 get_timestamp();
+
+struct DrawElementsIndirectCommand { // used with glMultiDrawElementsIndirect()
+	uint32_t count;
+	uint32_t instanceCount;
+	uint32_t firstIndex;
+	int32_t  baseVertex;
+	uint32_t baseInstance; // OpenGL >= 4.2
+};
 
 inline int get_2d_texture_target(bool is_array=0, bool multisample=0) {
 	return (is_array ? (multisample ? GL_TEXTURE_2D_MULTISAMPLE_ARRAY : GL_TEXTURE_2D_ARRAY) : (multisample ? GL_TEXTURE_2D_MULTISAMPLE : GL_TEXTURE_2D));

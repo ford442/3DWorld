@@ -75,7 +75,7 @@ public:
 // function prototypes
 xform_matrix const &fgGetMVM();
 xform_matrix const &fgGetPJM();
-void apply_roll_to_matrix(xform_matrix &matrix, point const &pos, point const &lpos, vector3d const &ground_normal, float radius, float a_add, float a_mult);
+void apply_roll_to_matrix(xform_matrix &matrix, point const &pos, point const &lpos, vector3d const &ground_normal, float radius, float a_add=0.0, float a_mult=1.0);
 void apply_obj_mesh_roll(xform_matrix &matrix, point const &pos, point const &lpos, float radius, float a_add=0.0, float a_mult=1.0);
 
 
@@ -92,5 +92,12 @@ public:
 	void draw_and_clear(int prim_type, unsigned count, unsigned cur_vbo=0, int index_type=GL_NONE, void const *const indices=NULL, unsigned first=0, unsigned cur_vao=0);
 	unsigned size () const {return inst_xforms.size();}
 	bool     empty() const {return inst_xforms.empty();}
+};
+
+struct bone_transform_data_t {
+	int anim_id=-2; // -2 is unset/invalid
+	float anim_time=0.0;
+	vector<xform_matrix> transforms;
+	void clear() {anim_id = -2; anim_time = 0.0; clear_container(transforms);} // and free the memory
 };
 

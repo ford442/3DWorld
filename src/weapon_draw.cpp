@@ -290,7 +290,7 @@ void update_weapon_cobjs() { // and update cblade and lighting
 
 int select_dodgeball_texture(int shooter) {
 
-	if (UNLIMITED_WEAPONS && game_mode == 2 && !obj_groups[coll_id[BALL]].reorderable) { // can change when other players throw a ball
+	if (UNLIMITED_WEAPONS && game_mode == GAME_MODE_DODGEBALL && !obj_groups[coll_id[BALL]].reorderable) { // can change when other players throw a ball
 		if (player_dodgeball_id < 0) {player_dodgeball_id = (obj_groups[coll_id[BALL]].choose_object(1) % NUM_DB_TIDS);} // peek=1
 		return dodgeball_tids[player_dodgeball_id]; // choose once and don't change - may throw a ball of a different color
 	}
@@ -359,7 +359,7 @@ void draw_weapon(point const &pos, vector3d dir, float cradius, int cid, int wid
 			break;
 
 		case W_BALL:
-			if (wmode & 1) {
+			if (game_mode == GAME_MODE_FPS && (wmode & 1)) { // teleporter gun is secondary fire of dodgeball
 				teleporter tp;
 				tp.pos    = pos0;
 				tp.radius = 0.3*object_types[oid].radius;
@@ -773,8 +773,8 @@ void draw_weapon_in_hand_real(int shooter, bool draw_pass, shader_t &shader, int
 	}
 	else { // smiley - out of sync by a frame?
 		assert(shooter >= 0 && shooter < num_smileys);
-		if (sstate.powerup == PU_INVISIBILITY)         return;
-		if (sstate.weapon == W_BALL && game_mode == 2) return; // dodgeball already drawn
+		if (sstate.powerup == PU_INVISIBILITY) return;
+		if (sstate.weapon == W_BALL && game_mode == GAME_MODE_DODGEBALL) return; // dodgeball already drawn
 		reflection_pass = 0; // irrelevant for smileys
 	}
 	int const cid(get_shooter_coll_id(shooter));
@@ -799,7 +799,7 @@ void draw_weapon_in_hand(int shooter, shader_t &shader, int reflection_pass) {
 
 void draw_camera_weapon(bool want_has_trans, int reflection_pass) {
 
-	if (!game_mode || (weap_has_transparent(CAMERA_ID) != want_has_trans) || (game_mode == 2 && world_mode != WMODE_GROUND)) return;
+	if (!game_mode || (weap_has_transparent(CAMERA_ID) != want_has_trans) || (game_mode == GAME_MODE_DODGEBALL && world_mode != WMODE_GROUND)) return;
 	if (reflection_pass && !camera_pdu.sphere_visible_test(pre_ref_camera_pos, 2.0*CAMERA_RADIUS)) return; // player + weapon not visible in reflection
 	shader_t s;
 	setup_smoke_shaders(s, 0.01, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0.0, 0.0, 0, 0, 0, 0); // no rain/snow
@@ -976,7 +976,7 @@ void draw_inventory() {
 
 	for (unsigned i = 1; i < NUM_WEAPONS; ++i) { // skip unarmed
 		// if player doesn't have this weapon, or it's out of ammo, don't show it
-		if (game_mode == 2 && i != W_BALL) continue; // dodgeballs only
+		if (game_mode == GAME_MODE_DODGEBALL && i != W_BALL) continue; // dodgeballs only
 		if ((enable_translocator && i == W_XLOCATOR) || (!sstate.no_weap_id(i) && !sstate.no_ammo_id(i))) {weapons.push_back(i);}
 	}
 	shader_t s;
@@ -1013,11 +1013,11 @@ void draw_inventory() {
 	}
 }
 
-void draw_qbd_with_textured_shader(quad_batch_draw const &qbd, int tid) {
+void draw_qbd_with_textured_shader(quad_batch_draw const &qbd, int tid, float min_alpha=0.0) {
 
 	select_texture(tid);
 	shader_t s;
-	s.begin_simple_textured_shader(); // no lighting
+	s.begin_simple_textured_shader(min_alpha); // no lighting
 	glDisable(GL_DEPTH_TEST);
 	qbd.draw();
 	glEnable(GL_DEPTH_TEST);
@@ -1029,8 +1029,8 @@ void show_player_keycards() {
 	if (sstates == nullptr) return;
 	set<unsigned> const &keycards(sstates[CAMERA_ID].keycards);
 	if (keycards.empty()) return;
-	float const ar(float(window_width)/float(window_height)), dx(0.006*ar), quad_sz_x(0.35*dx), quad_sz_y(0.7*quad_sz_x), x0(0.052*ar);
-	point pos(x0, 0.052, -10.0*DEF_NEAR_CLIP); // top right, extending left
+	float const ar(float(window_width)/float(window_height)), s(10.0*DEF_NEAR_CLIP), dx(0.06*s*ar), quad_sz_x(0.35*dx), quad_sz_y(0.7*quad_sz_x);
+	point pos(0.52*s*ar, 0.52*s, -s); // top right, extending left
 	quad_batch_draw qbd;
 
 	for (auto i = keycards.begin(); i != keycards.end(); ++i) {
@@ -1040,11 +1040,31 @@ void show_player_keycards() {
 	draw_qbd_with_textured_shader(qbd, KEYCARD_TEX);
 }
 
-void show_key_icon() {
-
-	float const ar(float(window_width)/float(window_height)), dx(0.006*ar), quad_sz_x(0.35*dx), quad_sz_y(0.5*quad_sz_x), x0(0.052*ar);
+void show_icon_image(string const &fn, float xsize, float ysize, float xpos=0.0, vector<colorRGBA> const &colors=vector<colorRGBA>()) {
+	float const ar(float(window_width)/float(window_height)), s(10.0*DEF_NEAR_CLIP), quad_sz_x(0.025*s*xsize), quad_sz_y(0.025*s*ysize);
 	quad_batch_draw qbd;
-	qbd.add_quad_dirs(point(x0, 0.052, -10.0*DEF_NEAR_CLIP), quad_sz_x*plus_x, quad_sz_y*plus_y, WHITE); // top right
-	draw_qbd_with_textured_shader(qbd, get_texture_by_name("interiors/key.png"));
+	point pos((0.52 - 0.05*xpos)*s*ar, 0.52*s, -s);
+	qbd.add_quad_dirs(pos, quad_sz_x*plus_x, quad_sz_y*plus_y, WHITE); // top right; dx and dy are radius values
+	draw_qbd_with_textured_shader(qbd, get_texture_by_name(fn, 0, 0, 0), 0.1); // wrap_mir=0 (clamp), min_alpha=0.1
+
+	if (!colors.empty()) { // draw colors as bars in a row below the icon
+		float const pitch(2.2*quad_sz_x/max(colors.size(), size_t(2))), width(0.75*pitch), hheight(0.67*quad_sz_y);
+		qbd.clear();
+		pos.y -= 1.25*quad_sz_y + hheight; // shift below
+		pos.x -= quad_sz_x - 0.5*pitch; // shift nearly to left edge
+
+		for (colorRGBA const &color : colors) {
+			if (color.A > 0.0) {qbd.add_quad_dirs(pos, 0.5*width*plus_x, hheight*plus_y, color);} // skip transparent color
+			pos.x += pitch;
+		}
+		shader_t s;
+		s.begin_color_only_shader();
+		glDisable(GL_DEPTH_TEST);
+		qbd.draw();
+		glEnable(GL_DEPTH_TEST);
+	}
 }
+void show_key_icon(vector<colorRGBA> const &colors) {show_icon_image("icons/key.png",        1.0, 0.4, 0.0, colors);} // rightmost slot
+void show_flashlight_icon()                         {show_icon_image("icons/flashlight.png", 1.0, 1.0, 1.0        );} // one slot  to the left
+void show_pool_cue_icon  ()                         {show_icon_image("icons/pool_cue.png",   1.0, 1.0, 2.0        );} // two slots to the left
 

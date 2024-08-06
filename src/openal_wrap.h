@@ -14,7 +14,7 @@ enum {SOUND_BURNING=0, SOUND_RAIN1, SOUND_WIND1, SOUND_UNDERWATER, SOUND_EXPLODE
 	SOUND_SHELLC, SOUND_SH_DROP, SOUND_WATER_DROP, SOUND_SLIDING, SOUND_OBJ_FALL, SOUND_WOOD_CRACK, SOUND_FOOTSTEP, SOUND_SNOW_STEP, SOUND_ICE_CRACK, SOUND_RELOAD,
 	SOUND_FALLING, SOUND_HORN, SOUND_DOOR_OPEN, SOUND_DOOR_CLOSE, SOUND_KICK_BALL, SOUND_FLUSH, SOUND_GULP, SOUND_ZOMBIE1, SOUND_ZOMBIE2, SOUND_ZOMBIE3,
 	SOUND_ZOMBIE4, SOUND_ZOMBIE5, SOUND_SQUEAK, SOUND_BEEP, SOUND_SINK, SOUND_METAL_DOOR, SOUND_DOORBELL, SOUND_HELICOPTER, SOUND_RAT_SQUEAK, SOUND_HURT2,
-	SOUND_FLY_BUZZ, NUM_SOUNDS};
+	SOUND_FLY_BUZZ, SOUND_EATING, SOUND_BUBBLE, SOUND_NEON_SIGN, SOUND_SM_SPLAT, SOUND_POLICE, NUM_SOUNDS};
 
 // looping sounds
 enum {SOUND_LOOP_FIRE, SOUND_LOOP_RAIN, SOUND_LOOP_WIND, SOUND_LOOP_UNDERWATER, NUM_LOOP_SOUNDS};
@@ -177,6 +177,7 @@ void write_placed_sounds_to_cobj_file(std::ostream &out);
 void setup_openal_listener(point const &pos, vector3d const &vel, openal_orient const &orient);
 void set_openal_listener_as_player();
 void gen_sound(unsigned id, point const &pos, float gain=1.0, float pitch=1.0, bool rel_to_listener=0, vector3d const &vel=zero_vector, bool skip_if_already_playing=0);
+void gen_sound_random_var(unsigned id, point const &pos, float gain=1.0, float pitch=1.0);
 void gen_delayed_sound(float delay, unsigned id, point const &pos, float gain=1.0, float pitch=1.0, bool rel_to_listener=0); // no vel
 void gen_delayed_from_player_sound(unsigned id, point const &pos, float gain=1.0, float pitch=1.0);
 void proc_delayed_and_placed_sounds();
