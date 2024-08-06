@@ -12,7 +12,7 @@ GLI=dependencies/gli
 GLM=dependencies/glm
 
 INCLUDES=-I/usr/include/GL -Isrc -Isrc/texture_tile_blend -I$(TARGA) -I$(GLI) -I$(GLM) \
--Idependencies/meshoptimizer/src \
+-Idependencies/meshoptimizer/src -Idependencies/assimp/include \
 -Idependencies/freealut/include -Idependencies/stb
 
 DEFINES=-DENABLE_PNG -DENABLE_TIFF -DENABLE_DDS -DENABLE_STB_IMAGE -DENABLE_ASSIMP
@@ -25,7 +25,7 @@ CXXFLAGS=-g -Wall -O3 $(INCLUDES) $(DEFINES) -Wextra -Wno-unused-parameter -Wno-
 -Wformat-nonliteral -Wformat-security -Wformat-y2k -Wimport -Winvalid-pch -Wmissing-field-initializers \
 -Wmissing-format-attribute -Wpacked -Wpointer-arith -Wstack-protector -fstack-protector-strong \
 -D_FORTIFY_SOURCE=2 -Wunused -Wvariadic-macros -Wwrite-strings -Werror=return-type -D_GLIBCXX_ASSERTIONS \
--fexceptions -fasynchronous-unwind-tables -Wctor-dtor-privacy -Wnon-virtual-dtor
+-fexceptions -fasynchronous-unwind-tables -Wctor-dtor-privacy -Wnon-virtual-dtor 
 
 OBJS=$(shell cat obj_list)
 
